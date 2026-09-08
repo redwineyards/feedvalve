@@ -70,9 +70,11 @@ architecture — that is the system designer's task (see Section 6, "Design Deli
 
 ## 5. Explicit Non-Goals / Out of Scope (for this document)
 
-- Choice of specific concurrency primitives, queueing technology, or DB technology beyond what is
-  already fixed by the existing `poc/` codebase (Oracle via `go-ora`, UDP ingestion, LZO1Z
-  decompression) unless the architect determines a change is warranted and calls it out explicitly.
+- Fixed platform constraint: the target database is **Oracle**, accessed via the existing
+  `go-ora` (pure Go, no cgo) driver already used in `poc/db.go`. This is not open for the
+  architect to reconsider. Choice of concurrency primitives and queueing technology, by contrast,
+  is **not** fixed — the architect should weigh their strengths/weaknesses and select what best
+  fits the design.
 - UI/reporting layer for the metrics (only emission/exposure is in scope here).
 - Multi-exchange/multi-feed support (single feed source assumed unless stated otherwise by the
   architect's design).
@@ -108,15 +110,24 @@ includes:
 No system design, module breakdown, or technology selection should be performed as part of this
 requirements document — that work is explicitly deferred to the architect's design document.
 
-## 7. Open Questions for the Architect to Resolve
+## 7. Resolved Product Decisions
 
-- What staleness is acceptable for coalesced high-frequency data (i.e., is "latest value wins"
-  sufficient, or must intermediate values be preserved for any transcode)?
-- Are there ordering guarantees required between packets for the same token (e.g., must updates be
-  applied in arrival order, or is last-write-wins acceptable per field/table)?
-- What is the acceptable end-to-end latency budget from packet arrival to DB visibility, separately
-  for high-frequency vs. critical/sparse transcodes?
-- Should rate-limiter/coalescing state be in-memory only (lost on restart) or does it need to
-  survive a restart without data loss for in-flight coalesced updates?
-- Deployment topology: single instance, or does the design need to account for horizontal scaling /
-  multiple instances splitting the token space?
+The following questions have been answered by the stakeholder and are now constraints the
+architect's design must satisfy, not open questions:
+
+- **Staleness of coalesced data:** configurable per transcode. For high-frequency transcodes,
+  "latest value wins" is acceptable. Some transcodes may require intermediate (not just latest)
+  values to be preserved and persisted — the design must support this on a per-transcode basis,
+  not just a single global coalescing policy.
+- **Ordering:** updates for a given token must be applied to the DB in arrival order. Designs that
+  reorder or parallelize writes for the same token in a way that can violate arrival order are not
+  acceptable.
+- **Latency budget:** no fixed numeric SLA is specified, but end-to-end latency from packet arrival
+  to DB visibility should be minimized as a general design goal, for both high-frequency and
+  critical/sparse transcodes.
+- **Rate-limiter/coalescing state persistence:** in-memory only. It does not need to survive a
+  process restart; loss of in-flight coalesced state on restart is acceptable.
+- **Deployment topology:** multiple instances are preferred over a single instance. The token
+  count is expected to stay relatively stable, but feed volume/frequency per token can vary
+  significantly, so the design should account for horizontal scaling (e.g., splitting load across
+  instances) rather than assuming a single process handles the full feed.
