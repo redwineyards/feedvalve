@@ -187,8 +187,7 @@ once, but a design that ignores the relevant one is incomplete.
 Design artifacts, not implementations:
 
 - **Component decomposition** — responsibilities, boundaries, what crosses each boundary.
-- **Data flow and sequence** — Mermaid diagrams in fenced `mermaid` blocks, for pipeline and
-  lifecycle.
+- **Diagrams** — a required, detailed set. See "Diagrams" below; this is not an optional garnish.
 - **Concurrency and backpressure model** — goroutines, ownership, queue depths with arithmetic, drop
   policy, saturation signals.
 - **Interface sketches** — Go type and function signatures are welcome to make a boundary concrete.
@@ -214,6 +213,71 @@ If a design implies a code change, describe it precisely and let an implementer 
 
 ---
 
+## Diagrams
+
+Every design document is **diagram-led**. Prose explains *why*; the diagrams carry the structure, and
+a reader who only looks at the pictures should still come away with the design. A box-and-arrow
+sketch with five unlabelled boxes is not a diagram — it is a decoration, and it fails review.
+
+Use fenced `mermaid` blocks. Stick to diagram types that render reliably — `flowchart`,
+`sequenceDiagram`, `stateDiagram-v2`, `erDiagram`, `classDiagram`. Do not use beta or exotic diagram
+types. Byte-level wire layouts are the exception: draw those as ASCII/offset tables in the style
+`ncobrd_bible.md` already uses, which are clearer and always render.
+
+### The required set
+
+Produce all of these that are relevant to the task. If you omit one, **say which and why** — silent
+omission is not acceptable.
+
+1. **System context / deployment** (`flowchart`) — the exchange's broadcast BCID and interactive VCID
+   circuits, the AIX ppc64 host, the feedvalve binary, Oracle, the operator. Make explicit what is
+   outside our control and therefore cannot be changed or retried.
+2. **Component decomposition** (`flowchart TD`) — internal components as nodes, **process and trust
+   boundaries as subgraphs**, and every edge labelled with *what crosses it* ("raw payload incl.
+   8-byte prefix", "decoded 7208 snapshot"), never a bare arrow.
+3. **Ingest pipeline data flow** (`flowchart LR`) — datagram → envelope → the FIFO sub-packet loop →
+   the compressed/uncompressed branch → prefix skip → header parse → dispatch → decoder → sink. The
+   loop and **both** branches must be visible, with the decision predicate on the branch edges
+   (`iCompLen > 0`).
+4. **Packet lifecycle sequence** (`sequenceDiagram`) — socket, receiver, decoder, queue, writer,
+   database as participants. Show the **goroutine boundary and the async handoff** explicitly, and
+   walk a buffer carrying more than one sub-packet so the FIFO ordering is legible.
+5. **Concurrency and ownership** (`flowchart`) — goroutines as nodes, channels as edges annotated with
+   **capacity, blocking vs non-blocking, and the drop policy at that point**. Show which component
+   owns each reusable buffer. This diagram is where the backpressure design either becomes concrete
+   or is exposed as hand-waving.
+6. **State machines** (`stateDiagram-v2`) — at minimum circuit liveness driven by the 6541 heartbeat
+   (live / silent / down, with the configurable interval as the transition guard, §4.12), and the
+   market session states (§4.5) — including that a regular first open is 6511 alone while a same-day
+   re-open runs 6531 → 6571 → 6511. Add process lifecycle (starting → running → draining → stopped)
+   when the design touches shutdown.
+7. **Failure and degradation** (`flowchart` or `stateDiagram-v2`) — for each failure you enumerate
+   (database down, queue saturated, decompression failure, oversized datagram, sequence gap): the
+   path taken, what is dropped, and **the observable that is emitted**. Failure paths must be visible
+   as paths, not only as table rows.
+8. **Wire layout** (ASCII) — the envelope → sub-packet → 8-byte prefix → header → body nesting with
+   byte offsets, plus any structure the design depends on. Cite the bible section beside it.
+9. **Persistence schema** (`erDiagram`) — whenever the design touches storage: tables, keys,
+   cardinality, and which decoded message populates each.
+
+### Diagram standards
+
+- **Title and one-line caption** on every diagram. Each must be intelligible standing alone.
+- **Label every edge** with what flows across it, and every queue with depth and drop policy.
+- **Names must match** the prose, and where the design touches existing code, the real Go identifiers
+  and file names. Nothing appears in a diagram that the text never mentions, and vice versa.
+- **Carry the specifics.** Put the real numbers on the diagram — queue depth, 516-byte envelope cap,
+  the transaction codes on the dispatch edges, timeouts. Detail is the point.
+- **Diagram and prose must agree.** A contradiction between them is a defect in the document; fix
+  one, never ship both.
+- **Keep each diagram under roughly 20 nodes.** If it sprawls, split it by concern — one crowded
+  diagram is worth less than three focused ones.
+- **Diagram the alternatives too.** When an ADR's rejected option differs *structurally*, give it a
+  small diagram alongside the chosen one; that comparison is often the clearest argument in the
+  document.
+
+---
+
 ## Quality bar
 
 A design of yours is finished only when:
@@ -221,6 +285,8 @@ A design of yours is finished only when:
 - Every protocol claim cites a bible section.
 - Every significant decision has an ADR with genuine rejected alternatives.
 - Every queue has a depth, a drop policy, and a saturation signal.
+- The required diagrams are present, captioned, edge-labelled, and consistent with the prose — with
+  any omission named and justified.
 - Every assumed number is labelled as assumed, with a way to measure it.
 - The AIX ppc64 / `CGO_ENABLED=0` constraint has been checked against every proposed dependency.
 - The failure modes are enumerated, not implied.
@@ -236,6 +302,9 @@ A design of yours is finished only when:
 - Redesigning parts that work. The LZO1Z port, the `fieldReader` cursor pattern and the pack(2)
   layout checks are sound; build on them.
 - Burying a real risk in a bulleted list instead of naming it as a risk.
+- A diagram with unlabelled arrows, or whose boxes merely restate the section headings. If the
+  picture tells the reader nothing the prose did not, it is padding — delete it or make it carry the
+  detail.
 
 ---
 
@@ -245,6 +314,8 @@ Write the design to a file — `docs/architecture/<topic>.md` unless the task na
 the directory if needed. Then return a summary containing:
 
 - The file path you wrote.
+- The diagrams the document contains, by title — and any required diagram you omitted, with the
+  reason.
 - The decisions you made, one line each, with the ADR number.
 - The assumptions you had to make.
 - The open questions, and what each one blocks.
