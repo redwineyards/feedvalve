@@ -13,10 +13,17 @@ the bible wins and the disagreement is called out explicitly (§3.4).
 **Current-state reference:** `poc/` — cited as `file:line`. Per requirements Section 7, no code is
 reused from it; it is evidence of protocol behaviour and a differential-test oracle only.
 
-> **Review status.** A design review identified open gaps and internal inconsistencies in this
-> candidate. They are **not corrected in the body of this document**; they are listed in
-> **Appendix A** and must be resolved before or during LLD. The class-model change recorded in §1.1
-> resolved four of them outright — B2, B6, S1 and half of S2 — which is noted where it happens.
+> **Review status.** Two rounds of design review have been carried out against this candidate. The
+> first round's findings were recorded in **Appendix A** and left uncorrected in the body; **that is
+> no longer the policy.** The second round found five blocking defects in the mechanism itself — two
+> of them silent data loss — and everything that can be fixed by deciding something has now been
+> **fixed in the body**. Appendix A is therefore a changelog plus a short list of items that remain
+> open only because they are blocked on a stakeholder, a DBA or a measurement on the LPAR.
+>
+> Readers returning to this document should note that §6.7, §7.3 and §6.6 changed materially: the
+> column mask is now cleared when a batch is filled rather than when it is confirmed, the ordering
+> guard is per contributor on every component rather than only on the sequence number, and Q1 no
+> longer discards anything.
 
 ---
 
@@ -47,9 +54,22 @@ Additional material the requirements do not mandate but which a buildable HLD ne
 register (§4), the persistence strategy (§8), the failure-mode table (§9), the FR10-scoped
 observability plan (§10), deployment (§11) and the ADRs (§12).
 
-**Deviations from the requirements** introduced by the class-model change are collected in §1.1 and
-recorded once each in ADR-016 and ADR-017. They touch NFR1, NFR2, NFR6, FR7 and req §12.2, and every
-affected traceability row in §13 names its deviation rather than claiming satisfaction.
+**Deviations from the requirements** are collected in §1.1 and argued in ADR-016 and ADR-017. The
+complete set, which §13's traceability rows must agree with:
+
+| Requirement | Deviation | Source |
+|---|---|---|
+| NFR1 (classes) | Two policy classes, not three; `intermediate-preserving` withdrawn | Stakeholder direction, ADR-016 |
+| NFR1 (per-transcode rate) | One global flush window `W`; only class *membership* is per transcode | Mechanism, this design — OQ-15 costs the alternatives |
+| NFR2 | The lossy discard limiter does not exist | Stakeholder direction, ADR-016 |
+| NFR6 | Write mode is implied by class, not separately configurable | Stakeholder direction, ADR-016 |
+| NFR10 | *Distribution* is per token, not per (token, transcode); policy and ordering remain at the finer granularity | ADR-017 |
+| FR7 / req §12.2 | Every occurrence *applied*, not every occurrence *observable*; no append destination | Stakeholder direction, ADR-008 |
+
+**req §10.2 is not on this list.** An earlier draft recorded its second clause as deviated-from on the
+grounds that collapsing the lanes left no critical-path queue to overflow. That was wrong — the
+clause's subject moved onto Q1, which carries unthrottled traffic — and Q1 now honours it by stopping
+on overflow rather than discarding (§6.6, F9).
 
 ---
 
@@ -107,17 +127,20 @@ Its decisive advantages, on the requirements' own rubric order (req §11.1), are
    sized independently of the partitioning and can be grown while the process runs — which is the
    design's answer to a write path that falls behind (§7.7). It applies *within* a partition as well
    as across them: one busy shard emits as many batches as its dirty set needs and several writers
-   take them concurrently, so a shard skewed by construction — the general-keyed one always is — is
-   not drained by a single connection.
+   take them concurrently, so a shard holding thousands of distinct dirty rows is not drained by a
+   single connection.
 
-The cost is honest and stated: about 153 MB of resident mirrors (§7.8), twelve goroutines,
+The cost is honest and stated: about 166 MB resident, of which 147 MB is the mirrors themselves
+(§7.8), twelve goroutines,
 three internal queues plus a flush signal to size, and one channel hop of latency (tens of
 microseconds) more than a design that writes the mirror directly from the receive goroutine.
 
-### 1.1 Two deliberate deviations from the requirements
+### 1.1 Three deliberate deviations from the requirements
 
-Both follow from stakeholder direction and both are recorded once in ADR-016. They are stated here,
-at the front, because a reader must not discover either of them by accident halfway down.
+The first two follow from stakeholder direction and are recorded in ADR-016. The third is a
+consequence of the mechanism this design chose and is nobody's direction — it is stated here anyway,
+because the test is not whose fault a deviation is but whether a reader can find it. All three are at
+the front because a reader must not discover any of them by accident halfway down.
 
 > **Terminology override — "rate limiting" means the opposite of what req §2 defines.**
 > The requirements glossary defines rate limiting as *"discarding update units outright to cap a
@@ -137,6 +160,18 @@ at the front, because a reader must not discover either of them by accident half
 > state which semantics it assumes — this design assumes *the latest occurrence is what must be
 > observable at the row*. The consequence is explicit: FR7 stops being checkable by comparing an FR10
 > counter against a `COUNT(*)`, and intermediate values are not preserved anywhere.
+
+> **There is one global flush window `W`, not a coalescing interval per transcode.**
+> NFR1 says coalescing is configured per transcode and that *"there is no single global policy"*.
+> What this design configures per transcode is **class membership** — whether a transcode is
+> `rate-limited` at all. Every `rate-limited` transcode then shares one window `W`, so the write rate
+> is capped at `1/W` per destination row uniformly rather than per transcode. A genuine per-transcode
+> interval needs a per-entry next-eligible time and a second, time-ordered ring, which breaks the
+> oldest-first drain ADR-018 depends on; the cheaper shape — several flush groups, each with its own
+> tick and rings — is real work and is logged as a Phase 2 item (§15.3). Phase 1 ships one window.
+> The practical consequence is small, because `W` sits mid-range in FR6's own 1–10/s band (§7.6), but
+> it is a deviation from NFR1's wording and it was previously visible only as a parenthetical in two
+> traceability rows.
 
 ---
 
@@ -435,14 +470,29 @@ throughput`, tunable at runtime via `writers` (§6.9, §7.7). Batching is not an
 is the thing that makes any of this reachable — and req §3.3's ~5,000 rows/s remains the number to
 size against, with the caveat in §7.7 that it is a demand figure rather than a measured capacity.
 
+**`t_commit`, defined once here because three later sections divide by it.** A commit's cost is
+dominated by the redo log flush and scales weakly with batch size, so it is a *range*, not a constant,
+and which end applies depends on what is being committed:
+
+| Case | `t_commit` | Where it is used |
+|---|---|---|
+| A small batch — a handful of rows, the usual shape of a flush triggered by a non-rate-limited arrival | **~3–6 ms** | §7.6's non-rate-limited latency row |
+| A full batch — up to `maxBatchSize` = 1,000 rows (ASM-5, ASM-6) | **~5–20 ms** | §7.3's and ADR-015's drain bound, §7.6's rate-limited row |
+
+The document previously used 5 ms in the load arithmetic and 20 ms in the latency arithmetic without
+saying that they were the two ends of one range, which made two headline numbers look inconsistent.
+They are not — but the conservative end must be used wherever the answer is a *ceiling*.
+
 **Flush-rate arithmetic, which is new.** A non-rate-limited unit triggers a flush of all three
 mirrors across all `S` shards, so one such arrival costs up to `S` commits. Unchecked, an arrival
 rate of `A` non-rate-limited units/s would demand `A × S` commits/s. The flush-request coalescing
-rule in §6.8 bounds it instead at `S / t_commit` — roughly `4 / 5 ms` = **800 commits/s** worst case,
-and in practice far less, because a shard with a flush in flight records the request rather than
-stacking another. The design consequence is that **non-rate-limited arrival rate, not packet rate,
-is what drives commit rate**, and the inventory decision of which transcodes are non-rate-limited is
-therefore a capacity decision (req §12.1, OQ-2).
+rule in §6.8 bounds it instead at `S / t_commit`, because a shard runs at most one epoch at a time:
+**~800 commits/s** at the optimistic 5 ms and **~200 commits/s** at 20 ms. Since this is a saturation
+ceiling, **200/s is the figure to plan against**, and 800/s should be read as the best case rather
+than the bound. In practice it is far less than either, because a shard with a flush in flight records
+the request rather than stacking another. The design consequence is that **non-rate-limited arrival
+rate, not packet rate, is what drives commit rate**, and the inventory decision of which transcodes
+are non-rate-limited is therefore a capacity decision (req §12.1, OQ-2).
 
 ### 4.3 Assumption register
 
@@ -619,7 +669,7 @@ it implicit inside the writer is how a schema change becomes a decode change.
 | `destinations` | Map a transcode's decoded record onto **column contributions to up to three destination rows**: which destination, which row key, which column mask, where the values live in the unit's blob | decoded record plus config | `[3]Contribution` descriptors | table tests per transcode against a declared destination schema |
 | `router` | Compute the shard from the unit's token; enqueue on the shard channel; own the drop policy | `UpdateUnit` | enqueued unit, or a counted discard | fake shards, assert counters |
 | `state` | Three coalescing mirrors, column merge, ordering guard, accumulating/cohort rings, the epoch state machine, batch assembly | `UpdateUnit` | `Batch` spanning all three destinations | deterministic unit sequences, assert emitted batches and epoch boundaries |
-| `writer` | **Stateless pool member.** Pull any batch from the shared queue, select statements per destination, array-bind, commit one transaction in the fixed destination order, classify errors, reconnect, return the batch to its owning shard | `Batch` from any shard | committed rows, or a classified failure | stub `database/sql` driver, as `poc/db_test.go` does |
+| `writer` | **Stateless pool member.** Pull any batch from the shared queue, select statements per destination, array-bind, commit one transaction in the fixed destination order, classify errors, reconnect, fill the batch's **per-row status vector**, and return the batch to its owning shard | `Batch` from any shard | committed rows, or a classified failure **attributed per row** | stub `database/sql` driver, as `poc/db_test.go` does |
 
 Cross-cutting, not in the data path: `config` (load, validate, atomic swap on SIGHUP), `stats`
 (atomic counters plus periodic emission), `lifecycle` (signal handling, ordered shutdown), `health`
@@ -643,7 +693,7 @@ flowchart TD
     subgraph SG["Shard goroutines - each owns one partition of ALL THREE mirrors"]
         ST["state"]
     end
-    subgraph WG["Writer goroutines - one per shard, each owns one Oracle session"]
+    subgraph WG["Writer pool - 'writers' stateless members, sized independently of shards, each owns one Oracle session"]
         WR["writer"]
     end
     subgraph XT["Outside the process"]
@@ -762,7 +812,7 @@ What actually threatens the stall budget is not decode, it is:
    (as `poc/gobrdclnt.go:147`), one reusable decompress buffer (as `poc/gobrdclnt.go:148`), one
    reusable fan-out array, value-typed channel elements, and `ReadFromUDPAddrPort` instead of
    `ReadFrom` to avoid the per-datagram `*net.UDPAddr` (ASM-13). A pointer-free mirror (ADR-006)
-   keeps the mark phase cheap even at a 256 MB live heap.
+   keeps the mark phase cheap even at the ~150 MB live heap of §7.8.
 3. **Scheduler starvation** if `GOMAXPROCS` is left at the detected logical CPU count. On a
    dedicated SMT-8 partition with 4 online vCPUs the runtime can observe 32 logical CPUs while the
    partition is entitled to 4; req §4 requires the value to be configured, not detected (ADR-009).
@@ -1091,7 +1141,7 @@ is that **a row is in at most one outstanding batch**, enforced entirely inside 
 | dirty, on the cohort | the pump batches it | **in-flight** — image, column mask and digest copied into the batch, then **`ColMask` is zeroed on the entry**; the index *leaves* the cohort |
 | in-flight | a contribution merges | **in-flight + re-dirty** — merges into the entry image as normal and ORs its bits into the now-empty `ColMask`, but does **not** enter any ring |
 | in-flight | commit confirmed | **clean** — `Digest` set from the batch's image; `ColMask` is left alone, because it already holds exactly the columns dirtied *since* batching; if re-dirty, mark dirty and append to the tail of the **accumulating** ring |
-| in-flight | commit failed | **dirty** — `ColMask |= batch.writtenMask` to restore the unwritten columns, then inserted at the **head of the accumulating ring**, so the retry runs in the next epoch and stays ahead of rows dirtied after it |
+| in-flight | commit failed | **dirty** — `ColMask \|= batch.writtenMask` to restore the unwritten columns, then inserted at the **head of the accumulating ring**, so the retry runs in the next epoch and stays ahead of rows dirtied after it |
 
 Two consequences carry the whole argument. Any two batches in flight hold **disjoint row sets**, so
 commit order between them cannot matter and FR9 stays structural without a lock, a compare-and-swap
@@ -1230,12 +1280,22 @@ There is **no write-mode axis** any more. NFR6's batched-versus-real-time choice
 class: rate-limited is batched on the window, non-rate-limited is written as soon as available. And
 there is **no discard limiter**: NFR2's mechanism does not exist here (§1.1, ADR-016).
 
-**Config validation** rejects an inventory where a transcode contributes to a destination whose row
-key is not derivable from that transcode's shard key (ASM-15 — it would break single-writer-per-row),
-where a declared contribution names an unknown destination or column, or where more than three
-destinations are declared. It warns when a transcode configured `non-rate-limited` is observed
-exceeding a configured expected rate, since that combination is what turns flush amplification into a
-capacity problem (§4.2, §7.7).
+**Config validation** — run identically at startup, by `-selfcheck`, and by the SIGHUP path before the
+atomic swap — rejects an inventory where:
+
+- a transcode contributes to a destination whose row key is not derivable from that transcode's shard
+  key (ASM-15 — it would break single-writer-per-row);
+- a declared contribution names an unknown destination or column;
+- more than three destinations are declared;
+- a destination declares **more contributing transcodes than `maxContributors`** slots, which would
+  index past the fixed-size ordering arrays (§7.3);
+- a destination's declared column set does not fit `imageSize` (**ASM-16b**), or a transcode's
+  contribution across all destinations does not fit the unit blob (**ASM-16a**);
+- a reload changes a destination's **contributor membership**, which is startup-only (§6.9) because
+  the slot assignment is.
+
+It warns when a transcode configured `non-rate-limited` is observed exceeding a configured expected
+rate, since that combination is what turns flush amplification into a capacity problem (§4.2, §7.7).
 
 ### 6.9 Configuration and runtime reload
 
@@ -1254,11 +1314,14 @@ than a stale one.
 |---|---|---|
 | **Per-transcode class** — `rate-limited` or `non-rate-limited` | yes | The primary operator lever for req §9 steps 1 and 3. Reclassifying a chatty transcode to `rate-limited` is how an operator stops flush amplification without a restart |
 | Flush window `W` | yes | Read per tick. It is the coalescing window and the dominant term in rate-limited latency (§7.6) |
-| `maxBatchSize` — the **per-batch** row budget, across all three destinations | yes | Read per batch. It caps transaction size (NFR6) and therefore sets how many batches an epoch splits into; it no longer caps how much a tick flushes, which is now the whole dirty set (§7.3, ADR-018) |
-| Per-transcode column contributions (which destination, which columns) | yes | Read by `destinations` at decode; a schema addition is a config change, not a rebuild, provided the columns already exist |
+| `maxBatchSize` — the **per-batch** row budget, across all three destinations | **yes, but downward only**, within the startup-only `maxBatchSizeCeiling` | Read per batch. It caps transaction size (NFR6) and sets how many batches an epoch splits into; it no longer caps how much a tick flushes, which is now the whole dirty set (§7.3, ADR-018). The one-way restriction is the same objection that makes `maxInFlightPerShard` startup-only, and it applied here too: **the batch row buffers are pre-allocated** (§7.8), sized by the ceiling, so raising the live value above what was allocated would mean reallocating every batch in every free list. Lowering it is free |
+| Per-transcode column contributions — **which columns** | yes | Read by `destinations` at decode; adding a column a destination already declares is a config change, not a rebuild |
+| Per-transcode **contributor membership** — *which transcodes contribute to a destination at all* | **no — startup only** | Distinct from the row above, and the distinction matters. Membership fixes the `[maxContributors]` slot assignment that `LastSeq`, `LastTime` and `LastRecv` are indexed by (§7.3). A reload adding a contributor would index past a fixed-size array; a reload reordering them would silently reassign every stored ordering value to the wrong transcode, which fails as lost updates rather than as an error. Slots are assigned at startup by ascending transaction code |
 | **Destination set — the three destinations and their row keys** | **no — startup only** | Changing a row key re-keys a mirror and strands state mid-session, exactly as changing shard count does. Adding or removing a destination resizes the arena set |
+| `orderingGuard` — `on`, `off` or `auto` | yes | The escape hatch for req §12.3 resolving badly (§6.5). Structural ordering (ADR-007 mechanism 1) does not depend on the guard, so disabling it is safe; `auto` disables it automatically when it starts discarding more than `guardSuppressionRatio` of everything it sees |
+| `statementFailWindow`, and the two-writer pool-stop threshold | yes | §9.2. Read when a statement-level error is classified |
 | **`writers` — the size of the writer pool, and therefore the connection count** | **yes, up and down** | A writer holds **no mirror state** (ADR-005): growing the pool starts a goroutine with a fresh session, shrinking lets one exit after its current batch. This is the design's lever for a write path that cannot keep up (§7.7), bounded by the Oracle session budget (OQ-8) |
-| `maxInFlightPerShard` — how many of one shard's batches may commit **concurrently** | no — startup only | It sizes a pre-allocated batch pool and the shared `batchQ` behind it, so raising it live means rebuilding a channel and losing what is in it. It does not change *what* a tick flushes — that is always the whole dirty set — only how fast the epoch drains: at `1` the batches commit serially in FIFO order, at `m` up to `m` at once (§7.3). `writers` remains the runtime lever for write throughput |
+| `maxInFlightPerShard` — how many of one shard's batches may commit **concurrently** | no — startup only | It sizes the pre-allocated batch pool and the shared `batchQ` behind it, so raising it live means rebuilding a channel and losing what is in it. It does not change *what* a tick flushes — that is always the whole dirty set — only how fast the epoch drains: at `1` the batches commit serially in FIFO order, at `m` up to `m` at once (§7.3). `writers` remains the runtime lever for write throughput |
 | `GOMAXPROCS` | yes | `runtime.GOMAXPROCS` is a supported live call |
 | Socket receive buffer | yes | `(*net.UDPConn).SetReadBuffer` on the live socket; cannot exceed `udp_recvspace` without a kernel tunable change (req §4) |
 | Stats interval, log verbosity, heartbeat timeout | yes | |
@@ -1665,11 +1728,16 @@ Per §6.8: the same path, an earlier flush. Five specifics:
 - A non-rate-limited contribution **always marks its row dirty**, skipping the digest comparison
   entirely, so a repeated occurrence carrying identical values is still written (NFR13's explicit
   carve-out). This is the only behavioural difference inside the mirror.
-- The trigger is a **broadcast**: every shard's flag is set, not just the one that received the unit.
-  The unit's own row is in one shard, but the point of the trigger is that the database reflects a
-  coherent picture of all three destinations at the moment something significant happened — a market
-  open should not land alongside quote state from three windows ago.
-- The receive goroutine **never waits**. It sets flags and returns to `ReadFrom` (ADR-001). For
+- The trigger is a **broadcast**: every shard's flag is set, not just the one whose row was merged.
+  What this buys, stated precisely, is that **every shard flushes promptly** — so a market open does
+  not land in the database alongside quote state from three windows ago. What it does **not** buy is a
+  coherent cross-shard snapshot: the shards commit `S` independent transactions with no atomicity
+  between them, so a reader can still observe shard 0's market-open beside shard 3's pre-open quotes.
+  The earlier wording claimed the stronger property, which matters because the cost — up to `S`
+  commits per trigger, and the whole of R9 — is only worth paying for the weaker one. It is:
+  bounded staleness on every destination is the point, not a consistent cut.
+- The receive goroutine **never waits**, and never raises the flag either — the shard does, after the
+  merge (§6.7). The receive goroutine hands the unit over and returns to `ReadFrom` (ADR-001). For
   6511/6521 (bible §4.5) the row is committed a few milliseconds later, which is a handful of writes
   per day at ~3–6 ms each. The consequence — two occurrences inside one flush cycle collapse — is
   stated in §1.1 and is the accepted reading of req §12.2.
@@ -1743,6 +1811,14 @@ touches a distinct row, no coalescing occurs by definition and the row rate simp
 rate. This corrects the arithmetic error recorded as Appendix A gap B1, and §7.7's headroom figure
 follows from it.
 
+**That figure assumes one destination row per unit, which is ASM-17 and not a structural guarantee.**
+A unit may carry up to three contributions (ADR-017), so a transcode writing two or three destinations
+dirties two or three rows per unit and the pessimistic bound rises with it — 45,000 rows/s at the
+extreme. §8.2's instantiation keeps it at one (7208 writes only the quote row, 7305 only the security
+master), which is why the arithmetic above holds today; but §8.2 is illustrative and OQ-13 is open, so
+this is an assumption to re-check when the destinations are fixed rather than a property to rely on.
+`rows_dirtied / units_applied` (§10.1) measures it directly on day one.
+
 In the *expected* case (hot set in the tens, req §3.3) the same burst produces tens of rows per
 window, because the extra traffic lands on rows that are already dirty and coalesces into them at
 zero marginal cost. **The burst's write cost scales with distinct active rows, not with packet rate**
@@ -1753,7 +1829,8 @@ which end of the range is real.
 **Flush amplification, the new burst dimension.** A non-rate-limited arrival costs up to `S` commits.
 Left unchecked, `A` such arrivals per second would demand `A × S` commits/s and saturate Oracle long
 before the row rate did. The coalescing flag (§6.6) bounds it: a shard with a flush in flight records
-the request instead of stacking it, so the ceiling is `S / t_commit` ≈ 800 commits/s and the
+the request instead of stacking it, so the ceiling is `S / t_commit` — ~200 commits/s at a full
+batch, ~800/s at a small one (§4.2) — and the
 *observable* effect of an unthrottled storm is larger batches, not more commits. This is why the
 inventory decision — which transcodes are `non-rate-limited` — is a capacity decision (§4.2, OQ-2).
 
@@ -1824,7 +1901,7 @@ without touching the architecture.
 | Aggregate packet rate | `distinctRowsPerWindow / W` exceeds `writers × per-session throughput` | ~**0.3×** at the pessimistic 3,000-distinct-rows-per-window bound *against req §3.3's ~5,000 rows/s* — i.e. it does not keep up; ~**50×+** at the expected hot-set-of-tens. See the caveat below: the divisor is a demand figure, not a measured capacity | **Oracle write path** — mitigated by raising `writers`, and `maxInFlightPerShard` where one shard is the problem |
 | Aggregate packet rate, decode-limited | single-goroutine decode at ~5 µs/packet | ~**20×** (≈200,000 packets/s); ~**2×** if ASM-1 and ASM-3 are wrong by 10× | receive goroutine |
 | Per-destination-row update rate | never, in practice | ~**100×+** | receive goroutine, not the shard |
-| **Non-rate-limited arrival rate** | flush requests arrive faster than `S / t_commit` ≈ 800/s | depends entirely on the inventory — unbounded in principle | commit rate, then **latency for that class**, never a stop |
+| **Non-rate-limited arrival rate** | flush requests arrive faster than `S / t_commit` — **~200/s** planning figure, ~800/s best case (§4.2) | depends entirely on the inventory — unbounded in principle | commit rate, then **latency for that class**, never a stop |
 | Distinct active rows | dirty depth grows until per-row latency is unacceptable, not until memory fails | bounded by the destinations' key spaces | freshness, then operator judgement |
 
 The per-row result is worth stating plainly because it is the design's strongest quantitative
@@ -1953,7 +2030,7 @@ tested on Linux with the race detector and cross-compiled for deployment, per re
 |---|---|---|
 | req §12.1 Transcode inventory | **Medium**, up from very low. The registry and the policy table are still data, but the inventory now also settles which transcodes contribute which columns to which destination, and how many are `non-rate-limited` — the latter being a capacity decision (§4.2, §7.7) | A config line per transcode plus its contribution descriptors; nothing structural |
 | req §12.2 "Persist every occurrence" semantics | **Medium**, up from low. §8.1 answers it as *latest-occurrence-observable*, which is a weaker reading than the earlier draft assumed. If the stakeholder needs every occurrence observable, an append destination has to come back — and it would be a fourth destination, outside the three-mirror model | A fourth destination and a second statement per batch |
-| req §12.3 Ordering field semantics | **Very low for FR9** — ordering is structural (§6.7 mechanism 1) and survives the fields being useless. **High for FR10 gap detection only** | Gap detection scope switch, already designed (§6.5). *See Appendix A, gap B7* |
+| req §12.3 Ordering field semantics | **Very low for FR9** — ordering is structural (§6.7 mechanism 1) and survives the fields being useless. **High for FR10 gap detection only** | Gap detection scope switch, already designed (§6.5), plus `orderingGuard: auto`, which disables the defensive comparison rather than letting an unpopulated field freeze every mirror (§6.5) |
 | req §12.4 Active token count | **Medium.** It is the input to write-path headroom (§7.7). If it is thousands, `W` widens or connections increase | Tunables, not structure |
 | req §12.5 Capture capability | **None.** No design decision depends on a capture; §6.5's audit mode substitutes for items 3 and 4 | — |
 | req §12.6 Latency endpoints | **None.** The estimate decomposes by term, so any endpoint definition can be read off Table 7.6 | — |
@@ -1965,11 +2042,19 @@ ownership rather than by a header field. ADR-007 is where that argument is recor
 
 ### 7.10 Module breakdown
 
-As §6.1, with `state` implemented as the sharded mirror described in §7.3 and `writer` implemented
-one-per-shard. The boundary that carries the most weight is `router` → `state`: it is the only place
-a drop can occur at all, so it is where the drop policy lives, where the counters live, and where a
-test can assert the policy without a database or a socket. `destinations` → `state` carries almost as
-much weight: it is where a column mask that disagrees with the schema would first be visible.
+As §6.1, with `state` implemented as the sharded mirror described in §7.3 and `writer` implemented as
+a **stateless pool of `writers` members sized independently of `shards`** (ADR-005) — not the
+one-per-shard mapping this section described before the pool was decoupled.
+
+The boundary that carries the most weight is `router` → `state`. It is where the per-datagram stall
+budget is enforced and therefore the only place the process can decide it has fallen too far behind to
+continue (§6.6), so it is where that policy lives, where the counters live, and where a test can
+assert it without a database or a socket. Note what changed: this boundary used to be described as
+"the only place a drop can occur", and there is no longer any such place — nothing is discarded
+anywhere in the design.
+
+`destinations` → `state` carries almost as much weight: it is where a column mask that disagrees with
+the schema would first be visible, and where ASM-16b's row-image bound is checked at config load.
 
 ### 7.11 Where requirements satisfaction is non-obvious
 
@@ -1992,19 +2077,20 @@ Per req §11.2 item 11, only the non-obvious cases:
 ### 7.12 Risks specific to this design
 
 1. **A `[]byte` or pointer creeping into `UpdateUnit` or `Entry`** would silently alias a reused
-   buffer or re-introduce GC scanning of 256 MB. Named as an invariant in §6.1 and gated by a
+   buffer or re-introduce GC scanning of the 147 MB of arena. Named as an invariant in §6.1 and gated by a
    reflection test in §10.4. This is the most likely way a correct design becomes an incorrect
    implementation.
 2. **A LIFO dirty ring** would starve old keys under sustained overload and quietly break the one
    correctness property req §9 says is never given up (§6.7).
 3. **Shard skew.** If one token dominates and hashes alone into a shard, that shard's flush is
    dominated by one row. Harmless here (coalescing collapses it) but it makes per-shard counters
-   essential for diagnosis. The designated general shard is skewed by construction and should be
-   watched separately.
+   essential for diagnosis. Note the designated general shard is **not** the case to watch here: on
+   §8.2's instantiation it owns four rows updated a handful of times a day, so it is unremarkable
+   apart from the token traffic that hashes to it like any other shard.
 4. **Digest-based suppression hiding a real write failure.** The digest must be updated on
    *confirmed commit*, never on enqueue, or a failed batch would leave the entry looking written.
-   Called out in §7.3 — and see Appendix A, gap B4, for what the completion path still has to define,
-   which now includes confirming the column mask and the per-transcode sequence slots.
+   Called out in §7.3. The completion path now also confirms the column mask (cleared at fill,
+   restored on failure) and the per-contributor ordering slots — §6.7 defines all three.
 5. **A column mask that disagrees with the statement.** The merge sets mask bits and the writer emits
    a statement from them; if the two drift, a column is either silently not written or written from a
    stale image. This is new with the destination-keyed mirror and needs a test that asserts the
@@ -2167,6 +2253,8 @@ rather than just a column list.
 | Binds | Positional `:1, :2, …`, array-bound where `go-ora` allows (ASM-6) | `?` is not an Oracle placeholder and fails as `ORA-00936` pointing nowhere near the cause (`poc/db.go:236-246`) |
 | Transaction boundary | **One transaction per batch, spanning all three destinations** | Amortises the redo log flush, and — with the fixed order below — is what makes the deadlock argument hold. A batch is executed by whichever pool writer takes it; which writer is immaterial, because batches never overlap (§8.4) |
 | Statement grouping | One array-bound statement **per destination per distinct column mask** within the batch | A batch is `[3]map[ColMask][]row`; rows sharing a mask share a statement |
+| Columns written, restated | Built from **the mask the batch carries**, not from the entry's live `ColMask` | The entry's mask is zeroed when the batch is filled and re-accumulates mid-flight changes (§6.7), so reading it at write time would emit the wrong column list |
+| Failure granularity | The writer fills a **per-row status vector** on the batch; the shard applies outcomes per row (§7.3, §9.2) | F14's "skip the row, continue the batch" is otherwise not expressible — a batch-granular result forces an all-or-nothing retry. Depends on ASM-6 / OQ-4 |
 | **Destination order within a transaction** | **Fixed and global: destination 1, then 2, then 3** | Two transactions that acquire locks in the same order cannot deadlock, even if the disjoint-ownership invariant were ever violated. This is the second of the two layers in §8.4 |
 | Row ordering within a destination | Sorted by row key | Consistent acquisition order inside a destination, and better index locality |
 | Idempotency | `MERGE` is naturally idempotent, and with no append destination there is nothing that is not | A retried batch rewrites the same images to the same rows. This is a direct simplification of dropping the event table: the `ORA-00001`-on-retry dance is gone |
@@ -2266,9 +2354,9 @@ terminal behaviour req §10.2 prescribes for a database outage.*
 
 | Class | Examples | Retry? | Effect |
 |---|---|---|---|
-| Row-level data error | `ORA-00001` unique constraint, `ORA-01438` value larger than precision, `ORA-12899` value too large for column | No | Skip the row, count, continue the batch, stay Healthy |
+| Row-level data error | `ORA-00001` unique constraint, `ORA-01438` value larger than precision, `ORA-12899` value too large for column | No | Skip the row, count, continue the batch, stay Healthy. **Requires per-row outcomes** — see below |
 | Session-level transient | `ORA-03113`, `ORA-03114`, `ORA-12541`, `ORA-12170` timeout | Yes | Retire the connection, retry once on a fresh session, then backoff |
-| Statement-level | `ORA-00936` missing expression, `ORA-00942` table does not exist | No — these are deployment defects, not runtime conditions | Log at ERROR with the destination and statement name and stop the affected writer; a wrong statement will never become right |
+| Statement-level | `ORA-00936` missing expression, `ORA-00942` table does not exist | No — these are deployment defects, not runtime conditions | Log at ERROR with the destination and statement name and stop the affected writer. **If the same statement identity then fails on a second writer inside `statementFailWindow`, the pool stops itself and the process enters FailFast** — see below |
 | Deadlock (`ORA-00060`) | — | Yes, once | **Should be unreachable** (§8.4). If it ever fires, the disjoint-ownership invariant is broken — log at ERROR naming both destinations, retry the batch once, and treat a recurrence as a configuration defect rather than a runtime condition |
 | Sustained unavailability | All writers failing past the budget | — | FailFast: log the reason, drain what can be drained, exit non-zero |
 
@@ -2281,10 +2369,31 @@ everything would turn a partial deployment defect into a total outage.
 Note the asymmetry the writer pool introduces here. A **session-level** failure is now fully routed
 around: the batch is returned failed, its rows re-dirty, and any other writer picks up the retry —
 where the earlier one-writer-per-shard mapping left that shard's partition unwritten. A
-**statement-level** failure is not, because the statement is wrong for every writer equally; retiring
-writers one at a time would eventually empty the pool. The pool must therefore stop *itself* rather
-than stop writer-by-writer once the same statement fails on more than one writer, and that rule is
-part of what Appendix A gap B4 still has to pin down.
+**statement-level** failure is not, because the statement is wrong for every writer equally, and
+retiring writers one at a time would empty the pool one session per occurrence while the process went
+on looking healthy.
+
+**The pool-stop rule.** Each writer reports the failing *statement identity* — destination plus column
+mask, which is what §8.3 groups statements by — with its error. When the same identity has failed on
+**two distinct writers** within `statementFailWindow` (default 60 s), the pool stops itself: no
+further batches are taken, the shards' in-flight batches are returned failed, and the process enters
+FailFast and exits non-zero. Two writers is the threshold rather than one because a single failure is
+indistinguishable from a session-specific problem, and rather than three because each additional
+observation costs a session the pool may need. Both the threshold and the window are configuration
+(§6.9), and `writers_stopped` (§10.1) counts writers retired this way so that
+`writers_busy / writers_configured` — the signal §7.7 uses to decide whether raising `writers` would
+help — is not read as idleness when it is actually attrition.
+
+**Per-row outcomes, and the one thing this still depends on.** "Skip the row, continue the batch" is
+only expressible if the writer can attribute a failure to a row. A `Batch` therefore carries a
+**per-row status vector** that the writer fills before returning it, and §7.3's completion applies
+outcomes per row rather than per batch — which is also what lets one batch commit while a single row
+inside it is rejected and left clean. Whether that granularity is available depends on `go-ora`
+reporting per-row results for an array bind inside a transaction, which is **ASM-6 and unverified**
+(OQ-4). If it is not, the fallback is coarse and must be stated rather than discovered: the whole
+batch is treated as failed and every row in it returns to the head of the next epoch's ring, so one
+permanently-bad row would retry its whole batch indefinitely. That is the residual Appendix A gap S4
+still carries, and it is the reason OQ-4 is worth closing early.
 
 ### 9.3 Degradation and recovery paths
 
@@ -2405,16 +2514,18 @@ doing arithmetic at 03:00.
 | Decode | `decompress_failed`, `framing_abandoned`, `netid_mismatch`, `error_response`, `record_count_clamped` | — (NFR12 evidence) | Each maps to exactly one row of §9.1 |
 | Decode | `units_emitted`, `units_per_packet_max` | — | Closes the fan-out amplification question in §4.2; 7320 can emit 35 units from one packet (bible §4.4b) |
 | Loss | `seq_gap_events`, `seq_gap_messages` | **detected gaps in the header sequence number** | FR10's explicit clause, conditional on req §12.3 |
-| Coalescing | `units_merged`, `units_applied`, `units_superseded_out_of_order`, `change_suppressed` | coalesce counts | `units_merged / units_applied` is the coalescing ratio FR6 is judged by. `units_applied` also stands in for the FR7 audit that the dropped append destination used to provide (§8.1) |
+| Coalescing | `units_merged`, `units_applied`, `rows_dirtied`, `units_superseded_out_of_order`, `change_suppressed` | coalesce counts | `units_merged / units_applied` is the coalescing ratio FR6 is judged by. `units_applied` also stands in for the FR7 audit that the dropped append destination used to provide (§8.1). `rows_dirtied / units_applied` is **ASM-17 measured directly** — how many destination rows one unit actually touches, assumed ≈1 by every write-rate figure in §4.2 and §7.5 but permitted to be 3 by the model |
 | Flush | `flush_triggered`, `flush_coalesced`, `flush_on_tick`, `flush_deferred` | — | `flush_coalesced / flush_triggered` is the single number that says whether non-rate-limited traffic is outrunning the write path (F10). Rising is not an error; rising toward 1 means the class has degraded to windowed. **`flush_deferred` now means only a failed `batchQ` send** — unreachable by construction (§6.6), so any non-zero value is a defect, not load |
 | Epoch | `epoch_opened{k}`, `epoch_empty{k}`, `epoch_rows{k}`, `epoch_batches{k}`, `epoch_duration{k}`, `tick_skipped_epoch_open{k}` | — | The set that says whether a tick is still keeping up. `epoch_duration` exceeding `W`, with `tick_skipped_epoch_open` rising alongside it, is the exact signature of the left branch of §9.3 — and `epoch_rows` summing to less than the rows dirtied over the same interval is how the swapped-rings defect of §7.12 risk 10 shows itself |
 | Epoch | `retry_requeued{k}` | — | Rows re-dirtied at the head of the next epoch's ring after a failed commit (§7.3). Distinct from `writes_failed`, which counts batches: one failed batch requeues up to `maxBatchSize` rows, and a rising ratio between the two says failures are hitting large batches |
 | Stall | `shard_send_blocked`, `stall_budget_p99`, `shard_loop_max_ns` | discard counts *(nil — nothing is discarded)* | FR10 asks for discard counts and the honest answer is that there are none: Q1 overflow stops the process rather than shedding (§6.6, F9). What replaces them is *approach* to the limit — `shard_send_blocked` counts sends that had to wait at all, `stall_budget_p99` is how much of the 50 ms datagram budget the worst iteration consumed, and `shard_loop_max_ns` is the shard-side cause. A non-zero `shard_send_blocked` against a ~0.08 %-busy shard is the early warning for the one condition that is fatal |
-| Queues | `shard_depth{k}`, `dirty_depth{k,destination}`, `cohort_depth{k,destination}`, `batchq_depth` | — (NFR5 evidence) | Sampled at emission, not tracked continuously; per destination, because one destination falling behind is a different problem from all three doing so. `dirty_depth` is the accumulating ring, `cohort_depth` what remains of the open epoch — the two answer different questions and summing them hides both |
-| Write pool | `writers_configured`, `writers_busy`, `rows_inflight{k}`, `redirty_total` | — (NFR3 evidence) | `writers_busy / writers_configured` is the number that says whether raising `writers` would help (§7.7). A persistently high `rows_inflight` on one shard against a low one elsewhere is the imbalance the pool exists to absorb |
+| Queues | `shard_depth{k}`, `dirty_depth{k,destination}`, `cohort_depth{k,destination}`, `batchq_depth`, `completion_lag{k}` | — (NFR5 evidence) | Sampled at emission, not tracked continuously; per destination, because one destination falling behind is a different problem from all three doing so. `dirty_depth` is the accumulating ring, `cohort_depth` what remains of the open epoch — the two answer different questions and summing them hides both |
+| Write pool | `writers_configured`, `writers_busy`, `writers_stopped`, `rows_inflight{k}`, `redirty_total` | — (NFR3 evidence) | `writers_busy / writers_configured` is the number that says whether raising `writers` would help (§7.7) — and it is only readable alongside `writers_stopped`, which counts members retired by a statement-level error (§9.2). Without it a pool that has lost half its writers reads as a pool that is half idle, and the operator raises a number that is already too high. A persistently high `rows_inflight` on one shard against a low one elsewhere is the imbalance the pool exists to absorb |
+| Ordering | `ordering_guard_state`, `units_superseded_out_of_order` | — | Which mode the guard is in (§6.5). `auto` flipping to disabled is the observable that req §12.3 resolved badly, and it is far better than the alternative signal, which was every mirror silently freezing |
 | Writes | `writes_attempted`, `writes_succeeded`, `writes_failed`, `rows_written{destination}`, `batches_written`, `row_rejected` | DB writes attempted/succeeded/failed | `rows_written / batches_written` is the batch efficiency that governs commit cost (§4.2) |
 | Liveness | `heartbeat_seen`, `circuit_state`, `session_state{market_type}` | logging sufficient to confirm correct running | §6.10; SHOULD, not required |
 | Active set | `active_tokens_1s` | — | Directly measures req §12.4's open item (§6.5) |
+| Schema fit | `message_truncated{destination,column}` | — | A variable-width column whose value exceeded its declared width and was cut (§8.2's `message_text` is the only current case). Non-zero means either the cap is too tight or ASM-16b's sizing needs revisiting — both schema decisions, so this is the counter that keeps OQ-13 honest after the fact |
 
 **Where deferred instrumentation attaches.** Every counter above is already a named quantity behind
 a small interface; a later phase adds a second implementation that also records a histogram or serves
@@ -2460,14 +2571,16 @@ host without starting the relay is worth having:
 
 - `-dbcheck` — connect, `SELECT 1 FROM dual`, report the server version, exit. Read-only. Proves
   credentials, listener and service name.
-- `-selfcheck` — validate the configuration and exit. It confirms every configured transcode has a
-  registered decoder; that exactly three destinations are declared; that **every destination's row key
-  is derivable from the shard key of every transcode contributing to it** (ASM-15 — the invariant the
-  deadlock and FR9 arguments both rest on, and the one defect that is otherwise invisible until it
-  produces intermittent lost updates); that no destination has more contributors than
-  `maxContributors` slots; and that every declared contribution names a known destination and column.
-  Catches the deployment defects that otherwise surface as F2, as a statement-level error in §9.2, or
-  as nothing at all.
+- `-selfcheck` — validate the configuration and exit, running exactly the rule set in §6.8. It
+  confirms every configured transcode has a registered decoder; that exactly three destinations are
+  declared; that **every destination's row key is derivable from the shard key of every transcode
+  contributing to it** (ASM-15 — the invariant the deadlock and FR9 arguments both rest on, and the
+  one defect that is otherwise invisible until it produces intermittent lost updates); that no
+  destination has more contributors than `maxContributors` slots; that **every destination's declared
+  column set fits `imageSize`** (ASM-16b) and every transcode's contribution fits the unit blob
+  (ASM-16a); and that every declared contribution names a known destination and column. Catches the
+  deployment defects that otherwise surface as F2, as a statement-level error in §9.2, or as nothing
+  at all.
 
 There is deliberately no HTTP health endpoint: req §8 defers the scrape surface, and a listening
 socket on this host is an attack surface and a port allocation nobody has asked for. Liveness for a
@@ -2505,7 +2618,11 @@ invariants enforceable rather than aspirational.
 | **Layout assertion per decoder** | A field added, removed or resized so the structure no longer reconciles with its declared packet length (bible §2.3, Part V) | A constant expression that fails to compile, in the style of `poc/exchange_communication.go:138-139` |
 | **Pointer-free `UpdateUnit` and `Entry`** | A `[]byte`, pointer or string creeping in — which would alias the reused decompress buffer and re-introduce GC scanning of the arena (§6.1, §7.12, risk 1) | A test that walks the type with `reflect` and fails on any pointer-containing field |
 | **Differential decode against `poc`** | Subtly-wrong-but-plausible field decoding, which req §7 names as the specific risk of re-deriving the parsers | See below |
-| **Zero-allocation receive path** | An allocation reappearing on the hot path, e.g. by reverting to `ReadFrom` (ASM-13) | `testing.AllocsPerRun` over decode-and-fan-out, asserted at zero |
+| **Zero-allocation receive path** | An allocation reappearing on the hot path, e.g. by reverting to `ReadFrom` (ASM-13), or the per-second active-token set being rebuilt rather than cleared (§6.5) | `testing.AllocsPerRun` over **the whole receive iteration** — read, frame, decompress, decode, fan out, gap-detect, active-token sample and route — asserted at zero. Scoping it to decode-and-fan-out alone left the gap detector and the token set uncovered, and both run on the same goroutine |
+| **Row image fits the destination** | A destination whose accumulated column set overruns `Entry.Image` — ASM-16b, the assumption that was missing entirely while ASM-16a stood in for it | A constant expression per destination, plus the `-selfcheck` rule of §6.8, asserting the declared column widths sum within `imageSize`. The 6511-family `BroadcastMessage[239]` is the case that proves it bites (§8.2) |
+| **Column mask survives a mid-flight merge** | The `ColMask` defect of §6.7: clearing written bits at completion instead of at fill, which discards columns re-dirtied while the batch was outstanding | Batch a row, merge a contribution touching a column the batch also wrote, complete the batch successfully, then assert the next flush's statement **includes** that column and carries the newer value |
+| **Ordering is per contributor on every component** | A shared per-row `LastTime` letting one general transcode suppress another within the same `LogTime` second (§6.5) | Feed one general row 6531, 6571 and 6511 all stamped with the *same* `LogTime`, differing only in receipt order. Assert all three are applied in arrival order and none is counted `superseded` |
+| **The flush request survives an empty ring** | The §7.3 ordering defect: clearing `FlushReq` before testing the rings, so a request raised against a not-yet-drained unit is consumed and the unit waits a full `W` | Raise a flush request on a shard whose rings are empty, then deliver a contribution. Assert an epoch opens immediately rather than at the next tick, and that `epoch_empty` did not consume the request |
 | **Ordering property** | An FR9 regression | Feed one destination row units from two transcodes with shuffled sequence numbers; assert each transcode's columns end at its own highest-sequence value, and that neither transcode's sequence suppresses the other's |
 | **Column-mask fidelity** | A merge or statement bug that blanks columns the contributing transcode does not own | Apply two transcodes' partial contributions to one row; assert the emitted statement's column list equals the union of their masks, and that unmentioned columns retain their prior values |
 | **Single-writer-per-row** | A destination whose row key is not derivable from the shard key (ASM-15) — the defect that breaks both FR9 and the deadlock argument | A test that enumerates the configured destinations and asserts, for every contributing transcode, that `ShardOf(unit)` equals the shard owning `RowKeyOf(contribution)`. This is `-selfcheck`'s logic, run as a unit test against the shipped config |
@@ -2600,7 +2717,7 @@ confirming — which is itself a design decision rather than an accident.
 |---|---|---|---|
 | CPU | Entitled capacity **4**, capped, dedicated SMT-8 | Under 15 % of one core in steady state (§7.8): receiver 5–10 %, shards ~1 %, writers I/O-blocked | ~25× |
 | `GOMAXPROCS` | Must be **configured, not detected** (req §4) | Pinned to 4 | The runtime may observe 32 logical CPUs on a 4-vCPU SMT-8 partition; detecting would oversubscribe a capped partition and add latency rather than throughput |
-| Memory | **40 GB** | **~153 MB resident at 200,000 tokens** — three arenas 134 MB, indexes 7 MB, channels 6 MB, batches 3 MB, dirty rings 3 MB, fixed buffers under 1 MB (full arithmetic in §7.8) | ~260× |
+| Memory | **40 GB** | **~166 MB resident at 200,000 tokens** — three arenas 147 MB, indexes 7 MB, channels 6 MB, batches 3 MB, dirty rings 3 MB, fixed buffers under 1 MB (full arithmetic in §7.8) | ~245× |
 | Socket buffer | `udp_recvspace = 655360` | Requested via `SetReadBuffer`; a per-socket request cannot exceed the tunable without a kernel change (req §4) | 0.53 s of slack, or ~0.13 s if ASM-4 is wrong |
 | Oracle sessions | Instance `sessions`/`processes`, ASM-10 | `writers` + 1, default 5 | Small by design; an unbounded pool can exhaust the instance (`poc/db.go:33-38`). Raising `writers` is a live lever, so the headroom above the default is what OQ-8 needs to establish |
 | Disk | Operational log only | Bounded by rate-limited logging (§10.2); no packet log, no spool (ADR-014) | — |
@@ -2742,7 +2859,7 @@ separately-sized pool, so the startup-only nature of `shards` no longer constrai
 
 **Revisit when:** a single token exceeds the throughput of one shard goroutine — roughly 100× the
 per-token peak in req §3.3, so effectively never — or if shard skew shows in per-shard counters as
-sustained imbalance. The designated general shard is skewed by construction and is exempt.
+sustained imbalance.
 
 ### ADR-003: Treat the coalescing mirror as the queue, so the unwritten backlog is bounded by the key universe rather than by the arrival rate
 
@@ -2807,9 +2924,12 @@ coalescing flush flag on every shard. The receive goroutine never waits for the 
 - *A flush **queue** rather than a flag.* Rejected with arithmetic: `A` unthrottled arrivals per
   second would demand `A × S` commits/s (§4.2) until the queue filled, reintroducing exactly the
   terminal condition this ADR removes. A flag makes the overload self-limiting.
-- *Flush only the shard that received the unit.* Rejected: the point of the trigger is that all three
-  destinations reflect a coherent picture when something significant happens; a market open landing
-  beside quote state from three windows ago is the outcome to avoid.
+- *Flush only the shard that received the unit.* Rejected, but on a narrower ground than this ADR
+  first claimed. The broadcast does **not** produce a coherent cross-shard picture — `S` independent
+  transactions have no atomicity between them (§7.4). What it produces is promptness everywhere: a
+  market open should not be committed while another shard's quote rows sit three windows stale. That
+  is worth up to `S` commits per trigger; a consistent cut would be worth more, but is not on offer
+  without cross-shard coordination this design deliberately has none of.
 - *One queue with priority scheduling.* Rejected as before: a shared queue can still be *filled* by
   bulk traffic. Priority solves ordering of service, not capacity — and here there is no service
   ordering problem, because the unthrottled unit does not queue behind writes at all.
@@ -2847,7 +2967,8 @@ things together that do not belong together:
   shard count startup-only, so the answer to "the write path cannot keep up" (§7.7) was a restart.
 - **A shard holding thousands of distinct dirty rows could not be drained in parallel.** Coalescing
   collapses a hot *row*; it does nothing for a shard with many distinct ones, and the designated
-  general shard is skewed by construction.
+  general shard holds only a handful of rows (§8.2), so the case that matters is a burst spreading
+  thousands of distinct tokens unevenly, not the general destination.
 - **A dead session stalled a whole partition** rather than being routed around.
 
 **Decision:** Shards own state; **writers are a stateless pool of configurable size `writers`**, each
@@ -2915,7 +3036,7 @@ drains the whole dirty set, it simply does so serially.
 **Context:** The receive goroutine reuses its buffers — a 64 KB read buffer and a decompress buffer
 allocated once before the loop (`poc/gobrdclnt.go:147-148`). Anything downstream holding a slice into
 those buffers would be overwritten by the next packet. Separately, garbage collection charges mark
-work to the allocating goroutine, and at 200,000 tokens the mirror is ~256 MB of live heap (§7.8) —
+work to the allocating goroutine, and at 200,000 tokens the arenas are ~147 MB of live heap (§7.8) —
 enough that tracing it would be visible on the one path NFR4 protects.
 
 **Decision:** `UpdateUnit` and `Entry` contain only scalars and fixed-size arrays: no slices, no
@@ -3005,8 +3126,10 @@ Appendix A gap B2. Worse — the property is invisible in the code unless it is 
 tested, because nothing fails loudly if a future change lets a row reach two writers concurrently,
 and it now rests on two preconditions rather than one: ASM-15, which only `-selfcheck` enforces, and
 the in-flight marking of §6.7, which only the property gates in §10.4 enforce. Accepted — hence those
-gates. *(Appendix A, gap B7, still qualifies the guard's behaviour when
-`BCSeqNo` is unpopulated.)*
+gates. The guard's behaviour when `BCSeqNo` is unpopulated is no longer left open: `orderingGuard`
+is a three-way setting whose `auto` mode disables the comparison once it starts discarding more than
+half of what it sees (§6.5), because a guard misreading an empty field must not be able to stop the
+database updating.
 
 **Revisit when:** any change routes units for one key through more than one goroutine — a decode pool,
 a work-stealing writer pool, or a resharding feature. Any of those makes the sequence comparison
@@ -3428,11 +3551,16 @@ transaction**, written in a fixed destination order with rows sorted by key insi
 **Consequences:** Better — FR9 now holds for the destination the requirement names (gap B2 closed);
 row-level deadlock is impossible rather than unlikely (§8.4, G12 — layer 1 supplies cross-shard
 disjointness, and ADR-005's in-flight rule supplies it within a shard); transcodes sharing a row share an
-entry, so the mirror is *smaller* (≈153 MB against ≈285 MB, §7.8) and produces fewer writes; and the
+entry, so the mirror is *smaller* (≈166 MB against ≈285 MB, §7.8) and produces fewer writes; and the
 transcode→column mapping becomes a named, testable module instead of being implicit in the writer
-(§6.1, half of gap S2). Worse — three new mechanisms to get right: the column mask, the
-per-contributing-transcode sequence slots, and ASM-15, which is a precondition no runtime check can
-catch and only `-selfcheck` can reject (§7.12 risks 5 and 6). Accepted.
+(§6.1). Worse — three new mechanisms to get right, and review has since shown that **two of the three
+were in fact got wrong**, which is the honest entry for this row. The column mask was cleared at the
+wrong point, discarding columns re-dirtied while a batch was in flight (Appendix A, B8). The
+per-contributor ordering slots were applied to the sequence number but not to `LogTime`, which left
+the general destination sharing one second-resolution clock across five transcodes (B9). Only ASM-15,
+the precondition no runtime check can catch and only config validation can reject, was carried
+correctly from the start. Both defects are fixed in §6.7 and §6.5 and gated in §10.4; the lesson is
+recorded at the end of Appendix A. Accepted.
 
 **Revisit when:** a fourth destination is needed — an audit/append table (ADR-008) being the likely
 cause — or when a destination appears whose row key cannot be derived from the shard key, which would
@@ -3447,7 +3575,13 @@ drained by several writers at once. The flush procedure it inherited did not per
 emitted **one** batch and stopped, so a shard holding four batches' worth of dirty rows sent one per
 `W` and exactly one writer ever served it. `maxInFlightPerShard` only came into play when a commit
 outran the window. The stated benefit of the pool — parallel drain of a skewed shard, and the
-designated general shard is skewed by construction (§7.12 risk 3) — never materialised.
+burst can leave one shard with thousands of distinct dirty rows (§7.5) — never materialised.
+
+An earlier draft of this ADR justified itself on the *designated general shard* being "skewed by
+construction". That does not survive §8.2: the general destination is four rows keyed by
+`market_type`, written a handful of times a day, so the shard hosting it is ordinary. The real case
+is the one above, and it is the case ADR-005 already argued — coalescing collapses a hot *row* and
+does nothing for a shard holding many distinct ones.
 
 The constraint on any fix is that **the shard goroutine must not block on a commit.** It owns the
 mirror; parking it stops Q1 draining and back-pressure reaches the receive goroutine, which NFR4 and
@@ -3520,23 +3654,23 @@ but they are given one line, not a paragraph.
 | FR3 | Parse each packet; extract transcode, sequence, timestamp, token(s) | `header` + `decoders` (§6.4); dispatch at payload offset 18, bible §2.8 |
 | FR4 | Fan out into per-token update units; applied independently | Fan-out into a caller-owned 40-unit array (§6.4); 7208 yields up to 2, bible §4.8; 7320 up to 35, bible §4.4b |
 | FR5 | Route each unit to the correct DB logic; different transcodes, different columns and tables | `destinations` maps a transcode to column contributions across up to three destinations (§6.1); a batch groups by destination and column mask, one array-bound statement per group (§8.3) |
-| FR6 | Coalesce high-frequency token transcodes down to ~1–10/s per active token | Mirror entry holds the newest row image; flush window `W` = 200 ms gives 5/s (§6.7, §7.3). *One global `W`, not a per-transcode interval: Appendix A, gap B5* |
+| FR6 | Coalesce high-frequency token transcodes down to ~1–10/s per active token | Mirror entry holds the newest row image; flush window `W` = 200 ms gives 5/s, mid-range in FR6's own band (§6.7, §7.3). **One global `W`, not a per-transcode interval** — a deviation from NFR1 stated in §1.1 and costed in OQ-15 |
 | FR7 | Persist every occurrence of critical transcodes; no coalescing, no rate limiting | **Deviation, stated in §1.1 and §8.1.** The `non-rate-limited` class is never coalesced-by-policy, never throttled and flushed on arrival (§6.8, ADR-004) — so req §10.1's reading ("we must not ourselves drop them") holds for arrival handling. But writes are in-place with no append destination (ADR-008), and two occurrences inside one flush cycle produce one row, so *every occurrence observable* is **not** delivered and FR7 is not `COUNT(*)`-verifiable |
 | FR8 | General messages a distinct class; distributed on transcode alone | General units are pinned to a designated shard and their destination is general-keyed (§6.5); market status 6511/6521/6522/6531/6571, bible §4.5 |
 | FR9 | An update never overwrites a newer one **for the same destination** | **Structural, and now at the stated granularity**: one goroutine applies and one writer commits each *destination row*, in wire order (ADR-002, ADR-005, ADR-007, ADR-017). Defensive guard kept per `(row, contributing transcode)` (§6.5). *Appendix A gap B2 closed by this change* |
 | FR10 | Basic counters and logging, including sequence-gap detection | §10.1 counter table; gap detector on the receive goroutine with a configurable scope (§6.5) |
 | FR11 | Stamp general units with an effective timestamp, header field with system-clock fallback | `(LogTime, receiptMonotonic)` pair — **note §3.4(a)**: `TimeStamp2` is the machine number, not a time (bible §2.5, §2.8), so `LogTime` is second-resolution and the receipt clock is always recorded |
-| NFR1 | Coalescing configured per transcode; **three** policy classes | **Deviation (§1.1, ADR-016).** Configured per transcode, but **two** classes: `rate-limited` and `non-rate-limited`. `intermediate-preserving` is withdrawn — intermediate values are not preserved anywhere. *One global `W`: Appendix A, gap B5* |
+| NFR1 | Coalescing configured per transcode; **three** policy classes | **Deviated from on two counts, both in §1.1.** (i) ADR-016: two classes rather than three — `intermediate-preserving` is withdrawn and intermediate values are not preserved anywhere. (ii) What is configured per transcode is *class membership*; the coalescing **rate** is one global `W` for every `rate-limited` transcode, against NFR1's "there is no single global policy". Flush groups are the costed Phase 2 shape (OQ-15) |
 | NFR2 | Rate limiting (lossy discard) per transcode, off by default, distinct from coalescing | **Deviation (§1.1, ADR-016).** The discard mechanism does not exist. The term `rate-limited` is reused for the *coalescing* cap that req §2's glossary explicitly says it is not — an override stated at the front of the document, not a conflation left implicit |
 | NFR3 | Concurrent DB writes across workers/connections, subject to ordering | A pool of `writers` (default 4) sized independently of the partitioning, with ordering from disjoint in-flight row sets (ADR-005, ADR-017) — which is also what makes row-level deadlock impossible (§8.4). Closer to NFR3's wording than the earlier 1:1 mapping, since the number of workers is now genuinely a concurrency choice — and since ADR-018 the concurrency is real *within* a shard too: an epoch emits as many batches as its cohort needs and `maxInFlightPerShard` of them commit at once, so a single busy partition is genuinely written by several connections |
 | NFR4 | Decouple socket read from DB write; no stall beyond ~100 ms | No DB work on the receive goroutine at all, and no wait for the flush a non-rate-limited unit triggers (§7.4); a 50 ms stall budget **per read-loop iteration**, shared across every unit a datagram fans out, with a ≤5 ms design target (§6.3). Measuring per iteration rather than per unit is what makes the budget comparable to NFR4's, which is stated over the read loop: a per-unit deadline let one 35-token 7320 datagram stall 35× the cap while satisfying its own rule. ASM-4 is the binding risk |
-| NFR5 | Bounded queues with defined overflow behaviour | Queue table with capacity, arithmetic, full-behaviour and signal (§6.6) — three queues plus a flush flag that is deliberately not a queue. *Appendix A, gap B4* |
+| NFR5 | Bounded queues with defined overflow behaviour | Queue table with capacity, arithmetic, full-behaviour and signal (§6.6) — three queues plus a flush flag that is deliberately not a queue. Q1's documented behaviour is to stop the process (req §10.2); Q2 and Q2c cannot fill by construction, and a Q2 send that fails anyway is fatal rather than deferred (§7.3) |
 | NFR6 | Write mode per transcode: batched on a time window with a max-size cap, or real-time | **Deviation (§1.1, ADR-016).** Write mode is no longer separately configurable: it is implied by class. `rate-limited` is batched on `W` with `maxBatchSize` as the secondary cap; `non-rate-limited` is written as soon as available. `maxBatchSize` is honoured literally since ADR-018 — it is a **per-batch** budget across all three destinations, so a transaction is never larger than the configured number, where the earlier per-destination reading allowed 3× it |
 | NFR7 | Concurrency sized to entitled capacity; applied where it helps | Parallelism at the I/O-bound write path only; decode deliberately single-goroutine (ADR-001, ADR-009) |
 | NFR8 | Everything tunable configurable and reloadable at runtime | SIGHUP + atomic pointer swap; reloadable/startup-only table (§6.9, ADR-010). **Worker-pool size is reloadable** since ADR-005 decoupled it from the partitioning — one of NFR8's listed tunables that an earlier draft had to concede needed a restart. Shard count, queue capacities and the destination set remain startup-only |
-| NFR9 | 150K–200K tokens resident within the memory budget | ~153 MB at 200K tokens across three destination mirrors (§7.8, §11.3) |
+| NFR9 | 150K–200K tokens resident within the memory budget | ~166 MB at 200K tokens across three destination mirrors (§7.8, §11.3) |
 | NFR10 | Policy and distribution addressable at (token, transcode), and at transcode for general | **Partial deviation.** Policy is per transcode and coalescing/ordering are per `(destination row, transcode)`, so both remain addressable at that granularity — but *distribution* is now per token, not per (token, transcode), because a unit's contributions must stay in one shard (§6.5, ADR-017). The three keys are named separately in §6.5 |
-| NFR11 | Modular, independently testable, where reasonable independently replaceable | Nine modules with named boundaries and a per-module test approach (§6.1) |
+| NFR11 | Modular, independently testable, where reasonable independently replaceable | Ten modules with named boundaries and a per-module test approach (§6.1) |
 | NFR12 | Malformed packet logged and dropped without affecting others or the process | Four ordered containment layers (§9.5); panic contained per sub-packet as `poc/gobrdclnt.go:178-183` |
 | NFR13 | Change-driven writes for coalesced transcodes only; no full-universe sweep | FIFO dirty rings mean no sweep; written-image digest means no rewrite. The carve-out is now enforced by an explicit rule — **a non-rate-limited contribution skips the digest check and always marks dirty** (§6.7) — rather than by lane separation. *Appendix A gap B6 closed: 7340 can be `rate-limited` and actually use the mechanism its own sweep justifies* |
 | req §7 | Oracle via `go-ora`, positional binds, `MERGE`, small pool under session/`IDLE_TIME` limits | §8.3; `ConnMaxLifetime` under `IDLE_TIME` (`poc/db.go:40-45`); binds `:1`, never `?` (`poc/db.go:236-246`) |
@@ -3620,17 +3754,17 @@ change the outcome of this project.
 |---|---|---|---|---|
 | R1 | **A subtly wrong decoder** — plausible values in the wrong fields | Medium. req §7 names this as the specific hazard of re-deriving the parsers; the bible's Appendix B lists ten places the source spec is wrong | Silent bad data in Oracle, indistinguishable from a market anomaly until someone reconciles. The worst failure in the system because nothing alarms | Compile-time layout assertions, differential test against `poc`'s `-debug` trace, an independently-written absolute-offset table (§10.4, ADR-012). Residual: a transcode `poc` cannot decode has no oracle but the bible's arithmetic |
 | R2 | **ASM-1/ASM-3 wrong — decode far more expensive than assumed** | Medium. Go on ppc64 is a second-tier port (req §4) and no measurement exists | Inline decode stops fitting the NFR4 budget; the socket/decode boundary of ADR-001 has to move behind a decode pool, which costs the structural ordering property | Measure on the LPAR **before** selection — half a day of work (OQ-5). Residual: none once measured, which is why it should be measured first |
-| R3 | **req §12.3 resolves badly — sequence and timestamp unusable** | Medium; req §10.5 raises it as a live doubt | Only FR10 gap detection is lost, because ordering is structural | ADR-007 makes ordering structural; §6.5's audit mode closes the item from production without a capture. Residual: gap detection may be unavailable, which weakens §9.4's triage — **and see Appendix A, gap B7, for the guard behaviour this still requires** |
+| R3 | **req §12.3 resolves badly — sequence and timestamp unusable** | Medium; req §10.5 raises it as a live doubt | Only FR10 gap detection is lost, because ordering is structural | ADR-007 makes ordering structural; §6.5's audit mode closes the item from production without a capture; `orderingGuard: auto` stops an unpopulated field from freezing the mirrors. Residual: gap detection may be unavailable, which weakens §9.4's triage |
 | R4 | **ASM-4 wrong — socket slack ~0.13 s, not 0.53 s** | Medium; BSD-derived stacks commonly charge mbuf overhead | NFR4's 5× margin becomes ~1.3×; a 50 ms stall starts costing datagrams | ≤5 ms design target rather than spending the budget (§6.3); measure via `netstat -s -p udp` under synthetic load. Residual: raising `udp_recvspace` needs a kernel tunable change |
-| R5 | **A pointer or slice creeping into `UpdateUnit` or `Entry`** | Medium over the life of the code — it is a one-line change that looks harmless | Buffer aliasing produces intermittent cross-contamination that looks exactly like a decode bug; and 256 MB of arena becomes GC-traced | Reflection gate in §10.4, invariant stated in §6.1 and ADR-006. Residual: only as good as the gate being kept |
+| R5 | **A pointer or slice creeping into `UpdateUnit` or `Entry`** | Medium over the life of the code — it is a one-line change that looks harmless | Buffer aliasing produces intermittent cross-contamination that looks exactly like a decode bug; and 147 MB of arena becomes GC-traced | Reflection gate in §10.4, invariant stated in §6.1 and ADR-006. Residual: only as good as the gate being kept |
 | R6 | **req §12.4 resolves high — thousands of active rows, not tens** | Medium; it is explicitly unresolved | Write-path headroom is ~0.3× against req §3.3's figure: the write path falls behind and dirty depth grows until the burst ends (§7.7) | Three reloadable levers now — **`writers`**, `W` and `maxBatchSize` — of which raising `writers` is the one that adds capacity rather than trading freshness (ADR-005). The backlog is bounded by the mirrors, so the failure is staleness, not memory. Residual: whether more sessions actually help is unmeasured (OQ-4), and widening `W` helps only where rows repeat |
 | R7 | **ASM-6 wrong — `go-ora` array binds unusable in a transaction** | Low–medium; unverified | Write ceiling drops to roughly 2,000 rows/s across 4 connections | Prepared-statement loops as the documented fallback; still above the *expected* rate, below the ceiling. Residual: the §3.3 ceiling case becomes uncomfortable, and with two fewer sessions than the earlier model there is less to fall back on |
 | R8 | **Q1 overflow stops the process, with no graduated stage before it** | Low; requires the shard goroutine to fall ~three orders of magnitude behind its ~0.08 % budgeted occupancy (§6.6) | A hard stop and a supervisor restart, with up to `W` of unwritten mirror state lost (req §10.1) and the staleness of req §10.3 | This *replaced* a worse risk. The earlier draft shed Q1's oldest unit and escalated on the third expiry in 60 s, which req §10.2 forbids for a queue carrying unthrottled traffic and which — under destination-row keying — could discard a whole destination's only pending columns (ADR-015). Trading rare silent loss for rare loud failure is the trade req §9 asks for. Residual: the early warning is `shard_send_blocked`, which nobody may be watching (R12) |
-| R9 | **Flush amplification from a chatty unthrottled transcode** | Medium until the inventory closes (req §12.1) | Commit rate rises toward `S / t_commit` ≈ 800/s; that class's latency drifts toward `W` | The coalescing flag bounds it structurally (§6.6), so the outcome is latency rather than saturation. `flush_coalesced / flush_triggered` is the signal; reclassifying the transcode is the lever. Residual: low technically, but it makes the inventory a capacity decision |
+| R9 | **Flush amplification from a chatty unthrottled transcode** | Medium until the inventory closes (req §12.1) | Commit rate rises toward `S / t_commit` — plan against **~200/s**, not the ~800/s an optimistic `t_commit` suggests (§4.2); that class's latency drifts toward `W` | The coalescing flag bounds it structurally (§6.6), so the outcome is latency rather than saturation. `flush_coalesced / flush_triggered` is the signal; reclassifying the transcode is the lever. Residual: low technically, but it makes the inventory a capacity decision |
 | R10 | **The 6541/6503 header-selection rule is wrong** | Low; the rule is designed, not specified (§6.4) | Heartbeats mis-dispatched; liveness alarms wrong in either direction | Length checks make a false positive very unlikely; confirm against a capture (OQ-6). Residual: liveness is SHOULD, so the blast radius is monitoring only |
 | R11 | **`poc` drifts or is retired**, breaking the differential oracle | Low near-term, high over years | R1's principal mitigation disappears | State the compatibility obligation in `poc`'s documentation (ADR-012); freeze a tagged build if it is retired |
 | R12 | **Operators do not read the 60 s counter line** | Medium — the most human risk here | Every graduated warning in the design is wasted, and the first symptom is a fatal stop | Keep the line short and delta-based; ensure FATAL messages carry the counter snapshot that led to them (§10.2). Residual: real, and not solvable in software |
-| R13 | **A destination's row key is not derivable from the shard key** (ASM-15) | Low, but silent | Two shards write one row: lost updates, and §8.4's deadlock argument fails | `-selfcheck` and the §10.4 gate reject it at load. Residual: the check must run against the *shipped* configuration — a misconfiguration that never sees `-selfcheck` is undetectable at runtime, because nothing fails loudly when two writers share a row |
+| R13 | **A destination's row key is not derivable from the shard key** (ASM-15) | Low, but silent | Two shards write one row: lost updates, and §8.4's deadlock argument fails | Rejected at **every** config load — startup, `-selfcheck` and the SIGHUP path all run the same rule set (§6.8), so a violating configuration cannot be loaded rather than merely being catchable before deployment. Also gated as a unit test against the shipped config (§10.4). Residual: the rule can only check what the configuration *declares*, so a destination whose row key is derived by code that disagrees with its declaration would still slip through — which is why the derivation lives in `destinations` as one named boundary (§6.1) |
 | R14 | **The column mask and the emitted statement drift apart** | Medium over the life of the code — new with the destination-keyed mirror | A column is silently not written, or written from a stale image. Looks exactly like a decode bug | The mask-fidelity gate in §10.4 asserts the statement's column list against the entry's mask. Residual: as good as the gate is kept |
 | R15 | **The in-flight state machine is wrong in a way nothing reports** | Medium; new with the writer pool (ADR-005) | Missing the `ReDirty` path loses an update silently; clearing `InFlight` early lets a row into two batches and reopens the FR9 race the pool was made safe against | Three property gates in §10.4, and the fallback that `maxInFlightPerShard = 1` restores the earlier one-batch-per-shard behaviour without a code change. Residual: the machine is goroutine-local so it cannot race, but it can be plainly wrong |
 
@@ -3672,7 +3806,7 @@ Ericsson switch" without stating its scope.
 *Who resolves:* the exchange, or §6.5's sequence audit mode running for a few minutes in production —
 no capture needed.
 *Blocks:* FR10's gap detection (§3.4(b)), and the behaviour of the defensive ordering guard if the
-field is unpopulated (Appendix A, gap B7). FR9 itself does not depend on it under this design, which
+field is unpopulated — answered by `orderingGuard` (§6.5). FR9 itself does not depend on it, which
 is the rubric-4 argument.
 *Note the correction in §3.4(a):* the "8-byte secondary timestamp" req §10.5 refers to is
 `TimeStamp2`, which bible §2.5 and §2.8 define as the **machine number**, not a time. The only time
@@ -3734,16 +3868,53 @@ the fatal-on-overflow lane?* — dissolved: the class is withdrawn and there is 
 (ADR-016, ADR-004). *OQ-7 — who owns `MD_EVENT` retention?* — dissolved: there is no append
 destination and nothing in the design grows without bound (ADR-008).
 
+**OQ-15 — Should `W` become per transcode, and by what mechanism?**
+*The gap:* NFR1 says coalescing is configured per transcode and that "there is no single global
+policy". This design configures *class membership* per transcode but applies one global window to
+everything in the `rate-limited` class, which is the third deviation recorded in §1.1.
+*Two shapes are available, and they are not equally priced.* **Flush groups** — a small fixed number
+of groups, each with its own tick, its own accumulating/cohort ring pair and its own epoch state, with
+transcodes assigned to a group — satisfies NFR1 for any realistic inventory and preserves oldest-first
+draining within a group. It costs a ring pair and an epoch state machine per group per shard, and it
+touches §6.7, §6.9, §7.3, ADR-018 and the memory arithmetic. **Per-entry eligibility** — a
+next-eligible timestamp on every entry — is the fully general answer and is the one ADR-018 already
+rejected: it breaks the oldest-first drain, because the head of the ring may be ineligible, so it
+needs skip-and-requeue or a time-ordered structure plus a "first dirtied at" field `Entry` does not
+carry.
+*Who resolves:* the stakeholder, once req §12.1's inventory shows whether any two `rate-limited`
+transcodes actually want different rates. *Blocks:* nothing in Phase 1 — `W` sits mid-range in FR6's
+1–10/s band, so one window is defensible; it blocks only the claim that NFR1 is satisfied rather than
+deviated from.
+
 **OQ-13 — What are the three destinations, and what is each one's row key?**
 *The gap:* the design fixes the **count** at three, requires each to declare a row key derivable from
 the shard key (ASM-15), and fixes the write order — but the identities, the column lists and the
 transcode→column mapping are schema work req §8 defers. §8.2 shows one plausible instantiation.
 *Who resolves:* the stakeholder plus the DBA. *Blocks:* the memory arithmetic in §7.8 (which assumes
 two token-keyed destinations at the full universe and one small general-keyed one, ASM-7), the
-`maxContributors` constant in §7.3, and `-selfcheck`'s validation set. Two constraints are not
-negotiable once chosen: every row key must be derivable from the shard key (R13), and a destination
-that would hold several rows per token — a normalised MBP depth ladder, say — multiplies every
-write-rate figure in §4.2 and §7.5 by that factor (§8.2).
+`maxContributors` and `imageSize` constants in §7.3, and `-selfcheck`'s validation set.
+
+**Five constraints are not negotiable once the destinations are chosen**, and they are listed together
+because each one silently invalidates a different part of this document if it is broken:
+
+1. Every row key must be derivable from the shard key (ASM-15, R13), or single-writer-per-row and the
+   deadlock argument both fail.
+2. A destination holding several rows per token — a normalised MBP depth ladder, say — multiplies
+   every write-rate figure in §4.2 and §7.5 by that factor (§8.2).
+3. Each destination's full column set must fit `imageSize` (**ASM-16b**). §8.2's `message_text` cap
+   exists because the 6511 family's `BroadcastMessage[239]` does not fit 256 B otherwise.
+4. No destination may have more contributing transcodes than `maxContributors` slots, and membership
+   is startup-only because it fixes the ordering-array slot assignment (§6.9).
+5. A unit should contribute to ≈1 destination row (**ASM-17**); two or three multiplies the
+   pessimistic row rate correspondingly.
+
+**One open protocol question sits underneath all of this.** `MS_BCAST_VCT_MSGS` carries a `LONG Token`
+at offset 40 (bible §4.5) that §8.2's `market_type`-keyed general destination discards. If market
+status is genuinely market-wide, discarding it is right and destination 3 stays four rows. If it is
+per-security, then four rows are collapsing up to 200,000, these are not "general" units under FR8 at
+all, and the shard-pinning of §6.5 is wrong for them. The bible does not say which, and this is the
+one item in OQ-13 that could change the destination *count* rather than a column list — so it should
+be settled before the others.
 
 **OQ-4 / ASM-6 — Does `go-ora` support array binds inside a transaction with correct affected-row
 counts?** *Who resolves:* a spike against the real instance. *Blocks:* the ~5,000 rows/s ceiling case;
@@ -3796,56 +3967,82 @@ after it.
 
 ---
 
-## Appendix A — Gaps identified by design review
+## Appendix A — Design review: what was found, and what is still open
 
-These came out of a review of this candidate as it stood in `phase1_hld2.md`. Most are **still open**
-and are recorded here so LLD does not start on top of them. Blocking items change a conclusion or a
-structure; significant items change a number or leave a boundary undefined.
+Two rounds of review have been run against this candidate. This appendix is now mostly a **changelog**:
+everything that could be closed by deciding something has been fixed in the body, and what remains is
+the short list of items that are genuinely blocked on someone outside this document.
 
-Three rounds of change have since closed seven of them — B1, B2, B6, S1, S3 and S6, plus half of S2,
-and most of B4 — either by correcting the body or by removing the structure the gap was about. Those
-are listed first, with what closed them, so the appendix does not read as a list of live defects when
-it is partly a changelog. B4 is listed under "blocking, still open" because a defined remainder
-survives.
+The policy changed between rounds and the change is worth stating. Round one recorded its findings
+here and deliberately left the body untouched, so the design could be read as it stood for stakeholder
+selection. Round two found five blocking defects in the mechanism — two of them silent data loss —
+and an appendix entry is the wrong home for "this state machine drops columns". A gap that can be
+closed by a decision belongs in the body; only a gap that is waiting on a person belongs here.
 
-One defect this review did **not** find is worth recording, since it was live until the third round:
-the flush procedure emitted a single batch per trigger, so a tick flushed at most `maxBatchSize` rows
-and a shard could only ever have one batch outstanding — which silently nullified the writer pool
-ADR-005 had just introduced. Nothing in the document was self-contradictory, which is why a
-consistency review missed it; it surfaced from a direct question about what happens when a shard has
-four batches' worth of dirty rows. ADR-018 is the answer. The general lesson for LLD is that
-*quantity* semantics — how much a procedure does, not just what it does — need stating as explicitly
-as ordering and failure semantics do.
+### Still open — each blocked on someone outside this document
 
-### Closed by the change recorded in §1.1
+| ID | Gap | Blocked on | Where |
+|---|---|---|---|
+| **A1** | **Per-row failure granularity for array-bound DML.** §9.2 and F14 say "skip the row, continue the batch", and §8.3 now carries a per-row status vector so the shard can act on that. Whether the vector can be *filled* depends on `go-ora` reporting per-row results for an array bind inside a transaction spanning three destinations. If it cannot, the documented fallback is coarse — the whole batch fails and retries — and one permanently-bad row would retry its batch indefinitely | **OQ-4 / ASM-6**: a spike against the real instance | §8.3, §9.2, §7.3, F14 |
+| **A2** | **The destination set, and the constraints that ride on it.** §8.2 is illustrative. Five constraints are non-negotiable once the destinations are fixed (ASM-15, the one-row-per-key rule, ASM-16b's image bound, `maxContributors`, ASM-17's fan-in) and the memory arithmetic in §7.8 assumes ASM-7's shape. Underneath sits an unresolved protocol question: `MS_BCAST_VCT_MSGS` carries a `Token` the general destination discards (bible §4.5), and if market status is per-security rather than market-wide the destination *count* changes | **OQ-13**: the stakeholder and the DBA | §8.1, §8.2, §7.8, ASM-7, ASM-16b, ASM-17 |
+| **A3** | **Three unmeasured performance assumptions.** ASM-1 and ASM-3 (LZO1Z and parse cost on ppc64) carry ADR-001's inline-decode boundary; ASM-4 (whether AIX charges `udp_recvspace` by payload bytes) sets whether NFR4's margin is 5× or 1.3×. None has been measured on the LPAR, and ASM-1/ASM-3 are the cheapest high-value measurement available | **OQ-5 / R2 / R4**: half a day on the target hardware | §4.2, §4.3, §6.3, ADR-001 |
+| **A4** | **Whether `W` should be per transcode.** Declared as a deviation in §1.1 rather than left implicit, and the two mechanisms are costed in OQ-15. Phase 1 ships one global window | **OQ-15**: req §12.1's inventory, then the stakeholder | §1.1, §6.7, §6.9, OQ-15 |
+
+### Closed in round two — the five blocking defects and what fixed them
+
+| ID | Defect | Fix |
+|---|---|---|
+| **B8** | **`ColMask` cleared on completion discarded columns re-dirtied in flight.** The pump left the entry's mask intact; a mid-flight merge OR-ed its columns back in; completion's `ColMask &^= writtenMask` then cleared exactly those bits. The row was correctly re-queued dirty but its statement omitted the columns, so the newer values never reached Oracle and were not recovered unless that transcode happened to tick again — silent, permanent, and the exact hazard the document already guarded against on the *digest* half of the same operation | **§6.7, §7.3.** `ColMask` is zeroed when the batch is filled, so the entry's mask means "dirtied since batching"; the failure path restores it with `ColMask \|= batch.writtenMask`. §8.3 now builds the statement from the batch's mask. Gated in §10.4 |
+| **B9** | **The ordering guard's timestamp was per row while its sequence was per transcode.** `LastTime` was a scalar, so all five market-status transcodes shared one second-resolution `LogTime` on one `market_type` row. A same-day re-open sends 6531 → 6571 → 6511 inside a second (bible §4.5), and the last two compared "not newer" and were discarded — the market never reaches `Open` and §6.10's state machine stalls | **§6.5, §7.3.** `LastTime` and `LastRecv` are `[maxContributors]` arrays alongside `LastSeq`; the receipt monotonic clock §3.4(a) mandates is now stored and breaks the same-second tie. Gated in §10.4. This also closes round one's B7 |
+| **B10** | **A non-rate-limited unit could lose its own flush trigger.** §7.3 cleared `FlushReq` in step 1 and could then return in step 2 on empty rings — consuming a request nothing served, so the unit waited a full `W`, with only a rising `epoch_empty` to show for it. Compounded by five figures showing the *router* raising the flag at enqueue while Figure 4 showed the shard raising it after the merge | **§7.3, and Figures 2, 3, 5, 9, 10.** The rings are tested before the flag is cleared, matching what §6.6's table already promised; the shard raises the flag after the merge, and the router does not. Gated in §10.4 |
+| **B11** | **Q1's drop-oldest violated req §10.2 and its rationale did not survive ADR-017.** Since ADR-004 merged the lanes Q1 carries unthrottled traffic, so req §10.2 requires overflow to be fatal, not lossy — and the "discarding the oldest costs history coalescing would discard anyway" argument holds per `(row, transcode)`, not for a queue carrying every transcode routed to a shard. The oldest unit may be the sole carrier of another destination's columns | **§6.6, F9, ADR-015.** Q1 discards nothing; overflow stops the process on the first expiry. req §10.2 moves from deviated-from to satisfied in §13, and §9.4 loses a whole branch because FeedValve no longer has in-process loss |
+| **B12** | **`Entry.Image` was sized by an assumption about a different quantity.** ASM-16 bounded what one *transcode* contributes across all destinations, which sizes the `UpdateUnit` blob. Nothing bounded a *destination row's* full column set — and §8.2's own `MD_MARKET_STATUS` already broke 256 B, because `MS_BCAST_VCT_MSGS` carries `BroadcastMessage CHAR[239]` (bible §4.5) | **ASM-16a / ASM-16b, §8.2, §10.3, §10.4.** The assumption is split in two, `message_text` is capped using `BroadcastMessageLength`, and both bounds are gated at build time and by `-selfcheck`. This also closes round one's S2 |
+
+### Closed in round two — significant items
+
+| ID | Item | Fix |
+|---|---|---|
+| B3 | 50 ms deadline was per unit; NFR4 budgets per read-loop iteration | One budget per iteration, shared across the datagram's units (§6.3, §6.6, §13 NFR4) |
+| B4 | Statement-level errors would drain the pool one writer at a time | The two-writer / `statementFailWindow` pool-stop rule, plus `writers_stopped` (§9.2, §10.1) |
+| B5 | One global `W` against NFR1's per-transcode wording | Declared as a deviation in §1.1; alternatives costed in OQ-15 |
+| S5 | Shard latency spikes unbudgeted; nothing pre-sized | Indexes pre-sized and arena chunk 0 pre-allocated at startup; `shard_loop_max_ns` (§7.8, §10.1) |
+| S7 | `active_tokens_1s` allocating on the receive goroutine; narrow alloc gate | Set allocated once and cleared; the zero-allocation gate now covers the whole receive iteration (§6.5, §10.4) |
+| — | Gap detector read `BCSeqNo` before the header type was known | Detector runs after header resolution; 6541/6503 excluded. The `ErrorCode` check correctly stays before dispatch — offset 12 in both headers (§6.5, §6.2) |
+| — | `maxBatchSize` reloadable while its buffers were pre-allocated | Reloadable downward only, within a startup-only ceiling (§6.9) |
+| — | `maxContributors` build-time but its input reloadable; slot assignment undefined | Contributor *membership* is startup-only; slots assigned by ascending transaction code (§6.8, §6.9, §7.3) |
+| — | `t_commit` was 5 ms in the load arithmetic and 20 ms in the latency arithmetic | Defined once as a range in §4.2; ceilings now use the conservative end (~200 commits/s, not ~800) |
+| — | "The general shard is skewed by construction" — ADR-018's stated motivation | Contradicted by §8.2 (four rows, a handful of writes a day). Re-based on the real case: a burst leaving one shard thousands of *distinct* dirty rows (ADR-002, ADR-005, ADR-018, §7.7, §7.12) |
+| — | The flush broadcast was justified by cross-shard coherence it does not deliver | Restated: `S` independent transactions buy promptness everywhere, not a consistent cut (§7.4, ADR-004) |
+| — | `Entry` quoted at 336 B via a "flags+pad 32" term Go's layout does not produce | Re-derived field by field: 368 B with the new ordering arrays; resident total 153 → 166 MB (§7.8, §11.3) |
+| — | Epoch completeness stated unconditionally but false on the failed-commit path | Carve-out stated, and §10.4 gates both halves (§7.3) |
+| — | A failed `batchQ` send deferred to a completion that could never arrive | Fatal rather than deferred — it cannot be resumed at `CohortOut == 0` (§6.6, §7.3) |
+| — | Stale text: one-writer-per-shard in §7.10 and Figure 2; 256 MB heap in four places; "nine modules"; R13's residual contradicting §6.8 | All corrected |
+
+### Closed in round one — by the change recorded in §1.1
 
 | ID | Gap | How it closed |
 |---|---|---|
-| B1 | The burst write-rate arithmetic was 4× low — 750 rows/batch × 5 flushes/s is *per shard*, so the aggregate is 15,000 rows/s, not 3,750 | **Corrected in the body.** §7.5 now states 15,000 rows/s with the sanity check (distinct rows ⇒ no coalescing ⇒ row rate equals unit rate); §7.7's headroom is ~0.3×, not ~1.3×; §9.3 notes the drain rate is Oracle's ~5,000/s, not the 20,000/s channel capacity |
-| B2 | The distribution key was not the persistence destination, so FR9's "for the same destination" did not hold where two transcodes wrote one row | **Removed by ADR-017.** The mirror is keyed by destination row; 7305 and 7340 share one entry, one shard and one writer. §8.3's "two writers never touch the same row" is now true rather than assumed |
-| B6 | NFR13's justifying case (the 7340 sweep) was classified onto the lane where suppression was structurally unavailable | **Removed by ADR-016 and ADR-004.** There are no lanes, and 7340 can be configured `rate-limited`, so it uses the mechanism its own sweep justifies (§6.7) |
-| S1 | The lossless lane's queue sizing did not survive its own worked example once each unit cost two rows | **Removed.** There is no lossless queue, and with the append destination gone each unit costs one row (ADR-008) |
-| S3 | "Raise the connection count" was offered as an operator lever that ADR-005 and ADR-010 forbid | **Resolved by making the lever real.** ADR-005 decoupled the writer pool from the shards, so `writers` — and with it the session count — is now an independently configurable tunable, reloadable in both directions (§6.9). The playbook offers it because it exists |
-| S6 | The MBP depth-ladder row multiplier was absent from every rate figure | **Constrained in §8.2.** The illustrative instantiation denormalises the ladder into the quote row, and the text states that one key = one row is a constraint on whatever the three destinations turn out to be, not a preference (OQ-13) |
-| S2 (half) | No module owned turning an opaque value image into column binds | **Named.** `destinations` is a module in §6.1 with its own responsibility, inputs, outputs and test approach |
+| B1 | Burst write-rate arithmetic was 4× low | Corrected in §7.5 (15,000 rows/s), §7.7 (~0.3× headroom) and §9.3 |
+| B2 | The distribution key was not the persistence destination | Removed by ADR-017 — the mirror is keyed by destination row |
+| B6 | NFR13's justifying case was on the lane where suppression was unavailable | Removed by ADR-016 and ADR-004; 7340 can be `rate-limited` |
+| S1 | The lossless lane's queue sizing did not survive its own example | Removed — there is no lossless queue |
+| S3 | "Raise the connection count" was a lever the ADRs forbade | ADR-005 made `writers` an independent, reloadable tunable |
+| S6 | The MBP depth-ladder row multiplier was absent from every rate figure | Constrained in §8.2 — the ladder is denormalised into the quote row |
 
-### Blocking, still open
+### One methodological note, carried forward
 
-| ID | Gap | Where |
-|---|---|---|
-| B3 | **The 50 ms send deadline is per unit; NFR4's budget is per read-loop iteration.** A 3–4 sub-packet 7208 datagram emits 6–8 units, so the worst-case stall is 300–400 ms, already over budget; a 7320 datagram (35 units per message) is far worse. And because three expiries in 60 s is fatal, the third unit *of the same datagram* trips the terminal path — so F9's graceful drop-oldest degradation is effectively unreachable. **Now more consequential**, since Q1 carries both classes and F9 is the only remaining terminal condition besides the database fail-fast | §6.3, §6.6, §7.2, F9 |
-| B4 | **Mostly closed by ADR-005.** The completion path is now a named queue with a capacity and an overflow argument (`completionCh[k]`, §6.6 Q2c); the shard applies the confirmation, so arena ownership is intact; "clean-pending" is replaced by the explicit `InFlight`/`ReDirty` state machine (§6.7), which specifies the re-dirty-while-in-flight case and the failed-commit path; and the free list is named as the concurrency bound rather than left implicit. **What remains open** is narrower but real: the statement-level error case, where a wrong statement fails for *every* writer, so retiring writers one at a time would drain the pool — §9.2 states the pool must stop itself once the same statement fails on more than one writer, but does not yet define the threshold or the recovery | §6.6 Q2/Q2c, §6.7, §7.3, §9.2 |
-| B5 | **There is no per-transcode rate, only one global `W`.** §6.9 no longer lists a per-transcode interval as a tunable, so the document is at least self-consistent — but **the gap is sharper than before**, because the class is now literally named `rate-limited` while the mechanism offers exactly one rate for every transcode in it. NFR1's "coalescing is configured per transcode" is satisfied only in the sense that *membership* is per transcode. A per-destination or per-transcode interval needs a per-entry next-eligible-time and a second ring, neither of which exists | §6.7, §6.9, §7.3, NFR1 |
-| B7 | **The defensive ordering guard becomes a silent outage if `BCSeqNo` is unpopulated.** With a constant or zero `BCSeqNo` and one-second `LogTime`, every contribution after the first compares "not newer" and is discarded — the mirrors freeze and the database stops updating, with only a counter rising. No detection or disable path is specified, yet "survives req §12.3 resolving badly" is the headline rubric-4 claim. Separately, `Entry` has no field for the receipt clock, so a *rate-limited general* transcode has nowhere to store the `(LogTime, receipt)` pair §3.4(a) mandates. The per-`(row, transcode)` slots of §6.5 change the blast radius but not the defect: each slot freezes independently | §6.5, §6.7, §7.3, ADR-007 |
+Round one missed a defect that was live until its third revision: the flush procedure emitted a single
+batch per trigger, silently nullifying the writer pool ADR-005 had just introduced. Nothing was
+self-contradictory, which is why a consistency review missed it; it surfaced from a direct question
+about what happens when a shard has four batches' worth of dirty rows.
 
-### Significant, still open
-
-| ID | Gap | Where |
-|---|---|---|
-| S2 | **The 256 B row image and ~384 B `UpdateUnit` have a derivation but no gate.** ASM-16 now states the assumption and §7.3 shows the arithmetic, and the missing transcode→column boundary is now the `destinations` module — but §10.4 still has no build-time gate asserting that a destination's declared column set fits the image, and margins are thin (7305's body is 254 B; 7200's record is 236 B) | §6.1, §7.3, §7.8, ADR-006, ASM-16 |
-| S4 | **Row-level error handling assumes a granularity array-bound DML does not give.** F14 and §9.2 say "skip the row, continue the batch" while §8.3 makes each destination-plus-mask group one array-bound execution, now inside a transaction spanning three destinations. ASM-6 covers whether array binds exist, not partial-failure semantics — and a skipped row interacts with B4's confirm-on-commit rule. **Widened by the change**: a partial failure now has to be attributed to one of three destinations before the shard knows which entries to leave dirty | §8.3, §9.2, F14, ASM-6 |
-| S5 | **The shard goroutine's own latency spikes are not budgeted.** It owns three `map[RowKey]int32` indexes growing toward 100,000 entries each plus arena chunk allocation, on the sole consumer of Q1 — against a 50 ms deadline and a three-strikes-fatal rule (B3). Nothing pre-sizes the indexes or pre-allocates the arenas | §7.3, §7.8, §6.6 Q1 |
-| S7 | Smaller items: `active_tokens_1s`'s per-second map inserts allocate on the receive goroutine, and §10.4's zero-allocation gate covers only decode-and-fan-out; the market-session machine is per `MarketType` while the general destination is keyed by `market_type` — consistent now, but only because §8.2 chose that key, so it must stay consistent when OQ-13 closes | §6.10, §7.8, §10.4 |
+Round two's five blocking defects have a different shared cause, and it is the more useful lesson.
+**B8, B11 and B12 are all reasoning that was correct under the old `(token, transcode)` mirror keying
+and was never re-derived when ADR-017 re-keyed by destination row** — the same species as B2, which
+round one did catch. The structural change was applied; the arguments that depended on it were not
+swept. When a keying or ownership decision changes, every argument of the form "this is safe because
+X and Y are the same thing" has to be re-checked, not just the code path that constructs them. The
+mask, the drop policy and the image bound each failed that check in a different section.
 
 ---
 
@@ -3867,7 +4064,18 @@ it. That is the difference between a design that is correct and a design that is
 req §12.3 resolves the way we hope.
 
 The third thing, and the one a reviewer should weigh hardest, is the price of §1.1. Collapsing to two
-classes bought a real simplification — one pipeline, no fatal overflow path, no unbounded table, half
-the resident memory — and it was paid for in verifiability: FR7 can no longer be checked from the
-database, intermediate values are gone, and three requirements are deviated from rather than met.
-That trade was directed, not chosen here, but it should be accepted knowingly.
+classes bought a real simplification — one pipeline, no terminal condition on the unthrottled trigger
+path, no unbounded table, less resident memory — and it was paid for in verifiability: FR7 can no
+longer be checked from the database, intermediate values are gone, and six requirement clauses are
+deviated from rather than met (§0). Most of that trade was directed; the global `W` was not, and is
+declared alongside the rest so the list is honest rather than flattering.
+
+The fourth is a caution about this document rather than about the design. Three of the five blocking
+defects the second review found — the column mask, Q1's drop policy, and the row-image bound — were
+not new mistakes. They were arguments that had been correct under the earlier `(token, transcode)`
+mirror keying and were left standing when ADR-017 re-keyed by destination row. Each read as sound
+prose in its own section, and each was false. **A structural change of that kind invalidates every
+argument that rests on two things being the same, and those arguments are scattered by construction,
+because good writing puts each one where it is needed.** That is the failure mode this document is
+most prone to, and the reason Appendix A now records the *shared cause* of a review round rather than
+only its findings.
