@@ -752,11 +752,14 @@ flowchart LR
     G -->|"error: count, log, skip this sub-packet only"| D
     G --> I["payload with 8-byte prefix"]
     H --> I
-    I --> J["skip 8 bytes, parse header<br/>check byte 0 equals netId"]
+    I --> J["skip 8 bytes, check byte 0 equals netId<br/>read ErrorCode at header offset 12<br/>valid in BOTH header layouts"]
     J -->|"ErrorCode non-zero: MS_ERROR_RESPONSE, count, no write"| D
-    J --> K["gap detector on BCSeqNo"]
+    J --> HR{"RESOLVE THE HEADER first, section 6.4<br/>MESSAGE_HEADER iff 6541 at len 48<br/>or 6503 at len 60"}
+    HR -->|"yes: MESSAGE_HEADER"| MH["heartbeat or asset rate update<br/>NO gap detector - offset 14 holds a<br/>nanosecond Timestamp here, not BCSeqNo<br/>counted separately"]
+    MH --> D
+    HR -->|"no: it is BCAST_HEADER"| K["gap detector on BCSeqNo<br/>header offset 14"]
     K --> L{"transcode in registry?"}
-    L -->|"no: count, rate-limited log, advance cursor"| D
+    L -->|"no: count unknown, rate-limited log, advance cursor"| D
     L -->|"yes"| M["decode body, fan out one unit per token<br/>attach up to 3 contribution descriptors"]
     M --> N["router: class, shard from token<br/>enqueue on shardCh - the flush request is raised later,<br/>by the shard, after the merge"]
     N --> D
@@ -765,6 +768,16 @@ flowchart LR
 *Figure 3 — Ingest pipeline. The FIFO sub-packet loop and both branches of the compression predicate
 are explicit; every terminating edge names what is counted. Cursor advance is `2 + iCompLen` for the
 compressed branch and `2 + 8 + MessageLength` for the uncompressed branch (bible §3.3).*
+
+**Three orderings in that diagram are load-bearing and none of them is arbitrary.** `ErrorCode` is
+read **before** header resolution, because it sits at offset 12 in both layouts (bible §2.8) and
+bible §2.10 requires it checked before the transaction code is trusted. Header resolution comes
+**before** the gap detector, because `BCSeqNo` exists only in `BCAST_HEADER` — at offset 14 of a
+`MESSAGE_HEADER` sits the top half of a nanosecond `Timestamp`, and feeding that to the detector
+fabricates a gap on every heartbeat (§6.5). And the gap detector comes **before** the registry
+lookup, not after, so that a *known* header carrying an *unknown* transcode is still counted by the
+detector: excluding unknown codes would make the default `global` scope under-count by exactly the
+messages we cannot decode, which is the opposite of useful.
 
 Three properties of this loop are protocol requirements, not choices:
 
@@ -874,20 +887,37 @@ message uses `BCAST_HEADER` with `TransactionCode` at header offset 10 (payload 
 **6541 and 6503 use `MESSAGE_HEADER`, where the code sits at offset 0** (bible §2.8, §4.12, §4.15).
 The dispatcher must know which header it has before it knows the code. The rule adopted:
 
+Resolution returns a **triple** — `(headerKind, code, known)` — and it does so *without consulting the
+registry*, so that header classification cannot change when the configured inventory does:
+
 ```
-read SHORT at payload offset 18            -> candidate A (BCAST_HEADER)
-if A is a code in the registry             -> BCAST_HEADER, dispatch on A
-else read SHORT at payload offset 8        -> candidate B (MESSAGE_HEADER)
-     if B is 6541 and payload length == 48 -> MESSAGE_HEADER, heartbeat
-     if B is 6503 and payload length == 60 -> MESSAGE_HEADER, asset rate update
-     else                                  -> unknown transcode, count A
+B := SHORT at payload offset 8    // MESSAGE_HEADER.TransactionCode, header offset 0
+A := SHORT at payload offset 18   // BCAST_HEADER.TransactionCode,   header offset 10
+
+if B == 6541 and payloadLen == 48 -> (MESSAGE_HEADER, 6541, known)   // heartbeat
+if B == 6503 and payloadLen == 60 -> (MESSAGE_HEADER, 6503, known)   // asset rate update
+otherwise                         -> (BCAST_HEADER,  A,    A in registry)
 ```
 
-The length checks are what make this safe: 6541 is `MESSAGE_HEADER` only, 40 bytes (bible §4.12), so
-the payload is 48 bytes with the prefix; 6503 is 52 bytes (bible §4.15), so 60 with the prefix. In a
-6541 message, payload offset 18 falls inside `TraderId` (bible §2.8), which on a broadcast circuit is
-expected to be zero — so candidate A will not collide with a real code. **This is a designed rule,
-not a protocol fact; ASM-8 and OQ-6 cover confirming it against a capture.**
+**Everything that is not one of those two exact shapes is `BCAST_HEADER`**, including a `BCAST_HEADER`
+carrying a transcode nobody has configured. That matters for gap detection: the detector runs on
+`headerKind == BCAST_HEADER` regardless of `known`, so an unconfigured code still advances the
+sequence check rather than punching a hole in it (§6.2, §6.5).
+
+The code-plus-length pair is what makes this safe. 6541 is `MESSAGE_HEADER` only and 40 bytes (bible
+§4.12), so its payload is 48 with the prefix; 6503 is 52 bytes (bible §4.15), so 60. For a genuine
+`BCAST_HEADER` message to be misread as one of them, payload offset 8 — which is `BCAST_HEADER`'s
+first `Reserved BYTE[2]` (bible §2.8), expected zero — would have to hold exactly 6541 or 6503 *and*
+the message would have to be exactly 40 or 52 bytes from the header onward, i.e. a body-less or
+12-byte-bodied broadcast message. No catalogued message has that shape.
+
+This ordering is a deliberate change from an earlier form of the rule, which tested registry
+membership first and fell through to the `MESSAGE_HEADER` candidates only on a miss. That version
+worked but coupled two things that should not be coupled: adding a transcode to the inventory could in
+principle change how a message's *header* was classified, and it left "unknown code" ambiguous as to
+which header layout had been assumed — which is precisely the information the gap detector needs.
+**This is still a designed rule, not a protocol fact; ASM-8 and OQ-6 cover confirming it against a
+capture.**
 
 **Unknown and unconfigured transcodes** (req §12.1 requires this to be defined — "they will occur"):
 count by code, log at most once per code per interval, do **not** attempt to decode a body, and
@@ -965,20 +995,51 @@ mechanism that establishes order (ADR-007).
 
 **The guard has an off switch, and it needs one.** If req §12.3 resolves badly and `BCSeqNo` turns out
 to be constant or zero, a strict "newer than" comparison discards every contribution after the first
-and the mirrors freeze — the database simply stops updating, with nothing but a rising counter to show
-for it. `orderingGuard` is therefore a reloadable three-way setting (§6.9):
+and the affected mirrors freeze — the database simply stops updating, with nothing but a rising counter
+to show for it. `orderingGuard` is therefore a reloadable three-way setting (§6.9):
 
-- `on` — always compare.
+- `on` — always compare, never self-disable.
 - `off` — skip the comparison entirely. Safe by construction: ADR-007 mechanism 1 establishes ordering
   structurally, and the guard is only the defence against wire reordering.
-- `auto` (**default**) — compare, but if `units_superseded_out_of_order / units_applied` exceeds
-  `guardSuppressionRatio` (default 0.5) over a full stats interval, log ERROR once naming the ratio and
-  disable the guard for the remainder of the session. `ordering_guard_state` (§10.1) reports which
-  mode is in force.
+- `auto` (**default**) — compare, and disable the guard **for an individual transcode** once that
+  transcode's own discard ratio shows the field it is reading is unusable.
 
-`auto` exists because the failure is silent and the recovery is free. A guard that is discarding more
-than half of everything it sees is not defending against reordering, it is misreading an unpopulated
-field, and the correct response is to stop using it rather than to stop writing.
+**`auto` is scoped per contributing transcode, because that is the granularity of the fault.** An
+unpopulated `BCSeqNo` is a property of one message type, not of the feed: if one transcode is 30 % of
+traffic and its sequence is constant, a *global* ratio never crosses any sensible threshold while that
+transcode's rows stay frozen forever — and if a global ratio did cross, it would switch off the guard
+for every well-behaved transcode too. Two counters are therefore kept per contributing transcode:
+
+| Counter | Incremented when |
+|---|---|
+| `guard_offered{transcode}` | a contribution reaches the comparison — i.e. the entry exists **and** this transcode's slot has been populated at least once |
+| `guard_superseded{transcode}` | that comparison came out "not newer" and the contribution was discarded |
+
+The denominator definition matters and is easy to get wrong. **A contribution that creates an entry,
+or that is the first to populate its contributor slot, has nothing to compare against; it bypasses the
+guard and counts in neither counter.** Using `units_applied` as the denominator — which an earlier
+draft did — mixes in every unit that never reached the comparison at all, so the ratio drifts with the
+inventory mix rather than with the health of the field being tested.
+
+**Evaluation is off the data path and bounded in time.** The stats goroutine evaluates every
+`guardEvalInterval` (default **5 s**, not the 60 s stats interval) for each transcode that has
+accumulated at least `guardMinSamples` (default 100) offers since the last evaluation. If
+`guard_superseded / guard_offered` exceeds `guardSuppressionRatio` (default 0.5), that transcode's
+guard is disabled for the remainder of the session and one ERROR is logged naming the transcode, the
+ratio and the sample count. The worst-case freeze is therefore one evaluation interval plus the time
+to reach the sample floor — seconds, not the full minute a stats-interval-scoped rule would have cost,
+which matters because the freeze is total for the rows that transcode feeds.
+
+Mechanically the decision is one `atomic.Bool` per configured transcode, written once by the stats
+goroutine and read by the shards with a single atomic load at comparison time. Disabling is one-way
+within a session: re-enabling on a recovered ratio would flap, and there is nothing to gain from it
+because the guard is a defence, not the ordering mechanism. `ordering_guard_disabled{transcode}`
+(§10.1) reports the set.
+
+`auto` exists because the failure is silent and the recovery is free. A guard discarding more than
+half of what it sees is not defending against reordering — it is misreading an unpopulated field — and
+the correct response is to stop using it for that transcode rather than to stop writing that
+transcode's rows.
 
 **Gap detection (FR10, conditional on req §12.3).** The detector runs on the receive goroutine,
 before any queue, because it must see every message in arrival order and it costs one comparison.
@@ -990,6 +1051,13 @@ sequence number would feed a wild value into the detector on every heartbeat, wh
 pulse is a steady drip of fabricated `seq_gap` events on the one counter §9.4's triage procedure
 depends on. So the dispatcher resolves the header first (§6.4), and the detector sees `BCAST_HEADER`
 messages only; 6541 and 6503 are excluded and counted separately.
+
+**But it runs *before* the registry lookup, not after**, and the two exclusions are different. A
+`MESSAGE_HEADER` message has no `BCSeqNo` to read, so it is skipped. A `BCAST_HEADER` message
+carrying an unconfigured transcode has a perfectly good `BCSeqNo` and is **not** skipped — it is
+counted, then discarded by the registry as unknown (§6.2, ADR-011). Excluding it would make the
+default `global` scope under-count by exactly the traffic we cannot decode, turning every
+unconfigured code into a permanent phantom gap.
 
 The `ErrorCode` check is the opposite case and is deliberately left where it is, before dispatch:
 `ErrorCode` sits at offset 12 in **both** headers (bible §2.8), so checking it early is correct for
@@ -1022,9 +1090,9 @@ that table. Defaults are reloadable except where marked startup-only (§6.9).
 | # | Queue | Carries | Capacity (default) | Arithmetic behind it | Producer behaviour when full | Saturation signal |
 |---|---|---|---|---|---|---|
 | Q0 | Kernel socket buffer | datagrams | 640 KB (`udp_recvspace`) | 1,270 datagrams ≈ 0.53 s at 2,400/s; ≈ 0.13 s if ASM-4 is wrong | Kernel tail-drops silently — not our policy | `netstat -s -p udp` socket buffer overflows; also a `BCSeqNo` gap |
-| Q1 | Shard ingest `shardCh[k]` | `UpdateUnit` by value, 384 B | 4,096 units, startup-only | 15,000 units/s ÷ 4 shards = 3,750/s → 1.09 s of slack | Non-blocking send; on failure block against the **datagram's remaining stall budget** (50 ms, started once per read-loop iteration and shared by every unit that datagram fans out). **On expiry: stop loudly.** No unit is ever discarded | `shard_send_blocked`, `stall_budget_p99`, depth in the 60 s line |
+| Q1 | Shard ingest `shardCh[k]` | `UpdateUnit` by value, 384 B | 4,096 units, startup-only | 15,000 units/s ÷ 4 shards = 3,750/s → 1.09 s of slack | Non-blocking send; on failure block against the **datagram's remaining stall budget** (50 ms, started once per read-loop iteration and shared by every unit that datagram fans out). **On expiry: stop loudly.** No unit is ever discarded | `shard_send_blocked`, `stall_budget_used_max_ns`, depth in the 60 s line |
 | Q2 | Shared batch queue `batchQ` | `*Batch` spanning all three destinations, drawn from the producing shard's free list | `shards × maxInFlightPerShard` batches (default 8), startup-only | **Sized so it cannot fill.** Only `maxInFlightPerShard` batches exist per shard, so the free list bounds what can be in flight and the queue merely holds them — stated explicitly rather than left implicit | **Never blocks**, and by construction never fails. A failed non-blocking send is a defect, not load: it cannot be resumed when `CohortOut == 0`, so the shard counts `flush_deferred`, logs FATAL and stops (§7.3) | `flush_deferred`, `dirty_depth`, `batchq_depth` |
-| Q2c | Completion `completionCh[k]` | the finished `*Batch`, returned to its **owning** shard | `maxInFlightPerShard` (default 2) | One slot per batch that shard can have outstanding, so the writer can always hand a batch back | **Cannot fill**, for the same reason. A writer never blocks returning a batch | `completion_lag` |
+| Q2c | Completion `completionCh[k]` | the finished `*Batch`, returned to its **owning** shard | `maxInFlightPerShard` (default 2) | One slot per batch that shard can have outstanding, so the writer can always hand a batch back | **Cannot fill**, for the same reason. A writer never blocks returning a batch | `completion_lag_max_ns` |
 | **F** | Flush request `flushReq[k]` | **not a queue** — one boolean per shard, set atomically **by whichever shard merged a non-rate-limited contribution**, never by the router | 1 bit | A request is an *edge*, not a message: what matters is that a flush happens after this unit, not how many were asked for. Raising it after the merge rather than at enqueue is what keeps the request and the contribution that justifies it inseparable (§7.3) | **Cannot fill.** Setting an already-set flag is a no-op and is counted as a coalesced request. The flag is cleared **only when an epoch actually opens** — a tick that lands mid-epoch leaves it set, and so does an open attempt that finds every ring empty, or the request would be discarded unserved (§7.3) | `flush_triggered`, `flush_coalesced` |
 
 Both classes of traffic use Q1 and Q2. There is no second lane; what a non-rate-limited unit does
@@ -1318,7 +1386,7 @@ than a stale one.
 | Per-transcode column contributions — **which columns** | yes | Read by `destinations` at decode; adding a column a destination already declares is a config change, not a rebuild |
 | Per-transcode **contributor membership** — *which transcodes contribute to a destination at all* | **no — startup only** | Distinct from the row above, and the distinction matters. Membership fixes the `[maxContributors]` slot assignment that `LastSeq`, `LastTime` and `LastRecv` are indexed by (§7.3). A reload adding a contributor would index past a fixed-size array; a reload reordering them would silently reassign every stored ordering value to the wrong transcode, which fails as lost updates rather than as an error. Slots are assigned at startup by ascending transaction code |
 | **Destination set — the three destinations and their row keys** | **no — startup only** | Changing a row key re-keys a mirror and strands state mid-session, exactly as changing shard count does. Adding or removing a destination resizes the arena set |
-| `orderingGuard` — `on`, `off` or `auto` | yes | The escape hatch for req §12.3 resolving badly (§6.5). Structural ordering (ADR-007 mechanism 1) does not depend on the guard, so disabling it is safe; `auto` disables it automatically when it starts discarding more than `guardSuppressionRatio` of everything it sees |
+| `orderingGuard` — `on`, `off` or `auto`; with `guardSuppressionRatio` (0.5), `guardMinSamples` (100) and `guardEvalInterval` (5 s) | yes | The escape hatch for req §12.3 resolving badly (§6.5). Structural ordering (ADR-007 mechanism 1) does not depend on the guard, so disabling it is safe. `auto` disables it **per contributing transcode**, once that transcode's own `guard_superseded / guard_offered` crosses the ratio over at least the sample floor — scoped that way because an unpopulated `BCSeqNo` is a property of one message type, not of the feed. Read by the stats goroutine at each evaluation; the shards read one atomic bool |
 | `statementFailWindow`, and the two-writer pool-stop threshold | yes | §9.2. Read when a statement-level error is classified |
 | **`writers` — the size of the writer pool, and therefore the connection count** | **yes, up and down** | A writer holds **no mirror state** (ADR-005): growing the pool starts a goroutine with a fresh session, shrinking lets one exit after its current batch. This is the design's lever for a write path that cannot keep up (§7.7), bounded by the Oracle session budget (OQ-8) |
 | `maxInFlightPerShard` — how many of one shard's batches may commit **concurrently** | no — startup only | It sizes the pre-allocated batch pool and the shared `batchQ` behind it, so raising it live means rebuilding a channel and losing what is in it. It does not change *what* a tick flushes — that is always the whole dirty set — only how fast the epoch drains: at `1` the batches commit serially in FIFO order, at `m` up to `m` at once (§7.3). `writers` remains the runtime lever for write throughput |
@@ -2030,7 +2098,7 @@ tested on Linux with the race detector and cross-compiled for deployment, per re
 |---|---|---|
 | req §12.1 Transcode inventory | **Medium**, up from very low. The registry and the policy table are still data, but the inventory now also settles which transcodes contribute which columns to which destination, and how many are `non-rate-limited` — the latter being a capacity decision (§4.2, §7.7) | A config line per transcode plus its contribution descriptors; nothing structural |
 | req §12.2 "Persist every occurrence" semantics | **Medium**, up from low. §8.1 answers it as *latest-occurrence-observable*, which is a weaker reading than the earlier draft assumed. If the stakeholder needs every occurrence observable, an append destination has to come back — and it would be a fourth destination, outside the three-mirror model | A fourth destination and a second statement per batch |
-| req §12.3 Ordering field semantics | **Very low for FR9** — ordering is structural (§6.7 mechanism 1) and survives the fields being useless. **High for FR10 gap detection only** | Gap detection scope switch, already designed (§6.5), plus `orderingGuard: auto`, which disables the defensive comparison rather than letting an unpopulated field freeze every mirror (§6.5) |
+| req §12.3 Ordering field semantics | **Very low for FR9** — ordering is structural (§6.7 mechanism 1) and survives the fields being useless. **High for FR10 gap detection only** | Gap detection scope switch, already designed (§6.5), plus `orderingGuard: auto`, which disables the defensive comparison for the affected transcode rather than letting an unpopulated field freeze the rows it feeds (§6.5) |
 | req §12.4 Active token count | **Medium.** It is the input to write-path headroom (§7.7). If it is thousands, `W` widens or connections increase | Tunables, not structure |
 | req §12.5 Capture capability | **None.** No design decision depends on a capture; §6.5's audit mode substitutes for items 3 and 4 | — |
 | req §12.6 Latency endpoints | **None.** The estimate decomposes by term, so any endpoint definition can be read off Table 7.6 | — |
@@ -2499,11 +2567,26 @@ shaping the design around it.
 
 ### 10.1 Counters
 
-All counters are `atomic.Uint64` incremented on the owning goroutine with no lock and no channel, so
-instrumentation costs nothing measurable on the receive path. They are emitted as a single structured
-line every `statsInterval` (default 60 s), as both cumulative totals and the delta since the last
-emission — the delta is what an operator actually reads, and computing it in-process avoids everyone
-doing arithmetic at 03:00.
+Two instrument shapes, and **only** two, because req §8 defers the metrics system and this section
+must not quietly depend on one:
+
+- **Counters** — `atomic.Uint64`, incremented on the owning goroutine with no lock and no channel.
+  Emitted as cumulative totals *and* as the delta since the last emission; the delta is what an
+  operator actually reads, and computing it in-process avoids everyone doing arithmetic at 03:00.
+- **High-water marks** — also `atomic.Uint64`, but updated by a compare-and-swap-if-greater and
+  **reset to zero at each emission**, so the value published is the maximum observed during that
+  interval. Names end in `_max_ns` or `_max`. A CAS-max is a handful of instructions on an
+  uncontended word and costs nothing measurable on the receive path.
+
+**There are no percentiles and no histograms anywhere in this section**, and the distinction is not
+pedantry: a p99 needs a reservoir or a bucketed histogram, which is exactly the instrumentation
+req §8 defers, and quoting one here would commit the design to machinery it has declined to build. An
+earlier draft named a `stall_budget_p99`; it is a high-water mark
+(`stall_budget_used_max_ns`) because that is what the stated model can actually produce. A max is
+also the better signal for the things measured here, all of which are approaches to a hard limit
+rather than distributions anyone will plot.
+
+Everything is emitted as a single structured line every `statsInterval` (default 60 s).
 
 | Group | Counter | FR10 clause | Why it earns its place |
 |---|---|---|---|
@@ -2518,10 +2601,10 @@ doing arithmetic at 03:00.
 | Flush | `flush_triggered`, `flush_coalesced`, `flush_on_tick`, `flush_deferred` | — | `flush_coalesced / flush_triggered` is the single number that says whether non-rate-limited traffic is outrunning the write path (F10). Rising is not an error; rising toward 1 means the class has degraded to windowed. **`flush_deferred` now means only a failed `batchQ` send** — unreachable by construction (§6.6), so any non-zero value is a defect, not load |
 | Epoch | `epoch_opened{k}`, `epoch_empty{k}`, `epoch_rows{k}`, `epoch_batches{k}`, `epoch_duration{k}`, `tick_skipped_epoch_open{k}` | — | The set that says whether a tick is still keeping up. `epoch_duration` exceeding `W`, with `tick_skipped_epoch_open` rising alongside it, is the exact signature of the left branch of §9.3 — and `epoch_rows` summing to less than the rows dirtied over the same interval is how the swapped-rings defect of §7.12 risk 10 shows itself |
 | Epoch | `retry_requeued{k}` | — | Rows re-dirtied at the head of the next epoch's ring after a failed commit (§7.3). Distinct from `writes_failed`, which counts batches: one failed batch requeues up to `maxBatchSize` rows, and a rising ratio between the two says failures are hitting large batches |
-| Stall | `shard_send_blocked`, `stall_budget_p99`, `shard_loop_max_ns` | discard counts *(nil — nothing is discarded)* | FR10 asks for discard counts and the honest answer is that there are none: Q1 overflow stops the process rather than shedding (§6.6, F9). What replaces them is *approach* to the limit — `shard_send_blocked` counts sends that had to wait at all, `stall_budget_p99` is how much of the 50 ms datagram budget the worst iteration consumed, and `shard_loop_max_ns` is the shard-side cause. A non-zero `shard_send_blocked` against a ~0.08 %-busy shard is the early warning for the one condition that is fatal |
-| Queues | `shard_depth{k}`, `dirty_depth{k,destination}`, `cohort_depth{k,destination}`, `batchq_depth`, `completion_lag{k}` | — (NFR5 evidence) | Sampled at emission, not tracked continuously; per destination, because one destination falling behind is a different problem from all three doing so. `dirty_depth` is the accumulating ring, `cohort_depth` what remains of the open epoch — the two answer different questions and summing them hides both |
+| Stall | `shard_send_blocked` (counter), `stall_budget_used_max_ns` (max), `shard_loop_max_ns` (max) | discard counts *(nil — nothing is discarded)* | FR10 asks for discard counts and the honest answer is that there are none: Q1 overflow stops the process rather than shedding (§6.6, F9). What replaces them is *approach* to the limit — `shard_send_blocked` counts sends that had to wait at all, `stall_budget_used_max_ns` is how much of the 50 ms datagram budget the worst iteration of the interval consumed, and `shard_loop_max_ns` is the shard-side cause. A max rather than a percentile because the question is "how close did we come to the cliff", which only the worst case answers. A non-zero `shard_send_blocked` against a ~0.08 %-busy shard is the early warning for the one condition that is fatal |
+| Queues | `shard_depth{k}`, `dirty_depth{k,destination}`, `cohort_depth{k,destination}`, `batchq_depth`, `completion_lag_max_ns{k}` (max) | — (NFR5 evidence) | Sampled at emission, not tracked continuously; per destination, because one destination falling behind is a different problem from all three doing so. `dirty_depth` is the accumulating ring, `cohort_depth` what remains of the open epoch — the two answer different questions and summing them hides both |
 | Write pool | `writers_configured`, `writers_busy`, `writers_stopped`, `rows_inflight{k}`, `redirty_total` | — (NFR3 evidence) | `writers_busy / writers_configured` is the number that says whether raising `writers` would help (§7.7) — and it is only readable alongside `writers_stopped`, which counts members retired by a statement-level error (§9.2). Without it a pool that has lost half its writers reads as a pool that is half idle, and the operator raises a number that is already too high. A persistently high `rows_inflight` on one shard against a low one elsewhere is the imbalance the pool exists to absorb |
-| Ordering | `ordering_guard_state`, `units_superseded_out_of_order` | — | Which mode the guard is in (§6.5). `auto` flipping to disabled is the observable that req §12.3 resolved badly, and it is far better than the alternative signal, which was every mirror silently freezing |
+| Ordering | `guard_offered{transcode}`, `guard_superseded{transcode}`, `ordering_guard_disabled{transcode}`, `units_superseded_out_of_order` | — | The first two are the ratio `auto` evaluates (§6.5) and are kept per transcode because that is the granularity of the fault; `units_superseded_out_of_order` is their roll-up, useful for a glance but **not** what the rule tests. `ordering_guard_disabled` naming a transcode is the observable that req §12.3 resolved badly for it — far better than the alternative signal, which was that transcode's rows silently ceasing to update |
 | Writes | `writes_attempted`, `writes_succeeded`, `writes_failed`, `rows_written{destination}`, `batches_written`, `row_rejected` | DB writes attempted/succeeded/failed | `rows_written / batches_written` is the batch efficiency that governs commit cost (§4.2) |
 | Liveness | `heartbeat_seen`, `circuit_state`, `session_state{market_type}` | logging sufficient to confirm correct running | §6.10; SHOULD, not required |
 | Active set | `active_tokens_1s` | — | Directly measures req §12.4's open item (§6.5) |
@@ -2622,6 +2705,8 @@ invariants enforceable rather than aspirational.
 | **Row image fits the destination** | A destination whose accumulated column set overruns `Entry.Image` — ASM-16b, the assumption that was missing entirely while ASM-16a stood in for it | A constant expression per destination, plus the `-selfcheck` rule of §6.8, asserting the declared column widths sum within `imageSize`. The 6511-family `BroadcastMessage[239]` is the case that proves it bites (§8.2) |
 | **Column mask survives a mid-flight merge** | The `ColMask` defect of §6.7: clearing written bits at completion instead of at fill, which discards columns re-dirtied while the batch was outstanding | Batch a row, merge a contribution touching a column the batch also wrote, complete the batch successfully, then assert the next flush's statement **includes** that column and carries the newer value |
 | **Ordering is per contributor on every component** | A shared per-row `LastTime` letting one general transcode suppress another within the same `LogTime` second (§6.5) | Feed one general row 6531, 6571 and 6511 all stamped with the *same* `LogTime`, differing only in receipt order. Assert all three are applied in arrival order and none is counted `superseded` |
+| **`orderingGuard: auto` is scoped per transcode** | A global ratio, which is the shape that both fails to fire for a minority transcode with a dead sequence field and, when it does fire, switches the guard off for well-behaved ones (§6.5) | Drive two transcodes into one destination: one with a constant `BCSeqNo`, one with a healthy ascending one, at a mix where the *global* ratio stays below `guardSuppressionRatio`. Assert the constant-sequence transcode's guard disables, the healthy one's does not, and the constant-sequence transcode's rows resume updating within `guardEvalInterval` once it has passed `guardMinSamples` |
+| **The guard ratio's denominator excludes first contributions** | Counting slot-initialising contributions in `guard_offered`, which makes the ratio drift with inventory mix rather than with field health (§6.5) | Feed N distinct rows one contribution each, all from one transcode. Assert `guard_offered` is zero — nothing reached a comparison — and that `auto` therefore cannot trip on a workload that never repeats a key |
 | **The flush request survives an empty ring** | The §7.3 ordering defect: clearing `FlushReq` before testing the rings, so a request raised against a not-yet-drained unit is consumed and the unit waits a full `W` | Raise a flush request on a shard whose rings are empty, then deliver a contribution. Assert an epoch opens immediately rather than at the next tick, and that `epoch_empty` did not consume the request |
 | **Ordering property** | An FR9 regression | Feed one destination row units from two transcodes with shuffled sequence numbers; assert each transcode's columns end at its own highest-sequence value, and that neither transcode's sequence suppresses the other's |
 | **Column-mask fidelity** | A merge or statement bug that blanks columns the contributing transcode does not own | Apply two transcodes' partial contributions to one row; assert the emitted statement's column list equals the union of their masks, and that unmentioned columns retain their prior values |
@@ -3127,9 +3212,10 @@ tested, because nothing fails loudly if a future change lets a row reach two wri
 and it now rests on two preconditions rather than one: ASM-15, which only `-selfcheck` enforces, and
 the in-flight marking of §6.7, which only the property gates in §10.4 enforce. Accepted — hence those
 gates. The guard's behaviour when `BCSeqNo` is unpopulated is no longer left open: `orderingGuard`
-is a three-way setting whose `auto` mode disables the comparison once it starts discarding more than
-half of what it sees (§6.5), because a guard misreading an empty field must not be able to stop the
-database updating.
+is a three-way setting whose `auto` mode disables the comparison **for the offending transcode**
+once that transcode's own discard ratio shows the field is unusable (§6.5), because a guard
+misreading an empty field must not be able to stop the database updating — and must not switch
+itself off for well-behaved transcodes either.
 
 **Revisit when:** any change routes units for one key through more than one goroutine — a decode pool,
 a work-stealing writer pool, or a resharding feature. Any of those makes the sequence comparison
@@ -3754,7 +3840,7 @@ change the outcome of this project.
 |---|---|---|---|---|
 | R1 | **A subtly wrong decoder** — plausible values in the wrong fields | Medium. req §7 names this as the specific hazard of re-deriving the parsers; the bible's Appendix B lists ten places the source spec is wrong | Silent bad data in Oracle, indistinguishable from a market anomaly until someone reconciles. The worst failure in the system because nothing alarms | Compile-time layout assertions, differential test against `poc`'s `-debug` trace, an independently-written absolute-offset table (§10.4, ADR-012). Residual: a transcode `poc` cannot decode has no oracle but the bible's arithmetic |
 | R2 | **ASM-1/ASM-3 wrong — decode far more expensive than assumed** | Medium. Go on ppc64 is a second-tier port (req §4) and no measurement exists | Inline decode stops fitting the NFR4 budget; the socket/decode boundary of ADR-001 has to move behind a decode pool, which costs the structural ordering property | Measure on the LPAR **before** selection — half a day of work (OQ-5). Residual: none once measured, which is why it should be measured first |
-| R3 | **req §12.3 resolves badly — sequence and timestamp unusable** | Medium; req §10.5 raises it as a live doubt | Only FR10 gap detection is lost, because ordering is structural | ADR-007 makes ordering structural; §6.5's audit mode closes the item from production without a capture; `orderingGuard: auto` stops an unpopulated field from freezing the mirrors. Residual: gap detection may be unavailable, which weakens §9.4's triage |
+| R3 | **req §12.3 resolves badly — sequence and timestamp unusable** | Medium; req §10.5 raises it as a live doubt | Only FR10 gap detection is lost, because ordering is structural | ADR-007 makes ordering structural; §6.5's audit mode closes the item from production without a capture; `orderingGuard: auto` stops an unpopulated field from freezing the rows that transcode feeds, per transcode and within seconds rather than a stats interval. Residual: gap detection may be unavailable, which weakens §9.4's triage |
 | R4 | **ASM-4 wrong — socket slack ~0.13 s, not 0.53 s** | Medium; BSD-derived stacks commonly charge mbuf overhead | NFR4's 5× margin becomes ~1.3×; a 50 ms stall starts costing datagrams | ≤5 ms design target rather than spending the budget (§6.3); measure via `netstat -s -p udp` under synthetic load. Residual: raising `udp_recvspace` needs a kernel tunable change |
 | R5 | **A pointer or slice creeping into `UpdateUnit` or `Entry`** | Medium over the life of the code — it is a one-line change that looks harmless | Buffer aliasing produces intermittent cross-contamination that looks exactly like a decode bug; and 147 MB of arena becomes GC-traced | Reflection gate in §10.4, invariant stated in §6.1 and ADR-006. Residual: only as good as the gate being kept |
 | R6 | **req §12.4 resolves high — thousands of active rows, not tens** | Medium; it is explicitly unresolved | Write-path headroom is ~0.3× against req §3.3's figure: the write path falls behind and dirty depth grows until the burst ends (§7.7) | Three reloadable levers now — **`writers`**, `W` and `maxBatchSize` — of which raising `writers` is the one that adds capacity rather than trading freshness (ADR-005). The backlog is bounded by the mirrors, so the failure is staleness, not memory. Residual: whether more sessions actually help is unmeasured (OQ-4), and widening `W` helps only where rows repeat |
