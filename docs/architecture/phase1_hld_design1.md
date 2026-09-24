@@ -1619,7 +1619,15 @@ monotonic clock that §3.4(a) mandates as the tiebreak, stored always rather tha
 which is what breaks the same-second tie.
 
 `maxContributors` is a build-time constant sized from the largest number of transcodes any one
-destination may receive contributions from. Four is ample for the inventories the bible catalogues.
+destination may receive contributions from. **It must be at least five, and the layout above — which
+sizes the three arrays at four slots — is wrong.** `MD_MARKET_STATUS` takes contributions from
+6511, 6521, 6522, 6531 and 6571 (bible §4.5), the same five this section's own re-open argument
+names two paragraphs above, so §8.2's instantiation is rejected by the `-selfcheck` rule below
+against the constant this section declares. The LLD resolves it at **8**, which also narrows
+`LastTime` to the 4-byte wire width, putting `Entry` at **424 bytes** rather than the 368 derived
+here; see `docs/lld/00-foundations.md` §3.7 and ADR-L03 for the re-derived sizing and the memory
+envelope that follows from it. The figures in §7.8 and §11.3 are the `maxContributors = 4`
+arithmetic and are low by ~23 MB.
 Because the array is fixed-size and pointer-free, **the set of contributors to a destination is
 startup-only configuration** (§6.9) — column *lists* stay reloadable, but membership does not, since
 a reload that added a fifth contributor would index past the array and a reload that reordered them
