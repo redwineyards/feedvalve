@@ -517,7 +517,12 @@ byte-swapped.
 type MsgHeader struct {
     TimestampNs int64      // MESSAGE_HEADER.Timestamp, ns since 1 Jan 1980 (bible §2.5, §2.8).
                            // Zero and meaningless when Kind == HeaderBcast
-    LogTime     int32      // both layouts, seconds since 1 Jan 1980 (bible §2.5)
+    LogTime     int32      // present in both layouts but at DIFFERENT offsets: header
+                           // offset 4 in BCAST_HEADER, offset 2 in MESSAGE_HEADER
+                           // (bible §2.8 tables). Seconds since 1 Jan 1980 (bible §2.5).
+                           // Read it at a single fixed offset and the other layout
+                           // yields AlphaChar — two characters of Symbol construed as
+                           // a timestamp. Resolve Kind first, then pick the offset
     BCSeqNo     int32      // BCAST_HEADER only, header offset 14. Zero when Kind == HeaderMessage
     Code        TransCode  // BCAST_HEADER offset 10 / MESSAGE_HEADER offset 0
     ErrorCode   int16      // offset 12 in BOTH layouts — checked before dispatch (bible §2.10)
