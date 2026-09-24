@@ -2574,8 +2574,8 @@ shaping the design around it.
 
 ### 10.1 Counters
 
-Two instrument shapes, and **only** two, because req §8 defers the metrics system and this section
-must not quietly depend on one:
+Three instrument shapes, and **only** three, because req §8 defers the metrics system and this
+section must not quietly depend on one:
 
 - **Counters** — `atomic.Uint64`, incremented on the owning goroutine with no lock and no channel.
   Emitted as cumulative totals *and* as the delta since the last emission; the delta is what an
@@ -2584,6 +2584,17 @@ must not quietly depend on one:
   **reset to zero at each emission**, so the value published is the maximum observed during that
   interval. Names end in `_max_ns` or `_max`. A CAS-max is a handful of instructions on an
   uncontended word and costs nothing measurable on the receive path.
+- **Published gauges** — a current value rather than an accumulation: the depths, `writers_busy`,
+  `circuit_state`, `session_state`. An earlier draft of this section claimed two shapes and then
+  listed these anyway, describing them as "sampled at emission", which hid a concurrency defect
+  rather than a naming one. **`dirty_depth` and `cohort_depth` are `len()` of a slice the shard
+  owns**, so a stats goroutine that samples them is racing the shard — on a target where the race
+  detector does not run (§11.2), so the race would never be caught where it happens. The shape is
+  therefore defined by *who writes it*: the owning goroutine `Store`s the value at a point in its
+  cycle it already passes through, and the stats goroutine only ever loads the atomic. That is one
+  store per epoch, not per unit. `batchq_depth` is the exception that proves the rule — `len()` of a
+  channel is race-free, so it genuinely is sampled at emission. Names end in `_depth`, `_state`,
+  `_busy`, `_configured` or `_stopped`.
 
 **There are no percentiles and no histograms anywhere in this section**, and the distinction is not
 pedantry: a p99 needs a reservoir or a bucketed histogram, which is exactly the instrumentation
