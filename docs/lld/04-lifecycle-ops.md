@@ -28,7 +28,7 @@ designed here.
 | **6** | [Observability](#6-observability) | emission, levels, DSN hygiene, health checks, the twelve-question runbook, AIX |
 | **7** | [The gate suite](#7-the-gate-suite) | 89 gates in six layers, and the race-detector constraint |
 | **8** | [Build, cross-compile and deploy](#8-build-cross-compile-and-deploy) | the build line, the dependency audit, sizing, `udp_recvspace`, deploy and rollback |
-| **9** | [ADRs](#9-adrs) | ADR-L06 … ADR-L14 |
+| **9** | [ADRs](#9-adrs) | ADR-L30 … ADR-L38 |
 | **10** | [Additions to the Vol 0 ledger](#10-additions-to-the-vol-0-ledger) | 14 instruments, 1 type, 1 channel, **0 new config keys** |
 | **11** | [Deltas against the HLD](#11-deltas-against-the-hld) | D4-1 … D4-10 |
 | **12** | [Assumptions](#12-assumptions) | ASM-A1 … ASM-A9, each with a measurement |
@@ -50,7 +50,7 @@ designed here.
 | 4.9 | Writer health, per writer, with the pool-level escalations | `stateDiagram-v2` | §5.2 |
 | 4.10 | The six terminal paths and the one drain they share | `flowchart TD` | §5.2 |
 | 4.11 | Deployment and system context | `flowchart TD` | §8.1 |
-| 4.12 | ADR-L10's rejected alternative, side by side with the chosen one | `flowchart LR` | ADR-L10 |
+| 4.12 | ADR-L34's rejected alternative, side by side with the chosen one | `flowchart LR` | ADR-L34 |
 | — | Part V layout verification: 15 structures, declared vs field sum | ASCII table | §7.1 |
 
 **Required diagrams deliberately omitted, with the reason:**
@@ -160,7 +160,7 @@ distinguishable from a failure, or every planned shutdown becomes a restart.
 
 | Code | Meaning | Supervisor behaviour | Emitted when |
 |---|---|---|---|
-| **0** | Requested shutdown completed | do not restart | SIGINT/SIGTERM; **including when the drain deadline expired** and rows were abandoned — that is a counted, logged degradation of a stop we asked for, not a failure (ADR-L13) |
+| **0** | Requested shutdown completed | do not restart | SIGINT/SIGTERM; **including when the drain deadline expired** and rows were abandoned — that is a counted, logged degradation of a stop we asked for, not a failure (ADR-L37) |
 | **0** | `-selfcheck` or `-dbcheck` passed | n/a | one-shot modes |
 | **1** | Startup failure | restart; a loop is the correct visible symptom | invalid configuration, `ErrNoPassword` (Vol 0 §3.11), Oracle unreachable at open, socket bind refused, arena allocation failure |
 | **2** | **RESERVED — do not use.** The Go runtime exits with status 2 on an **unrecovered panic** | restart | a panic outside the contained regions of §5.5. Seeing 2 means "read the stack trace on stderr", which is a different instruction from either 1 or 4 |
@@ -339,7 +339,7 @@ func Build(cfg *config.Config, store *config.Store, db *oradb.DB, reg obs.Regist
 // then performs the drain of §1.5 steps 3-10 and returns.
 //
 // The returned error is nil for a requested shutdown — INCLUDING one in which
-// the drain deadline expired and rows were abandoned (ADR-L13) — and non-nil
+// the drain deadline expired and rows were abandoned (ADR-L37) — and non-nil
 // only for a terminal runtime condition, which main maps to exit code 4.
 func (g *Graph) Run(ctx context.Context) error
 
@@ -1599,7 +1599,7 @@ becomes "cannot be loaded at all".
 | **G-LIFE-2** | A running graph with **no** datagrams arriving, the receiver blocked in `ReadFrom` | Send SIGTERM | `run` returns within 200 ms; the receiver logged **no** ERROR for the read failure | Adding a `SetReadDeadline` poll loop, or forgetting that **closing the listener is the only way to unblock an in-flight `ReadFrom`** (`poc/gobrdclnt.go:135-145`); and logging the shutdown read error as a failure (`poc/gobrdclnt.go:152-154`) |
 | **G-LIFE-3** | `OpenDB` succeeds; the socket bind is rigged to fail | `run` | `run` returns a non-nil error **and `db.Close()` was called** | A `Fatalf` in the bind error path. G-BLD-3 catches the literal call; this catches an equivalent early `os.Exit` reached indirectly, and it is the runtime half of C-1 |
 | **G-LIFE-4** | `maxInFlightPerShard` batches outstanding for shard *k*; the shard returns at the drain deadline with rows still dirty | The writers then return their batches on `completionCh[k]` with nobody reading | **No writer blocks**; all writers return; `run` completes | The §1.5 step 10 deadlock. The proof rests entirely on `cap(completionCh[k]) == maxInFlightPerShard`; a well-meaning reduction to an unbuffered channel makes shutdown hang forever with no diagnostic |
-| **G-LIFE-5** | — | Table test over: requested shutdown; requested shutdown with the drain deadline expired; each of the five `FatalReason`s; a startup error; a `-selfcheck` failure | Exit codes 0, **0**, 4×5, 1, 3 respectively; and **nothing ever maps to 2**, which is reserved for the Go runtime's unrecovered panic | A drain-deadline expiry mapping to non-zero, which makes the supervisor **restart a process we just asked to stop** (ADR-L13); and a design condition claiming exit 2, making a real panic indistinguishable |
+| **G-LIFE-5** | — | Table test over: requested shutdown; requested shutdown with the drain deadline expired; each of the five `FatalReason`s; a startup error; a `-selfcheck` failure | Exit codes 0, **0**, 4×5, 1, 3 respectively; and **nothing ever maps to 2**, which is reserved for the Go runtime's unrecovered panic | A drain-deadline expiry mapping to non-zero, which makes the supervisor **restart a process we just asked to stop** (ADR-L37); and a design condition claiming exit 2, making a real panic indistinguishable |
 | **G-DRAIN-1** | N dirty rows well inside the deadline's capacity, a healthy fake database | SIGTERM | All N written; `drain_abandoned_rows{destination} == 0`; exit 0 | A drain that closes `shardCh` and returns without a final flush-all, silently losing up to `W` of state on every planned restart |
 | **G-DRAIN-2** | Dirty rows far beyond what 5 s can write, or a writer stalled indefinitely | SIGTERM | The process exits within `drainTimeoutMs` + ε; `drain_abandoned_rows{destination}` equals the remainder **per destination**; exit **0** | An unbounded drain — a shutdown that never completes is worse than one that abandons honestly. Also catches a **per-shard** deadline, which would make total shutdown `shards × drainTimeoutMs` = 20 s (§1.5 step 7) |
 | **G-CFG-1** | Vol 0 §7.2's key list, as data | For each key, a configuration with a value one step outside the declared range | Every one is rejected, naming the key | A key added to the schema with no validation, accepted at any value, failing later as something unrelated |
@@ -1969,11 +1969,11 @@ way (§2.5), and `config_generation` advancing is the confirmation that the roll
 
 ## 9. ADRs
 
-Numbered `ADR-L06` onward, continuing Vol 0's `ADR-L01`…`ADR-L05` so LLD-level decisions form one
+Numbered `ADR-L30` onward, continuing Vol 0's `ADR-L01`…`ADR-L05` so LLD-level decisions form one
 sequence and cannot be confused with the HLD's `ADR-001`…`ADR-018`. Only decisions neither the HLD nor
 Vol 0 made appear here.
 
-### ADR-L06: Bind the socket last, close it first, and put the drain in `run`'s body rather than a defer
+### ADR-L30: Bind the socket last, close it first, and put the drain in `run`'s body rather than a defer
 
 **Status:** proposed
 
@@ -2018,7 +2018,7 @@ contributor may be tempted to "clean it up". The doc comment on `run` (§1.1) sa
 it — which would mean the graph has grown a second ownership domain and §1.5 needs restructuring, not
 patching.
 
-### ADR-L07: Reject a startup-only reload by comparing a declared list of key paths, not a fingerprint
+### ADR-L31: Reject a startup-only reload by comparing a declared list of key paths, not a fingerprint
 
 **Status:** proposed
 
@@ -2053,7 +2053,7 @@ added, which is the intended friction.
 **Revisit when:** the key count roughly doubles, at which point generating both the list and Vol 0
 §7.2's table from one machine-readable schema becomes cheaper than maintaining the gate.
 
-### ADR-L08: Drive circuit liveness from any datagram via one atomic and a 1 s timer
+### ADR-L32: Drive circuit liveness from any datagram via one atomic and a 1 s timer
 
 **Status:** proposed — **SHOULD**, inheriting ADR-013's status
 
@@ -2094,7 +2094,7 @@ which is unmeasurable.
 **Revisit when:** `heartbeatWarnSec` is routinely configured below 2 s, at which point the clamp
 dominates and the tick should be derived rather than clamped.
 
-### ADR-L09: Make the market-session machine total — the next state is a pure function of the code
+### ADR-L33: Make the market-session machine total — the next state is a pure function of the code
 
 **Status:** proposed
 
@@ -2135,7 +2135,7 @@ Stated in §6.6 Q11 rather than left for someone to discover.
 **Revisit when:** the exchange documents a transition the lookup table cannot express — for example a
 code meaning "resume previous state".
 
-### ADR-L10: Feed the session machine through a bounded non-blocking channel, not a sampled atomic
+### ADR-L34: Feed the session machine through a bounded non-blocking channel, not a sampled atomic
 
 **Status:** proposed
 
@@ -2190,7 +2190,7 @@ counter that must stay at zero.
 **Revisit when:** market-status traffic becomes high-rate, which would mean the exchange has changed
 what these codes are for.
 
-### ADR-L11: Emit as a small set of group lines with a mandatory `health` line, not one line
+### ADR-L35: Emit as a small set of group lines with a mandatory `health` line, not one line
 
 **Status:** proposed
 
@@ -2227,7 +2227,7 @@ snapshot needs a grep on the shared timestamp rather than a single line.
 **Revisit when:** a log collector exists on this host (OQ-L11), at which point JSON and one object per
 emission is strictly better.
 
-### ADR-L12: Prove concurrency on the development host, and substitute ownership assertions on the target
+### ADR-L36: Prove concurrency on the development host, and substitute ownership assertions on the target
 
 **Status:** proposed
 
@@ -2267,7 +2267,7 @@ rather than buried.
 **Revisit when:** Go adds race-detector support for `aix/ppc64`, or the LPAR is replaced by
 `linux/ppc64le`, where `-race` **is** supported and the whole layer (3) becomes redundant.
 
-### ADR-L13: A drain-deadline expiry exits 0, and exit code 2 is reserved for the Go runtime
+### ADR-L37: A drain-deadline expiry exits 0, and exit code 2 is reserved for the Go runtime
 
 **Status:** proposed
 
@@ -2302,7 +2302,7 @@ in step with `FatalReason`.
 **Revisit when:** a terminal condition is added that a supervisor should treat *differently* — for
 example one that should back off rather than restart immediately.
 
-### ADR-L14: Reject unknown configuration keys, and version the config file with the binary
+### ADR-L38: Reject unknown configuration keys, and version the config file with the binary
 
 **Status:** proposed
 
@@ -2380,7 +2380,7 @@ declaration and offset table in §4.5.
 |---|---|---|---|---|---|---|---|
 | **H** | `sessionCh` | `model.SessionEvent` by value, 16 B | **64**, startup-only | receiver (decode path) | stats/health (sole) | **non-blocking** `select` with `default`; never enters the stall budget | drop; `session_events_dropped`++. Losing one costs a log line and a gauge update and **never costs data** — the same message is already routed to its shard as an `UpdateUnit` |
 
-Capacity arithmetic and the rejected alternative are in §4.5 and ADR-L10. This is the only addition to
+Capacity arithmetic and the rejected alternative are in §4.5 and ADR-L34. This is the only addition to
 Vol 0's channel inventory, and Vol 0 §9.4's property — *"no goroutine in this diagram can block
 indefinitely on another"* — survives it, because the send is non-blocking and the consumer's only
 other work is a 1 s timer.
@@ -2395,9 +2395,9 @@ census of twelve is unchanged** (HLD §7.1, Vol 0 §9).
 ### 10.5 No new configuration keys
 
 Stated explicitly, because adding a key is the easy thing to do wrong. The health evaluation tick is
-derived (§3.3, ADR-L08), `sessionCh`'s capacity is fixed (§4.5), the emission grouping rules are fixed
+derived (§3.3, ADR-L32), `sessionCh`'s capacity is fixed (§4.5), the emission grouping rules are fixed
 (§6.1), and `feedvalve_assert` is a build tag rather than configuration (§7.6). **Vol 0 §7.2 remains
-the complete key table**, with one rule added to its validation set (V-STRICT1, ADR-L14) and no new
+the complete key table**, with one rule added to its validation set (V-STRICT1, ADR-L38) and no new
 keys.
 
 ---
@@ -2415,10 +2415,10 @@ apology: a sibling volume reading only the HLD would contradict this document at
 | **D4-3** | HLD §10.2 | WARN at "queue at 50 %", ERROR at "queue at 80 %" | **Removed.** Replaced by `shard_send_blocked` non-zero as the WARN trigger, plus a new `shard_depth_max{k}` high-water mark | Two independent problems. **(a)** Q2 and Q2c *cannot fill by construction* (Vol 0 §9.2), so a percentage threshold on them is dead code. **(b)** Q1 sits at ~0.08 % occupancy, so a 50 % threshold would fire microseconds before the fatal condition — it is not an early warning, it is a death rattle. Worse, Vol 0 §8.2's `shard_depth` is shape **G**, *sampled* at emission, and a 60 s sample of a queue that is empty 99.9 % of the time reads 0 forever, so the HLD's own threshold story has no instrument that could support it | Needs one new instrument (§10.1). The early warning HLD §6.6 itself names — `shard_send_blocked` — becomes the actual mechanism |
 | **D4-4** | HLD §11.4, Vol 0 §7.2 | Neither says what a **missing `db` object** means in production. `poc` no-ops the write when `packetDB == nil` (CLAUDE.md) | **V-DB1**: a `db` object is required outside `-selfcheck` and `-dbcheck`; its absence is a validation error | `poc`'s no-op is right for a POC — it is what keeps the decoder tests working — and wrong for a relay whose only purpose is to persist. A production process that decodes perfectly and writes nothing, silently, is the worst possible failure: every counter looks healthy | One validation rule. A future decoder-only mode must be an explicit flag, never an accident of omission |
 | **D4-5** | HLD §9.1 | Nineteen failure rows, F1–F19 | **Ten added**, F20–F29: pool self-stop, `batchQ` send failure, single-writer statement stop, clock step, shard stall, three panic regions, an unreported row, and value truncation | Each is a condition the HLD describes in prose elsewhere (§9.2's pool-stop rule and statement class, §9.5's panic containment, Vol 0 §5.4's `OutcomePending`, §8.2's `message_truncated`) or does not mention at all (a clock step). None had a row an operator could look up, and F24 in particular — the shard stall — is the **only** warning before F9 stops the process | Ten rows, three new counters (§10.1), one new `FatalReason` |
-| **D4-6** | **Vol 0 §8.1** | "Everything is emitted as **one structured line** every `stats.intervalSec`" | One **emission event** — one atomic pass, one timestamp, one `gen=` — written as one line per Vol 0 §8.2 group heading, with a mandatory `health` line and a full sweep every tenth interval | At the Phase 1 defaults the ledger plus §10's additions produce **≈ 200 distinct labelled values ≈ 5 KB** (§6.1 arithmetic). That is unreadable on stderr and truncated by several transports. The property Vol 0 is expressing — one consistent snapshot — is preserved by the shared timestamp and generation | A refinement of wording, not of content. **This is the one delta against Vol 0 rather than the HLD**; ADR-L11 argues it |
+| **D4-6** | **Vol 0 §8.1** | "Everything is emitted as **one structured line** every `stats.intervalSec`" | One **emission event** — one atomic pass, one timestamp, one `gen=` — written as one line per Vol 0 §8.2 group heading, with a mandatory `health` line and a full sweep every tenth interval | At the Phase 1 defaults the ledger plus §10's additions produce **≈ 200 distinct labelled values ≈ 5 KB** (§6.1 arithmetic). That is unreadable on stderr and truncated by several transports. The property Vol 0 is expressing — one consistent snapshot — is preserved by the shared timestamp and generation | A refinement of wording, not of content. **This is the one delta against Vol 0 rather than the HLD**; ADR-L35 argues it |
 | **D4-7** | HLD §6.10 Figure 6, ADR-013 | The liveness thresholds, with no **evaluation mechanism** and no evaluation period | One padded `atomic.Int64` written by the receiver per datagram; evaluation on a **1 s tick, clamped to `heartbeatWarnSec / 2`**, not a configuration key | Vol 0 §9.1 folds `health` into the stats goroutine, whose interval is **60 s — five times the 12 s warn threshold**. Evaluating at emission cannot detect the threshold at all: an outage would be reported somewhere between 12 s and 72 s after it began, and a `Quiet` episode might never be observed | ±1 s detection; one timer fire per second on an otherwise sleeping goroutine |
 | **D4-8** | HLD §6.10 Figure 7 | A partial transition relation for the market session | A **total** machine: `next = stateOf(code)` always; the edge set only distinguishes expected from anomalous | Taken literally, an undrawn combination has no defined behaviour, and the obvious implementation — ignore it — converts **one lost datagram** into a session-long wrong state on a feed with no retransmission (bible §1, §2.8) | Six states, one lookup table; `session_anomalies` will be legitimately non-zero when a status message is lost |
-| **D4-9** | HLD §11.4 | Terminal conditions "exit non-zero" | A five-value taxonomy: 0 / 1 / **2 reserved for the Go runtime** / 3 / 4, with a **drain-deadline expiry exiting 0** | A single non-zero code makes a requested shutdown that hit the drain deadline indistinguishable from a failure, so the supervisor **restarts a process we just asked to stop**. And claiming 2 would collide with the Go runtime's unrecovered-panic status on a host whose only debugging tool is a panic stack | ADR-L13; gated by G-LIFE-5 |
+| **D4-9** | HLD §11.4 | Terminal conditions "exit non-zero" | A five-value taxonomy: 0 / 1 / **2 reserved for the Go runtime** / 3 / 4, with a **drain-deadline expiry exiting 0** | A single non-zero code makes a requested shutdown that hit the drain deadline indistinguishable from a failure, so the supervisor **restarts a process we just asked to stop**. And claiming 2 would collide with the Go runtime's unrecovered-panic status on a host whose only debugging tool is a panic stack | ADR-L37; gated by G-LIFE-5 |
 | **D4-10** | HLD §6.9 | `maxBatchSize` "reloadable, but **downward only**" | **Inherited from Vol 0 delta D8**: reloadable in `[1, maxBatchSizeCeiling]` in **both** directions | The HLD's own justification — the row buffers are pre-allocated *sized by the ceiling* — permits any value within the ceiling. Vol 0 §7.3 C2 already resolved this; restated here only because it is easy to reintroduce the stricter rule from the HLD's wording | Not a new delta. An operator who lowers `maxBatchSize` during an incident can raise it again without a restart |
 
 Two HLD statements re-derived and **confirmed**, for the record:
@@ -2442,7 +2442,7 @@ labelled **(assumed)** where it appears and each has a way to be measured.
 |---|---|---|---|---|
 | **ASM-A1** | A **1 s** health evaluation tick gives acceptable detection granularity against a 12 s warn threshold | 1 s, clamped to `heartbeatWarnSec / 2` | G-LIVE-1 drives the machine with synthetic timestamps and compares the observed transition time against the injected silence. On the LPAR, compare the logged `silent_s` against a deliberately severed circuit | Only the latency of a liveness alarm, by at most one tick. Cheap to lower |
 | **ASM-A2** | `sessionCh` capacity **64** is ample: the worst plausible burst is one simultaneous re-open across four market types = 12 events inside one second | 64 | `session_events_dropped` **must remain 0**. Any non-zero value falsifies this directly and is itself the measurement | A dropped health event costs a log line and a gauge update; **never data** (§4.5). Raising it is a one-constant change |
-| **ASM-A3** | The full instrument set emits **≈ 200 distinct labelled values ≈ 5 KB**, which is why the emission is grouped | ~200 values | Count the values in one emission on the LPAR with the shipped configuration | If it is materially smaller — say under 40 values — ADR-L11's single-line alternative becomes viable again and the grouping is unnecessary complexity |
+| **ASM-A3** | The full instrument set emits **≈ 200 distinct labelled values ≈ 5 KB**, which is why the emission is grouped | ~200 values | Count the values in one emission on the LPAR with the shipped configuration | If it is materially smaller — say under 40 values — ADR-L35's single-line alternative becomes viable again and the grouping is unnecessary complexity |
 | **ASM-A4** | The commodity trading window is **09:00–23:55 `Asia/Kolkata`** | that | Exchange confirmation (req §12.7, open), or observe the first and last datagram of a session for one week and take the envelope | Only the **severity** of a liveness log line, never the gauge and never the data path. It fails open (§3.5), so an entirely wrong window makes alarms louder, not quieter |
 | **ASM-A5** | On AIX, the default `udp_recvspace` is materially below 640 KB, and **`sb_max` must be ≥ `udp_recvspace`** or the larger setting is silently capped | — | `no -o udp_recvspace` and `no -o sb_max` on the LPAR; then read the **effective** buffer back after `SetReadBuffer` and compare against the request (§8.5 rule 2) | If `sb_max` is the binding limit, Q0's slack is smaller than HLD §6.6's 0.53 s and ASM-4's 4× margin shrinks further (HLD R4). **The startup log line makes this observable rather than latent** |
 | **ASM-A6** | A wall-versus-monotonic divergence of **> 1 s between two emissions** is a reliable clock-step detector | 1 s threshold | G-CLOCK-1 with injected steps; then watch `clock_step_detected` in production for false positives | A false positive would mean the stats goroutine was descheduled for over a second — which is itself worth knowing on a capped LPAR, so the failure mode of this assumption is informative rather than harmful |
@@ -2464,10 +2464,10 @@ Vol 0's, `OQ-L7` onward are raised here.
 
 | # | Question | Resolved by | Blocks |
 |---|---|---|---|
-| **OQ-L7** | **Does the production supervisor restart on non-zero exit, and can it deliver SIGHUP?** ADR-L13's taxonomy assumes the first; every operator lever in HLD §9.3 assumes the second | The platform team, or one experiment: send SIGHUP and check `config_generation` advanced; kill with a non-zero exit and check it comes back | **The entire exit-code taxonomy (§1.2) and the whole reload story (§2).** If SIGHUP is unavailable, every "reloadable" key in Vol 0 §7.2 is effectively startup-only and HLD §9.3's operator levers all become restarts. Highest-value open item in this volume |
+| **OQ-L7** | **Does the production supervisor restart on non-zero exit, and can it deliver SIGHUP?** ADR-L37's taxonomy assumes the first; every operator lever in HLD §9.3 assumes the second | The platform team, or one experiment: send SIGHUP and check `config_generation` advanced; kill with a non-zero exit and check it comes back | **The entire exit-code taxonomy (§1.2) and the whole reload story (§2).** If SIGHUP is unavailable, every "reloadable" key in Vol 0 §7.2 is effectively startup-only and HLD §9.3's operator levers all become restarts. Highest-value open item in this volume |
 | **OQ-L8** | **Where does stderr go, and is it rotated?** The entire observability surface is stderr (§6.7); there is no file, no endpoint and no agent | The platform team | Whether the runbook (§6.6) is usable at all. If stderr is discarded, this design has **no** observability and F16's "bounded by design" argument is irrelevant because nothing is retained |
 | **OQ-L9** | **Does `netstat -s -p udp` on this AIX version report socket-buffer overflows in a form attributable to our socket?** The counters are typically system-wide, not per-socket | One command on the LPAR under synthetic load, with and without a deliberate read-loop stall | **§6.6 Q3** — the only triage step that distinguishes "we stalled" from "the circuit dropped". If attribution is impossible because another process also receives UDP, the triage degrades to "a gap with no other explanation" and `shard_send_blocked` becomes the sole in-process signal |
-| **OQ-L10** | **Is there a log collector reachable from this host?** Determines whether the emission should be `key=value` (chosen, grep-friendly, human-readable) or JSON | The platform team | Only ADR-L11's format, which is a formatter change behind `Registry.Emit(io.Writer)` with no data-path impact. Recorded so the choice is revisited deliberately rather than inherited |
+| **OQ-L10** | **Is there a log collector reachable from this host?** Determines whether the emission should be `key=value` (chosen, grep-friendly, human-readable) or JSON | The platform team | Only ADR-L35's format, which is a formatter change behind `Registry.Emit(io.Writer)` with no data-path impact. Recorded so the choice is revisited deliberately rather than inherited |
 | **OQ-L11** | **What is the LPAR's AIX version, and does the Go `aix/ppc64` port's netpoller behave as assumed there?** §7.4 point 3 lists AIX runtime behaviour as uncovered by any test we can run on the dev host | Running G-AIX-1's smoke suite on the actual LPAR | Nothing structurally — but it is the only way to discover a platform surprise before production. Should be done once, early, at the same time as OQ-L3 and OQ-L5 |
 | **OQ-L12** | **Does the operations team have a runbook-delivery mechanism?** §6.6's twelve questions are worthless if they live only in this document | The platform/ops team | HLD **R12** — "operators do not read the 60 s counter line", named there as the most human risk and explicitly *not solvable in software*. This is the one place where a documentation decision has a direct reliability consequence |
 | **OQ-4** *(HLD)* | Does `go-ora` report **per-row results** for an array bind inside a transaction (ASM-6)? | A half-day spike against the real instance | **G-ROW-1 and the three-valued `RowOutcome`.** If it cannot attribute a failure to a row, `OutcomeRejected` and `OutcomeFailed` collapse into one, F14's "skip the row, continue the batch" becomes inexpressible, and one permanently-bad row retries its whole batch indefinitely. Vol 0 calls this the highest-value open item for the LLD and this volume agrees |

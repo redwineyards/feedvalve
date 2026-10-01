@@ -80,6 +80,29 @@ Ordered by consequence.
    `cohort_depth` are `len()` of a shard-owned slice, so sampling them from the stats goroutine is a
    data race on a target with no race detector. Corrected in the HLD.
 
+## Status: the contract is merged
+
+Volumes 1–4 were written in parallel and each ended with an "Additions to the Vol 0 ledger" section.
+**Those are now folded into Volume 0 and it is genuinely frozen** — previously it was frozen only in
+name, and an implementer building `Entry` from it would have produced a struct with no
+`Quarantined` field, leaving Volume 2's quarantine mechanism nowhere to live.
+
+Merged: **60 instruments** (§8.2a), **5 configuration keys** (§7.2), **~20 types and fields**
+(§3.13). The sibling "Additions" sections remain as provenance and are superseded.
+
+Three decisions were taken at the same time and are now part of the contract:
+
+- **The destination mapping is configuration, not code.** Already most of the way there — tables,
+  columns and SQL names were startup-only config — so this was consolidation rather than change.
+- **Pre-validation (§5A).** `Column` carries precision, byte capacity, nullability and domain, so
+  the mirror can refuse a value Oracle would refuse, at merge time, naming the contributing
+  transcode. Explicitly defence-in-depth: quarantine and the two-phase execute both remain.
+- **QD, the lock-free datagram ring (§9.5).** A single-producer, single-consumer ring between the
+  reader and the decoder, superseding ADR-001 — whose two grounds for rejecting a pre-classification
+  queue are now one answered (single consumer preserves arrival order) and one expired (there is no
+  per-class drop policy left to inform). Adds one goroutine, 8.5 MB, and ~3.4 s of absorption on top
+  of the kernel's 0.53 s. Resident total moves to **220.8 MB**.
+
 ## Cross-volume reconciliation
 
 Resolved after the volumes were written. These are binding.
@@ -91,7 +114,10 @@ Resolved after the volumes were written. These are binding.
 | `MsgHeader.LogTime` annotated "both layouts" in Vol 0, corrected by Vol 1's V-V1 | **Different offsets: 4 in `BCAST_HEADER`, 2 in `MESSAGE_HEADER`** (bible §2.8). Read at one fixed offset, the other layout yields `AlphaChar` — two characters of `Symbol` construed as a timestamp, feeding the ordering guard |
 | `SEC_INFO.OptionType` at @24 in Vol 0, corrected by Vol 1's V-V2 | **@26.** @24 overlaps `StrikePrice` (22–26) and makes the struct 28 bytes against a declared 30. The four *absolute* offsets Vol 0 derives are unaffected |
 | `maxBatchSize` reload direction | **Reloadable in both directions** within a startup-only ceiling (Vol 0 §7.3 C2). Buffers are pre-allocated at the ceiling, so any value within it is safe. Vol 4 correctly bound to Vol 0 over a looser instruction |
-| Memory envelope — Vol 0 said 189 MB resident, Vol 2 said 212.4 MB | **212.4 MB.** Vol 2's figure includes quantisation Vol 0's occupied-bytes arithmetic omits: arena chunking, Go map bucket rounding, and pre-sized rings. 0.53% of the 40 GB partition; every HLD §7.8 and §11.3 conclusion survives |
+| Memory envelope — Vol 0 said 189 MB resident, Vol 2 said 212.4 MB | **220.8 MB.** Vol 2's quantisation corrections (arena chunking, map bucket rounding, pre-sized rings) supersede Vol 0's occupied-byte arithmetic, plus 8.5 MB for QD. 0.55% of the 40 GB partition; every HLD §7.8 and §11.3 conclusion survives |
+| **ADR-L06 … ADR-L12 were each defined twice** — once in Vol 1, once in Vol 4, for unrelated decisions | **Vol 4 renumbered to ADR-L30 … ADR-L38.** A citation of "ADR-L10" previously resolved to recover-boundary placement *or* the session-event channel depending on which volume you held. Blocks allocated per volume now: Vol 0 L01–L05 and L13, Vol 1 L06–L12, Vol 2 L20–L24, Vol 3 W01–W08, Vol 4 L30–L38 |
+| **"Q0" meant two different things** — the HLD defines it as the kernel socket buffer; the new ring needed a label | The ring is **QD**. Q0 keeps its existing meaning, and Q1/Q2/Q2c are untouched — renumbering them would have been a large, risky edit for no gain |
+| `blob_overrun{code}` (Vol 1, decode) vs `blob_len_mismatch{code}` (Vol 2, shard) | **Both kept.** The same invariant seen from two sides with two different remedies — a decoder writing past a declared width, versus a unit whose blob length disagrees with its mask |
 
 ## Open questions, by what they block
 

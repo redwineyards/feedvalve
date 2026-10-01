@@ -587,7 +587,19 @@ type Entry struct {
     Dirty    bool
     InFlight bool    // batched, not yet confirmed — the in-flight rule, HLD §6.7
     ReDirty  bool    // merged again while in flight; requeued by the completion
-    _        [5]byte // explicit pad to the 8-byte boundary
+
+    // --- merged from Vol 2 §13.1 (A1, A2). Both land in padding this struct
+    // --- already declared, so Entry is still 424 B.
+    Quarantined bool  // Oracle refused this row and will refuse it identically
+                      // forever; off every ring, zero retries, released only by a
+                      // config fix or a disjoint-mask merge (Vol 2 §9, defect L4)
+    SlotSeen    uint8 // bit i: has contributor slot i ever been applied? The
+                      // ordering guard's denominator rule — a contribution that
+                      // initialises a slot has nothing to compare against and must
+                      // count in neither guard_offered nor guard_superseded (Vol 2 §5.4)
+
+    _        [3]byte // explicit pad to the 8-byte boundary — was [5]byte before the
+                     // two fields above; three bytes remain for the next flag
     Image    [imageSize]byte // the current column image of this row, wire form (§4)
 }
 ```
@@ -602,14 +614,22 @@ Entry — align 8, size 424 (maxContributors = 8, imageSize = 256)
    32    32  LastSeq   [8]int32   (align 4)
    64    32  LastTime  [8]int32   (align 4)
    96    64  LastRecv  [8]int64   (align 8; 96 is 8-aligned)
-  160     1  Dirty     bool
-  161     1  InFlight  bool
-  162     1  ReDirty   bool
-  163     5  _         [5]byte    explicit pad
-  168   256  Image     [256]byte  (align 1)
+  160     1  Dirty       bool
+  161     1  InFlight    bool
+  162     1  ReDirty     bool
+  163     1  Quarantined bool       Vol 2 A1
+  164     1  SlotSeen    uint8      Vol 2 A2
+  165     3  _           [3]byte    explicit pad
+  168   256  Image       [256]byte  (align 1)
   ----------------------------------------
   424 total.  424 % 8 == 0, no trailing pad.
 ```
+
+> **`Quarantined` and `SlotSeen` cost nothing.** Both land inside the five pad bytes this struct
+> already declared at offset 163, so `Entry` is **still 424 B** and every memory figure below is
+> unchanged. This is the explicit-padding rule of §2 earning its keep: the free space was visible as
+> a budget, so Volume 2 could spend it deliberately instead of growing the struct by eight bytes
+> across 400,000 rows. Three bytes remain.
 
 **Against the HLD's 368.** The HLD's arithmetic is *correct for the fields it declares*: `Row` 8 +
 `ColMask` 8 + `Digest` 8 + `LastSeq[4]int32` 16 + `LastTime[4]int64` 32 + `LastRecv[4]int64` 32 +
@@ -623,9 +643,17 @@ recorded in §12:
 | `LastTime` `int64` → `int32` | −32 | `LogTime` is a `LONG` — 4 bytes signed (bible §2.7, §2.8). Storing a 4-byte wire field in 8 bytes buys nothing and breaks §10.3's wire-width rule (delta D3) |
 | `Written ColMask` added | +8 | §5.3's suppression predicate. Without it NFR13 silently loses a first-ever write of a field (delta D4) |
 
-Arena memory at ASM-7's ~400,000 rows: `400,000 × 424 = 169.6 MB` against the HLD's 147 MB. Revised
-resident total ≈ **189 MB** (arenas 169.6, indexes 7, Q1 5.9, batch buffers 2.3, rings 3, fixed
-buffers <1) against the HLD's 166 MB — **0.47 % of the 40 GB partition**, and every conclusion in HLD
+Arena memory at ASM-7's ~400,000 rows: `400,000 × 424 = 169.6 MB` of *occupied* bytes against the
+HLD's 147 MB.
+
+> **Superseded by Vol 2 §10, which is canonical for the envelope.** Occupied-byte arithmetic
+> understates the real figure because it ignores quantisation: arenas are allocated in chunks, Go
+> rounds map buckets to a power of two, and the rings are pre-sized. Vol 2 re-derived arenas at
+> **187.6 MB**, indexes at **11.7 MB** and rings at **4.8 MB**. With Q1 at 5.9 MB, the new datagram
+> ring **QD** at 8.5 MB (§9.5.2), batch rows at 2.3 MB and fixed buffers under 1 MB, the resident
+> total is ≈ **220.8 MB — 0.55 % of the 40 GB partition.** Use these figures, not the 169.6/189 pair.
+
+Every conclusion in HLD
 §7.8 and §11.3 survives unchanged.
 
 > **Considered and not taken:** a per-destination image size. HLD §8.2's destination 1 needs 181
@@ -672,7 +700,12 @@ type BatchRow struct {
     Slot    int32           // arena slot of the source Entry, so the completion path needs no
                             // map lookup and cannot look up the wrong row after a reload
     Outcome RowOutcome      // filled by the writer, read by the owning shard
-    _       [3]byte         // explicit pad
+    _       [1]byte         // explicit pad — was [3]byte before ErrCode below
+    ErrCode uint16          // Vol 2 §13.1 A7. The bare ORA number for a Rejected or Failed
+                            // row, 0 otherwise. A uint16 and not an oradb.ErrClass because
+                            // mirror may not import oradb (§1.3) and the shard never
+                            // classifies — it only logs. Without it the quarantine ERROR
+                            // line names no cause and is undiagnosable (Vol 2 §9.6)
     Image   [imageSize]byte // the row image as it was at pump time, wire form (§4)
 }
 
@@ -707,11 +740,15 @@ BatchRow — align 8, size 288 (imageSize = 256)
    16     8  Digest   uint64
    24     4  Slot     int32
    28     1  Outcome  RowOutcome (uint8)
-   29     3  _        [3]byte    explicit pad
+   29     1  _        [1]byte    explicit pad
+   30     2  ErrCode  uint16     (align 2; 30 is 2-aligned)   Vol 2 A7
    32   256  Image    [256]byte  (align 1)
   ----------------------------------------
   288 total.  288 % 8 == 0.
 ```
+
+> **`ErrCode` is also free.** It occupies two of the three pad bytes already declared at offset 29,
+> so `BatchRow` stays **288 B** and the buffer figure below does not move.
 
 Batch row buffers: `shards × maxInFlightPerShard × maxBatchSizeCeiling × 288` =
 `4 × 2 × 1000 × 288` = **2.3 MB**, under the HLD §7.8 figure of 3 MB (which reused the 368-byte
@@ -1026,6 +1063,41 @@ constant for the life of the process.*
 
 ---
 
+### 3.13 Merged from the sibling volumes
+
+Types and values Volumes 1–4 needed that §3 did not define. Folded in here; the "Additions" sections
+in those volumes are superseded and remain only as provenance. Two entries are **withdrawn** and are
+listed rather than deleted, so a reader of an earlier draft can see the decision was deliberate.
+
+| Addition | Package | Why it is needed |
+|---|---|---|
+| `Datagram` — 1040 B, pointer-free | `model` | **New in this merge.** QD's element (§9.5.2) |
+| `SessionEvent` — 16 B, pointer-free | `model` | *(Vol 4)* crosses decode → health by value, so the session machines see the re-open's three transitions rather than a sampled end state |
+| `RejectPanic` added to the `Reject` enum | `model` | *(Vol 1)* the recover boundary needs a `Reject` value to return; every other outcome on that path has one |
+| `ErrStallBudgetExpired` sentinel | `model` | *(Vol 1)* the fatal path must be a **returned error**, not `os.Exit` (§10.4) — `main` maps it to an exit code and Volume 4's drain runs first. Now covers **both** budgets (§9.5.6) |
+| `Column.Scale uint8` | `destinations` | *(Vol 3 A1)* `Scaled` says *whether* to divide; the statement text needs *by what* |
+| `Column.LenBit int8` | `destinations` | *(Vol 3 A2)* destination 2's text takes its length from a different image field; without this the binder cannot be generated from the column table at all |
+| `Column.SQLPrecision`, `SQLMaxBytes`, `NotNull`, `Domain` | `destinations` | **New in this merge (B2).** The DDL facts the mirror needs to pre-validate (§5A) |
+| `Entry.Quarantined`, `Entry.SlotSeen` | `model` | *(Vol 2 A1, A2)* both free — they land in declared padding, §3.7 |
+| `BatchRow.ErrCode uint16` | `model` | *(Vol 2 A7)* free, in declared padding. A bare ORA number and not an `ErrClass`, because `mirror` may not import `oradb` and the shard never classifies — it only logs |
+| `Config.Gen uint64`, assigned monotonically on load and swap | `config` | *(Vol 2 A6)* the shard needs "was this reloaded?" as a cheap exact test at epoch open. Pointer comparison would also fire on a no-op re-publish |
+| `oradb.ErrSpace` added to `ErrClass` | `oradb` | *(Vol 3 A4)* tablespace exhaustion retries like a session error but **never** self-heals. Folded into `ErrSession`, a full tablespace looks like a network blip and the runbook says "wait" when it should say "page the DBA" |
+| `oradb.Session` — a pinned connection that knows when it was acquired | `oradb` | *(Vol 3 A5)* a writer needs its transaction, statements and row locks on one session — and, per finding W1, needs to know when to give it back |
+| `FlushBus` — `req []atomic.Bool`, `wake []chan struct{}` | `mirror` | *(Vol 2 A8)* makes "no shard can reach another shard's state" structural rather than disciplinary |
+| `ring` with `PushFrontBlock` | `mirror` | *(Vol 2 A9)* HLD §7.3 types the dirty structure as a slice and calls it a ring. A slice has no O(1) head insertion, and the failure path head-inserts deliberately — Vol 2 §11.4 shows the consequence is a process crash during a database outage |
+| `Shard.Quarantine`, `Shard.cfgGen` | `mirror` | *(Vol 2 A4, A5)* materialise the quarantine set so a reload releases it in one pass instead of scanning the arena |
+| `app.Runtime` — config, registry and destinations behind **one** atomic pointer | `app` | *(Vol 1 A-16)* the registry cannot live inside `Config` (§1.2 forbids `config` → `decode`), and two independent pointers give a skew window on reload |
+| `wire.FieldID` + name table; `FieldReader` methods `Copy`, `Skip`, `Pad`, `Remaining`, `Reset` | `wire` | *(Vol 1 A-17)* §1.2 assigns the cursor to `wire` without fixing its surface. `Copy` is the workhorse, because R1 stores wire form — a field is copied, never decoded and re-encoded |
+| `maxRegistered = 32`, `maxConsecutiveReadErrors = 64` | `decode`, `app` | *(Vol 1 A-18)* deliberately constants rather than keys |
+| ~~`RowFailState`~~ **withdrawn** | — | *(Vol 2 A3)* an earlier draft's three-valued failure state. With OQ-4 resolved and attribution supplied by Volume 3, the intermediate "isolate" state is unnecessary and a `bool` suffices |
+| ~~`oradb.ErrClass` moved into `model`~~ **withdrawn** | — | *(Vol 2)* superseded by `BatchRow.ErrCode`, which is strictly smaller and leaves §3.11 untouched |
+
+**One correction to §4.3** *(Vol 1 A-19)*: destination 0's contributors are **7208 and 7200**, not
+7208 alone. The exchange chooses which it sends, without notice (bible §4.8a), so both must be
+declared — two of the eight slots.
+
+---
+
 ## 4. `Entry.Image`: the field map (closes L5)
 
 The HLD specifies a 256-byte row image and never says what is in it. Nobody can write the merge, the
@@ -1043,6 +1115,12 @@ missing definition.
 > payload into `Blob`, `copy` from `Blob` into `Image` — which is what keeps the receive goroutine at
 > the cost §6.3 assumes. And **change detection compares raw bytes**, so the digest (§5) is a pure
 > function of what the exchange sent, immune to a rounding change in our presentation code.
+>
+> **Clarified (Vol 1 A-08): re-grouping wire bytes is permitted; re-encoding them is not.** 7200's
+> 10-byte ladder element has to be re-packed into destination 0's 12-byte element layout. That is
+> allowed. Every stored byte remains the exchange's own big-endian value at its wire width, unscaled
+> and untrimmed — only the grouping changes, and the synthesised flag byte is the zero the bible says
+> it always carries. The rule forbids *transforming* a value, not *placing* it.
 >
 > All presentation conversion — price scaling (bible §2.4; note v3.5 changed precision from (6,4) to
 > (7,2)), the 1 Jan 1980 epoch → Oracle `TIMESTAMP` (bible §2.5, Unix offset 315,532,800), blank-trim
@@ -1116,8 +1194,25 @@ type Column struct {
     Offset   uint16   // byte offset within Entry.Image
     Width    uint16   // bytes occupied; the wire width, or 2+n for a CHAR[n] (R5)
     Kind     ColKind  // how the writer converts it at bind time
-    Scaled   bool     // divide by 10^precision at bind time (bible §2.4)
+    Scaled   bool     // divide by 10^Scale at bind time (bible §2.4)
+    Scale    uint8    // Vol 3 A1 — decimal places. `Scaled` says WHETHER to divide;
+                      // this says by what. The statement text needs the divisor
+    LenBit   int8     // Vol 3 A2 — the mask bit of the field supplying this field's
+                      // valid length; -1 when the length is implicit. Destination 2's
+                      // message_text takes its length from message_len, a DIFFERENT
+                      // image field, and without this the binder cannot be generated
+                      // from the column table at all
     SQL      []string // one or more SQL column names, in bind order (R7)
+
+    // --- Pre-validation metadata. Describes the DDL, so the mirror can reject a
+    // --- value the database would refuse BEFORE it reaches a batch (§5A).
+    // --- Lives here, in `destinations`, and not in `oradb`, because `mirror` may
+    // --- not import the database packages (§1.3).
+    SQLPrecision uint8    // NUMBER(p,s) total digits; 0 means "not a NUMBER"
+    SQLMaxBytes  uint16   // VARCHAR2/CHAR byte capacity; 0 means "not character"
+    NotNull      bool     // the column is NOT NULL in the DDL
+    Domain       []string // the permitted values of a flag column ("Y","N"); nil is
+                          // unconstrained. Mirrors a CHECK constraint
 }
 
 type ColKind uint8
@@ -1544,6 +1639,71 @@ assumes rather than the arithmetic itself.
 
 ---
 
+## 5A. Pre-validation: refusing a value before Oracle has to
+
+### 5A.1 What this is for
+
+A batch commits in one transaction, and one bad row costs more than one row. With per-row
+attribution supplied by Volume 3's two-phase execute, a batch containing a row Oracle refuses must
+roll back and re-run **row by row** to find out which row was at fault — `N` round trips instead of
+one. Volume 2 then quarantines the offender. Both mechanisms work, and both are expensive enough
+that it is worth not reaching them.
+
+**Most of that class is knowable in advance.** A value too wide for `NUMBER(7,2)` will be refused
+every time, by every writer, forever; nothing about the database's state makes it a surprise. If the
+column's precision is in the contract, the mirror can see it coming.
+
+### 5A.2 What is checkable, and what is not
+
+| Checkable in the mirror | Not checkable |
+|---|---|
+| Numeric precision overflow — `ORA-01438` | Deadlock, `ORA-00060` — a concurrency property |
+| Character length — `ORA-12899` | Tablespace exhaustion, instance down |
+| Domain violations on a flag column — a `CHECK` | Unique violations (this schema has none beyond the PK) |
+| Invalid epoch conversions, non-finite numerics | Anything depending on rows we did not write |
+| An empty column mask — a Volume 2 defect | |
+
+`NOT NULL` is the one partial case. Writes are `MERGE`, so the insert branch fires only for a row
+Oracle does not have — and the mirror knows only whether *it* has written the row (`Entry.Written`,
+`Digest != 0`), not whether someone deleted it since. **Treat `NotNull` as advisory**: check it, warn
+on it, never quarantine on it.
+
+### 5A.3 The rule
+
+> **Validate at merge, per contribution — not at pump, per row.**
+
+Both points work. Merge-time is better for two reasons. It can name the **contributing transcode**,
+which is what an operator needs to fix the cause rather than the symptom. And it rejects the field
+*before* it is written into the image, so the rest of the row stays writable — at pump time the bad
+value is already merged and the only remaining choices are to drop a column or quarantine the whole
+row.
+
+The cost is a bounds comparison per changed field on a merge that already costs ~365 ns on a shard
+running at 0.29 % busy. It is not measurable.
+
+### 5A.4 The limit, stated so nobody relies on the wrong thing
+
+**Pre-validation is defence in depth. It does not and cannot replace the error path.** Oracle is
+authoritative, its schema can change under a running process, and a mapping file can be wrong in the
+optimistic direction as easily as the pessimistic one. **Volume 2's quarantine and Volume 3's
+two-phase execute both remain in full.** What changes is how often they run, not whether they exist.
+
+A design that treated this as "now row errors cannot happen" would have removed a safety net and
+installed a false sense of safety in its place — strictly worse than not having the check.
+
+### 5A.5 Instruments
+
+| Instrument | Shape | Writer | Labels | Earns its place |
+|---|---|---|---|---|
+| `prevalidate_rejected` | C | shard | `{destination,reason}` — `precision`, `length`, `domain`, `time`, `nonfinite` | The rate at which the mirror is refusing values. Non-zero means a decoder, a scale setting or the DDL is wrong — and it says which kind |
+| `prevalidate_rejected_transcode` | C | shard | `{transcode}` | Which message type is producing them. This is the field the operator actually acts on |
+| `rows_rejected_by_oracle_unpredicted` | C | shard | `{destination}` | **The honesty counter.** A row Oracle refused that pre-validation passed. Every increment is a gap between the mapping and the real DDL, and the catalog check of §7.6 should have caught it |
+
+That third one matters most. Without it, pre-validation silently degrades as the schema drifts and
+nobody learns until the serial fallback starts costing throughput again.
+
+---
+
 ## 6. `ColMask` semantics
 
 ### 6.1 Bit assignment
@@ -1700,10 +1860,12 @@ Defaults are the HLD's where the HLD states one. Where it does not, the default 
 | `runtime.shards` | `int` | `4` | 1–64 | — | **startup-only** — changing it re-keys every mirror and strands state mid-session |
 | `runtime.generalShard` | `int` | `0` | 0 – `shards-1` | the designated shard for non-token units (FR8, HLD §6.5) | **startup-only** — same reason |
 | `runtime.shardQueueCapacity` | `int` | `4096` | 256 – 65,536 | Q1 depth. 15,000 units/s ÷ 4 shards → 1.09 s of slack (HLD §6.6) | **startup-only** — resizing a channel means rebuilding it and losing what is in it |
+| `runtime.datagramQueueCapacity` | `int` | `8192` | 1,024 – 65,536, **and MUST be a power of two** | QD depth (§9.5). 8,192 at ~2,400 datagrams/s is **3.4 s** of absorption on top of Q0's 0.53 s, for 8.5 MB. The power-of-two rule is not stylistic: the ring wraps by masking, and a non-power-of-two silently corrupts the index. `-selfcheck` rejects it | **startup-only** — the ring is one allocation sized at construction |
 | `runtime.maxInFlightPerShard` | `int` | `2` | 1–16 | sizes the per-shard batch free list, `completionCh` and `batchQ` | **startup-only** (HLD §6.9) |
 | `runtime.maxBatchSizeCeiling` | `int` | `1000` | 1 – 10,000 | sizes the pre-allocated `Batch.Rows` slices (§3.8) | **startup-only** |
 | `runtime.expectedRows` | `int` | `200000` | 1,000 – 5,000,000 | pre-sizes each shard's index as `make(map[RowKey]int32, expectedRows/shards)`. Incremental map growth lands on the sole consumer of Q1 (HLD §7.8) | **startup-only** |
 | `runtime.arenaChunkRows` | `int` | `4096` | 256 – 65,536 | arena chunk size; growth appends a chunk rather than copying | **startup-only** |
+| `runtime.time1980UnixOffsetSec` | `int` | `315532800` | 0 – 2³¹ | **(Vol 3 A8)** the Unix offset of the exchange's 1980 epoch (bible §2.5). A key and not a constant because **OQ-W2 is open** — if the epoch turns out to be IST-anchored rather than UTC, every timestamp is 5 h 30 m out, and this turns the fix from a rebuild into a reload. Changing it does **not** rewrite rows already written | reloadable |
 
 #### `flush`
 
@@ -1711,7 +1873,8 @@ Defaults are the HLD's where the HLD states one. Where it does not, the default 
 |---|---|---|---|---|---|
 | `flush.windowMs` (*W*) | `int` | `200` | 10 – 60,000 | the coalescing window and the dominant term in rate-limited latency (HLD §7.6) | reloadable — read at epoch open, held for the epoch (§7.4) |
 | `flush.maxBatchSize` | `int` | `1000` | 1 – `runtime.maxBatchSizeCeiling` | caps a **transaction** (NFR6), not a window's output — a tick flushes the whole dirty set (ADR-018) | reloadable **in both directions within the ceiling** — see contradiction C2 |
-| `flush.drainTimeoutMs` | `int` | `5000` | 0 – 60,000 | bounds the final flush-all at shutdown; on expiry the process exits anyway and logs abandoned dirty rows per destination (HLD §6.10) | reloadable |
+| `flush.drainTimeoutMs` | `int` | `5000` | 0 – 60,000 | bounds the final flush-all at shutdown; on expiry the process exits anyway and logs abandoned dirty rows per destination (HLD §6.10). **One shared budget for all shards, not one each** (Vol 4 D4-1) | reloadable |
+| `flush.epochStallWarnMs` | `int` | `30000` | 1,000 – 600,000 | **(assumed, Vol 2 A10)** — the runtime detector for an epoch that has stopped progressing rather than merely running slowly (HLD §7.12 risk 9). **How to measure:** set it to 5× the observed `epoch_duration_max_ns` after one session | reloadable — read at each tick |
 
 #### `writers`
 
@@ -1724,6 +1887,8 @@ Defaults are the HLD's where the HLD states one. Where it does not, the default 
 | `writers.failFastWrites` | `int` | `20` | 1 – 100,000 | the count half of the same budget | reloadable |
 | `writers.retryInitialMs` | `int` | `100` | 1 – 60,000 | **(assumed)** — HLD §9.2 says "retry with backoff" and gives no numbers. Measure the real reconnect time against the instance (OQ-L4) | reloadable |
 | `writers.retryMaxMs` | `int` | `5000` | `retryInitialMs` – 60,000 | **(assumed)**; doubling backoff, capped | reloadable |
+| `writers.connIdleReleaseSec` | `int` | `60` | 5 – 3,600 | **(assumed, ASM-W1; Vol 3 A6)** — finding W1: a pinned `*sql.Conn` is **exempt from `ConnMaxLifetime`**, because `database/sql` checks expiry only on put and get and the cleaner walks only the free list. CLAUDE.md invariant 4 therefore does not protect the writer sessions, and each writer must release its own when idle | reloadable |
+| `writers.stmtCacheSize` | `int` | `256` | 8 – 4,096 | **(assumed, ASM-W2; Vol 3 A7)** — per-writer statement cache cap. Expected occupancy is 3; the structural ceiling is 765. Past the cap, execution continues uncached rather than evicting | reloadable |
 
 #### `db` — and note what is **not** here
 
@@ -1984,11 +2149,111 @@ availability problem).
 | **Active set** ||||||
 | `active_tokens_1s_max` | **M** | tokens | receiver | — | **renamed** — HLD §10.1 lists `active_tokens_1s` without a shape suffix (gap G5). Directly measures req §12.4. The set is allocated once and **cleared**, never rebuilt, because the receive path is allocation-free (HLD §6.5) |
 | **Schema fit** ||||||
-| `message_truncated` | C | values | shard | `{destination,column}` | a variable-width value cut at its declared width (§4.5). Non-zero means the cap is too tight **or** ASM-16b needs revisiting — both schema decisions, so this is what keeps OQ-13 honest after the fact |
+| `message_truncated` | C | values | **decode** | `{destination,column}` | a variable-width value cut at its declared width (§4.5). Non-zero means the cap is too tight **or** ASM-16b needs revisiting — both schema decisions, so this is what keeps OQ-13 honest after the fact. **Writer corrected from `shard` to `decode` (Vol 1 A-07):** the decoder is the only component that ever sees the unclamped length, and clamping there keeps the merge a pure copy over the mask's set bits with no per-bit special case |
 | **Configuration and lifecycle** ||||||
 | `config_reloads` | C | reloads | lifecycle | — | **added** — F15 describes reload behaviour and §10.1 has no counter (gap G8) |
 | `config_reload_rejected` | C | reloads | lifecycle | — | **added** — the one that matters: a rejected reload means the operator's change did **not** take effect while the process looks healthy |
 | `drain_abandoned_rows` | C | rows | shard | `{destination}` | **added** — HLD §6.10 says the drain "logs how many dirty rows were abandoned, per destination" and §10.1 has no instrument (gap G9). This is an honest count of what req §10.1 already calls unrecoverable |
+
+### 8.2a Merged from the sibling volumes
+
+Volumes 1–4 were written in parallel against §8.2 and each ended with instruments it needed that
+§8.2 did not define. **They are folded in here and this table is now part of the ledger** — the
+"Additions to the Vol 0 ledger" sections in those volumes are superseded by it and remain only as
+provenance. Shapes are §8.1's C / M / G; nothing below needs a reservoir.
+
+**Receive and decode** *(Vol 1)*
+
+| Instrument | Shape | Writer | Labels | Earns its place |
+|---|---|---|---|---|
+| `decompress_failed` | C | framing | **`{reason}`** = input_overrun, output_overrun, lookbehind_overrun, input_not_consumed | `output_overrun` means ASM-14 is broken and has a known fix; the other three mean wire corruption. Two operator actions behind one number |
+| `decompressed_len_mismatch` | C | decode | `{code}` | HLD §3.3 names this cross-check as one of two things this design adds over `poc`, and nothing counted it |
+| `seq_regression` | C | receiver | — | A duplicate or reordered datagram is **not** a gap; folding it into the gap counter corrupts the only loss figure the system produces |
+| `seq_resync` | C | receiver | — | The observable for "the sequence source restarted"; without it the resync rule is a silent re-baseline |
+| `unconfigured_transcode` | C | decode | `{code}` | ADR-011 explicitly requires "we can decode this but nobody told us what to do with it" to be distinguishable from "never seen". Different remedies: a config edit versus an exchange conversation |
+| `booktype_skipped` | C | decode | `{code}` | A deliberate discard with no counter is indistinguishable from a decode failure |
+| `blob_overrun` | C | decode | `{code}` | Runtime half of the ASM-16a gate. Should be unreachable; non-zero is a code defect `-selfcheck` missed |
+| `short_payload` | C | decode | `{stage}` = header, body | §3.11 promises every `Reject` value maps to a counter name; this was the one without |
+| `udp_read_errors` | C | receiver | — | `poc` logs-and-continues on a read error, which spins at full CPU. With the consecutive-error bound this becomes a bounded, visible failure |
+| `last_datagram_mono_ns` | **G** | receiver | — | The liveness machine transitions on **any** datagram, so what `health` needs is a receipt timestamp, not a heartbeat message |
+
+**Datagram ring and pre-validation** *(new in this merge — B3, B2)*
+
+| Instrument | Shape | Writer | Labels | Earns its place |
+|---|---|---|---|---|
+| `qd_depth_max` | **M** | receiver | — | QD is empty almost always; a sampled gauge would read 0 forever. The high-water mark is the only form that can show it filling (§9.5) |
+| `qd_send_blocked` | C | receiver | — | Publishes that had to wait. **A signal about the decoder, not the socket** — publishing is a copy and an atomic store |
+| `qd_wake_parked` | C | decoder | — | How often the consumer exhausted its spin and parked. Rising with load means the spin bound is mistuned; near-constant means the feed is idle, which is normal |
+| `decoder_loop_max_ns` | **M** | decoder | — | One dequeue-to-fan-out pass. The direct measurement of ASM-1/ASM-3, which are the assumptions QD exists to insure against |
+| `prevalidate_rejected` | C | shard | `{destination,reason}` = precision, length, domain, time, nonfinite | The rate at which the mirror refuses values before Oracle has to, and which kind (§5A) |
+| `prevalidate_rejected_transcode` | C | shard | `{transcode}` | Which message type produces them — the field an operator acts on |
+| `rows_rejected_by_oracle_unpredicted` | C | shard | `{destination}` | **The honesty counter.** A row Oracle refused that pre-validation passed: a gap between the mapping and the real DDL. Without it, pre-validation degrades silently as the schema drifts |
+
+**Shard and mirror** *(Vol 2)*
+
+| Instrument | Shape | Writer | Labels | Earns its place |
+|---|---|---|---|---|
+| `flush_wake_dropped` | C | shard | `{k}` | Cap-1 wake coalescing made visible; divergence from `flush_coalesced` means the flag and the edge are out of step |
+| `flush_wake_received` | C | shard | `{k}` | Proves the L1 wakeup fires. Zero here against a non-zero `flush_triggered` means only the loop's level check is carrying the design |
+| `tick_send_dropped` | C | **ticker** | `{k}` | A tick dropped *at the ticker* never reaches `TickMissed` and is otherwise invisible — a worse condition than a skipped tick |
+| `rows_created` | C | shard | `{destination}` | The live growth curve of the row universe: validates ASM-7 from production instead of from a guess |
+| `arena_chunks` | **G** | shard | `{k,destination}` | With `rows_created`, makes chunk utilisation — the quantisation correction of Vol 2 §10 — observable |
+| `ring_grown` | C | shard | `{k,destination}` | A pre-sized ring that grew means `expectedRows` is wrong **and** a long copy landed on a shard. Should be 0 forever |
+| `blob_len_mismatch` | C | shard | `{code}` | The merge's validation pass. A decoder or configuration defect; warrants a rebuild, not tuning |
+| `merge_into_quarantined` | C | shard | `{destination}` | How much live data the quarantine is costing — a dead contract versus a hot row |
+| `row_quarantined` | C | shard | `{destination}` | The **rate** of new permanent failures |
+| `rows_quarantined_current` | **G** | shard | `{destination}` | The **standing set**, and the one to alert on. A counter alone cannot say whether the operator's fix worked |
+| `quarantine_released` | C | shard | `{destination}` | Should step once per reload-fix; proves the runbook action landed |
+| `quarantine_skipped` | C | shard | `{destination}` | A rejected row released immediately because a merge touched columns disjoint from those refused — "we recovered the data" versus "we held it back" |
+| `inflight_desync` | C | shard | `{k}` | Zero, or the process has stopped |
+| `cohort_not_empty` | C | shard | `{k}` | Zero, or the process has stopped |
+| `epoch_stalled` | C | shard | `{k}` | Distinguishes "the database is slow" from "the epoch is stuck" |
+| `shard_depth_max` | **M** | shard | `{k}` | *(Vol 4)* §8.2's `shard_depth` is a gauge sampled every 60 s against a queue empty 99.9 % of the time — it reads 0 forever. **The high-water mark is the only form that can show Q1 rising**, and F9's whole early-warning story depends on it |
+
+**Writer and persistence** *(Vol 3)*
+
+| Instrument | Shape | Writer | Labels | Earns its place |
+|---|---|---|---|---|
+| `writers_running` | **G** | writer | — | `writers_stopped` is cumulative and cannot answer "how many are running now" after a resize. The operator ratio is `writers_busy / writers_running` |
+| `commit_duration_max_ns` | **M** | writer | — | Closes HLD §4.2's *assumed* 5–20 ms commit. Three later sections divide by that range and nothing measured it |
+| `writer_batch_duration_max_ns` | **M** | writer | — | Take-to-return. With the above it separates bind cost from commit cost — the difference between "raise `writers`" and "the database is slow" |
+| `array_bind_rows_max` | **M** | writer | `{destination}` | The only way to answer "is `maxBatchSize` actually being reached?" |
+| `stmt_cache_entries` | **G** | writer | `{writer}` | Predicted occupancy is 3. Above ~20 means the mask space is not what the analysis assumed |
+| `stmt_cache_uncached` | C | writer | — | Executions that ran uncached because the cap was hit |
+| `batch_fallback_perrow` | C | writer | — | Entries into the serial attribution phase. Rising means a schema or scaling defect is producing bad rows continuously — read the logged row keys, do not add writers |
+| `rows_affected_mismatch` | C | writer | `{destination}` | Also the only external symptom of a short-arena silent write loss |
+| `batch_row_empty_mask` | C | writer | `{destination}` | A row arriving with an empty mask — a shard defect. Without it, it looks like a token that stopped updating |
+| `writer_conn_recycled` | C | writer | `{reason}` = hold, idle, error | Separates "working as designed" from "the database keeps dropping us" |
+| `write_probe` | C | writer | `{result}` = ok, fail | Without it the degraded-state probe is invisible and "why did it fail-fast against a healthy database?" is unanswerable |
+| `oracle_error` | C | writer | `{code}` — a **fixed 24-slot** table plus `other` | `write_retry{class}` is too coarse for a runbook: two codes in the same class can mean entirely different things. Fixed slots, because the taxonomy is closed |
+| `bind_nonfinite` | C | writer | `{destination,column}` | A non-finite value reaching a price column means the decoder or the image is wrong |
+| `bind_bad_time` | C | writer | `{destination,column}` | Also the first thing to read if OQ-W2 resolves badly |
+
+**Lifecycle, liveness and observability** *(Vol 4)*
+
+| Instrument | Shape | Writer | Labels | Earns its place |
+|---|---|---|---|---|
+| `panics_recovered` | C | decode / shard / writer / stats | `{stage}` | **Canonical for every recovered panic** — see the collision note below. HLD §9.5 layer 4 specifies panic containment per sub-packet and nothing counted it, so a decoder bug degraded to one silently lost message per packet, forever, with nothing to read |
+| `circuit_quiet_events` | C | health | — | `circuit_state` is sampled every 60 s: a 20-second quiet episode between samples is **completely invisible** |
+| `circuit_down_events` | C | health | — | A three-minute overnight outage that recovered must still be countable in the morning |
+| `circuit_outage_max_ns` | **M** | health | — | The magnitude of the worst outage in the interval |
+| `session_transitions` | C | health | `{market_type}` | `session_state` is a gauge; the re-open's three transitions inside one second are otherwise invisible |
+| `session_anomalies` | C | health | `{market_type}` | Distinguishes "we lost the message" from "the exchange sent something unexpected" |
+| `session_events_dropped` | C | decoder | — | The drop policy of the session channel. **Must remain zero** |
+| `writer_health_state` | **G** | writer | — | Healthy / Degraded / FailFast. Without it, `writes_failed` rising cannot be told from "retrying and recovering" |
+| `log_events_suppressed` | C | obs | `{class}` | Makes rate-limiting visible in the 60 s line; a large value is itself a signal |
+| `clock_step_detected` | C | stats | — | Explains a discontinuity in log timestamps in ten seconds instead of an hour |
+| `readbuf_effective_bytes` | **G** | lifecycle | — | The kernel silently caps the requested buffer, and the **effective** value is what bounds Q0's slack |
+| `uptime_seconds` | **G** | stats | — | A value that keeps resetting is a restart loop, which invalidates every other reading |
+| `config_generation` | **G** | lifecycle | — | The **positive acknowledgement** that a reload took effect. `config_reload_rejected` staying zero is an absence of a negative, not a confirmation |
+
+#### Collisions resolved in this merge
+
+| Collision | Resolution |
+|---|---|
+| Three names for one event — `decode_panic{code}` (Vol 1), `writer_panic` (Vol 3), `panics_recovered{stage}` (Vol 4) | **`panics_recovered{stage}` is canonical**; the other two are withdrawn. They counted the same events under narrower names. The offending transcode travels on the ERROR line, which Vol 4 already specifies, so the `{code}` label bought nothing a log line did not |
+| `shard_depth` (G, §8.2) versus `shard_depth_max` (M, Vol 4) | **Both kept, different jobs.** The gauge answers "what is it now", the mark answers "did it ever rise". Alert on the mark — the gauge reads 0 forever against a queue this empty |
+| `blob_overrun{code}` (Vol 1, decode) versus `blob_len_mismatch{code}` (Vol 2, shard) | **Both kept.** Same invariant observed from two sides with two different remedies: the decoder wrote past a declared width, versus the unit's blob length disagrees with its mask. Cross-referenced rather than merged |
 
 ### 8.3 Instruments the HLD names in prose but omits from §10.1
 
@@ -2056,15 +2321,17 @@ type Registry interface {
 
 ## 9. Concurrency contract
 
-This is the table the other four volumes index into. Twelve goroutines at the defaults, matching HLD
-§7.1's census.
+This is the table the other four volumes index into. **Thirteen** goroutines at the defaults — HLD
+§7.1's census of twelve plus the `decoder` introduced with QD (§9.5), which is the only goroutine
+this merge adds.
 
 ### 9.1 Goroutine classes and exclusive state
 
 | Class | Count | Exclusively owns | Never touches | Started / stopped by |
 |---|---|---|---|---|
 | `lifecycle` | 1 | the `*net.UDPConn` handle for close, the config `Store`, the signal channel, the shutdown sequence | any mirror state, any `Batch` | `main` / returns from `run` |
-| `receiver` | 1 | `readBuf [65536]byte`, `decompBuf [2048]byte`, `fanoutBuf [40]UpdateUnit`, the gap detector's `lastSeq`, the per-second active-token set (allocated once, **cleared** not rebuilt), the per-datagram stall budget | any `Entry`, any `Batch`, any DB handle | `app` / the socket being closed, which is the only way to unblock an in-flight `ReadFrom` (`poc/gobrdclnt.go:135-145`) |
+| `receiver` | 1 | `readBuf [65536]byte`, **QD's producer index**, the source-address check, the per-datagram enqueue budget | any `Entry`, any `Batch`, any DB handle, **QD's consumer index**, every buffer below | `app` / the socket being closed, which is the only way to unblock an in-flight `ReadFrom` (`poc/gobrdclnt.go:135-145`) |
+| `decoder` | **1 — exactly one, and this is load-bearing** | **QD's consumer index**, `decompBuf [2048]byte`, `fanoutBuf [40]UpdateUnit`, the gap detector's `lastSeq`, the per-second active-token set (allocated once, **cleared** not rebuilt), the per-datagram fan-out budget | any `Entry`, any `Batch`, any DB handle, the socket, **QD's producer index** | `app` / QD being closed after the receiver returns |
 | `shard` | `runtime.shards` (4) | `Index [3]map[RowKey]int32`, `Arena [3][][chunkSize]Entry`, `DirtyRing[3]`, `Cohort[3]`, `EpochOpen`, `CohortOut`, `TickMissed`, the `Free []*Batch` list, and **every `Entry` in its partition** | another shard's entries; any DB handle (compile-checked, §1.3); the receive buffers | `app` / `shardCh[k]` being closed |
 | `writer` | `writers.count` (4, reloadable) | one `*sql.Conn`, its prepared-statement cache, its grouping scratch, its consecutive-failure state | any `Entry`; any `Batch` it did not take from `batchQ`; the socket | `app`, and the reload path on resize / `batchQ` being closed, or self-exit on a shrink |
 | `ticker` | 1 | one `time.Ticker`, reset when `flush.windowMs` changes | everything else | `app` / context cancellation |
@@ -2082,12 +2349,14 @@ This is the table the other four volumes index into. Twelve goroutines at the de
 
 | # | Channel | Element | Capacity | Producer | Consumer | Send semantics | Full ⇒ |
 |---|---|---|---|---|---|---|---|
-| **Q1** | `shardCh[k]` | `model.UpdateUnit` **by value**, 360 B | `runtime.shardQueueCapacity` = **4096**, startup-only | receiver | shard *k* (sole) | non-blocking `select` first; on failure, block against the **datagram's remaining stall budget** (50 ms, started once per read-loop iteration and shared by every unit that datagram fans out) | **FATAL on the first expiry.** Nothing is discarded, anywhere in the design. `shard_send_blocked`, `stall_budget_used_max_ns` (HLD §6.6, F9, req §10.2) |
+| **QD** | `datagramRing` — **not a channel**, a lock-free SPSC ring (§9.5) | `model.Datagram` **by value**, 536 B | `runtime.datagramQueueCapacity` = **8192**, startup-only, **MUST be a power of two** | receiver (sole) | **decoder (sole)** | lock-free publish; if full, spin briefly then block against the **datagram's enqueue budget** | **FATAL on the first expiry.** `qd_depth_max`, `qd_send_blocked` (req §10.2, as Q1) |
+| **Q1** | `shardCh[k]` | `model.UpdateUnit` **by value**, 360 B | `runtime.shardQueueCapacity` = **4096**, startup-only | **decoder** | shard *k* (sole) | non-blocking `select` first; on failure, block against the **datagram's remaining fan-out budget** (50 ms, started once per dequeued datagram and shared by every unit it fans out) | **FATAL on the first expiry.** Nothing is discarded, anywhere in the design. `shard_send_blocked`, `stall_budget_used_max_ns` (HLD §6.6, F9, req §10.2) |
 | **Q2** | `batchQ` | `*model.Batch` | `shards × maxInFlightPerShard` = **8**, startup-only | any shard | any writer | **non-blocking, and by construction cannot fail**: only that many batches exist, drawn from per-shard free lists | a failed send is a **defect, not load** — it cannot be resumed when `CohortOut == 0`, so the shard counts `flush_deferred`, logs FATAL and stops (HLD §7.3) |
 | **Q2c** | `completionCh[k]` | `*model.Batch`, returned to its **owning** shard | `maxInFlightPerShard` = **2** | any writer | shard *k* (sole) | blocking send, but **cannot fill**: one slot per batch that shard can have outstanding | unreachable. `completion_lag_max_ns{k}` |
 | **T** | `tickCh[k]` | `struct{}` | **1** | ticker | shard *k* | **non-blocking** send. A full channel means the shard has not consumed the previous tick, which is exactly the `TickMissed` condition | no-op; the shard's own `TickMissed` and `tick_skipped_epoch_open{k}` already describe it |
 | **F** | `flushReq[k]` | **not a channel** — one `atomic.Bool` per shard | 1 bit | **whichever shard merged a non-rate-limited contribution**, after the merge — never the router | shard *k* | atomic `Store(true)`; setting an already-set flag is a no-op counted as `flush_coalesced` | cannot fill. Cleared **only when an epoch actually opens** — a tick landing mid-epoch leaves it set, and so does an open attempt that finds every ring empty, or the request is discarded unserved (HLD §6.6, §7.3) |
 | **W** | `flushWake[k]` | `struct{}` | **1** | the shard that set `flushReq[k]` | shard *k* | **non-blocking** send, immediately after `flushReq[k].Store(true)` | no-op — a pending wake already exists. **Reserved for Volume 2's wakeup mechanism (defect L1); its capacity and semantics are frozen here, its use is not.** A flag with no wakeup leaves a shard parked in `select` until its next tick, which is precisely the *W* delay the non-rate-limited class exists to avoid |
+| **H** | `sessionCh` | `model.SessionEvent` by value, 16 B | **64**, startup-only | **decoder** | stats/health (sole) | **non-blocking** `select` with `default`; never enters either budget | drop; `session_events_dropped`++. Losing one costs a log line and a gauge update and **never costs data** — the same message is already routed to its shard as an `UpdateUnit` *(Vol 4, A-CH-1)* |
 | **S** | `shutdown` | `struct{}`, closed never sent | — | lifecycle | all | close-to-broadcast | — |
 
 **Reading the drop policy in one sentence:** there is none. FeedValve discards no unit anywhere.
@@ -2161,6 +2430,150 @@ writer never waits on a shard — `completionCh[k]` has one slot per batch that 
 outstanding. The ticker and stats goroutines only ever do non-blocking sends and atomic loads. **The
 one place where a wait could be reintroduced by accident is Volume 2's flush wakeup**, which is why
 channel **W** is specified as cap-1 non-blocking here rather than left open.
+
+---
+
+### 9.5 QD — the lock-free datagram ring
+
+#### 9.5.1 Why it exists — ADR-L13
+
+> **ADR-L13: Decouple the reader from the decoder with a lock-free SPSC datagram ring.**
+> **Status:** proposed, **supersedes ADR-001**. Context, alternatives and consequences are §9.5.1
+> to §9.5.7 rather than a separate block, because the argument is inseparable from the mechanism.
+> **Revisit when:** the decode-cost measurement (ASM-1 / ASM-3, HLD OQ-5) lands. If decode is at or
+> under the assumed 10–20 µs per datagram, QD is insurance and could be removed; if it is an order
+> of magnitude worse, QD is what keeps the design loss-free.
+
+With decode inline, the socket is not being drained while a datagram is being decompressed and
+parsed. QD separates the two: the receiver's whole job becomes read, copy, publish, and the decoder
+runs behind it. The kernel buffer (Q0, 640 KB ≈ 0.53 s) and QD then compose — a datagram is lost
+only if **both** are full.
+
+This supersedes **ADR-001**, which placed the first queue after classification. Of ADR-001's two
+grounds for rejecting a pre-classification queue, one is answered and one has expired:
+
+- *"It destroys arrival ordering across datagrams."* It does — **for a decode pool.** QD has exactly
+  one consumer, so arrival order is preserved end to end and ADR-007's structural ordering is
+  untouched. This is the single non-negotiable constraint on QD (§9.5.5).
+- *"Its queue sits before classification, so its only FR7-safe overflow behaviour is to stall the
+  socket."* Written when Q1 still had a lossy per-class drop policy. Since the req §10.2 correction,
+  **nothing is discarded anywhere** and Q1's policy is uniform: try, then block against a budget,
+  then stop. There is no per-class policy left for classification to inform, so a queue that cannot
+  classify loses nothing.
+
+#### 9.5.2 The element
+
+```go
+// Datagram is one received datagram, carried through QD by value. Fixed size
+// and pointer-free: the whole ring is one allocation the collector never traces.
+type Datagram struct {
+    RecvMono int64      // receipt monotonic ns, taken ONCE immediately after ReadFrom.
+                        // This is the source of the ordering guard's receipt clock
+                        // (§3.4(a)) and of the fan-out budget's start (§10.2)
+    N        int32      // bytes valid in Buf
+    _        [4]byte    // explicit pad
+    Buf      [1024]byte // the datagram as read, 8-byte prefix included
+}
+```
+
+```
+Datagram — align 8, size 1040
+  off  size  field
+    0     8  RecvMono int64
+    8     4  N        int32
+   12     4  _        [4]byte   explicit pad
+   16  1024  Buf      [1024]byte (align 1)
+  ----------------------------------------
+ 1040 total.
+
+QD memory: 8192 × 1040 = 8.5 MB, allocated once, pointer-free.
+```
+
+`Buf` is 1024 and not 520 deliberately. The envelope cap is 516 bytes (bible §3.2), so 1024 is
+roughly a 2× margin — which means **an oversized datagram is still carried intact** and reported by
+framing as the envelope-assumption break it is (F6), rather than being silently truncated at the
+ring and misframed downstream. 4 MB buys the ability to diagnose the case rather than corrupt it.
+
+#### 9.5.3 The ring
+
+Single producer, single consumer — the simplest and fastest lock-free case, and the only one this
+design needs.
+
+```
+producer (receiver) owns tail · consumer (decoder) owns head · both published as atomics
+
+  publish:  if tail - load(head) == capacity -> full
+            write slot[tail & mask]
+            store(tail, tail+1)          <- release: the slot is written BEFORE the index moves
+
+  consume:  if head == load(tail) -> empty
+            read slot[head & mask]
+            store(head, head+1)          <- release: the slot is read BEFORE the index moves
+```
+
+Three properties this relies on:
+
+- **Capacity is a power of two**, so the wrap is a mask and never a division. `-selfcheck` rejects a
+  configured capacity that is not (§7.2).
+- **`head` and `tail` sit on separate cache lines.** On ppc64 the line is **128 bytes**, not 64 —
+  pad to 128 or the producer and consumer write the same line on every operation and false sharing
+  costs more than the lock this structure exists to avoid.
+- Go's `atomic.Uint64` `Load`/`Store` are sequentially consistent, which is stronger than the
+  acquire/release this needs. That is correct and portable; no `unsafe` and no assembly.
+
+#### 9.5.4 The wakeup, stated honestly
+
+**A lock-free ring has no blocking primitive, and that is the real design problem here — not the
+queue.** A consumer that finds the ring empty has two options:
+
+- *Busy-spin.* Genuinely lock-free throughout, and it burns a core. On a partition with capped
+  entitled capacity 4 that is **25 % of the entitlement** permanently, to serve a feed that occupies
+  a few per cent of one core. Rejected.
+- *Spin briefly, then park.* Lock-free on the fast path; the park path takes a lock only when the
+  ring is empty — which is exactly the moment there is nothing to contend over.
+
+**Chosen: bounded spin, then park on a capacity-1 wake channel** — the same level-plus-edge shape
+Volume 2 uses for the flush wakeup, for the same reason. The producer does a non-blocking send on
+the wake channel after publishing into an empty ring.
+
+> **What "lock-free" is buying, measured rather than assumed.** At ~2,400 datagrams/s a Go channel's
+> internal mutex would cost on the order of 25 ns per operation — about **0.006 % of one core**.
+> Lock-free buys no throughput here and it would be dishonest to claim otherwise. What it buys is
+> **predictability**: a mutex can be held across a goroutine preemption, and the resulting jitter is
+> precisely the thing QD exists to absorb. That is a defensible reason, and it is the only one.
+> If this structure ever becomes a maintenance burden, a buffered channel is a correct drop-in and
+> the throughput loss is unmeasurable.
+
+#### 9.5.5 The invariant that must not be relaxed
+
+> **QD has exactly one consumer. Not a pool, not now, not later.**
+
+A second consumer reorders datagrams relative to arrival, and arrival order at a single goroutine is
+ADR-007's mechanism-1 — the thing that makes ordering structural rather than dependent on the
+sequence guard, which is a *defence* and can auto-disable itself per transcode. Widening QD would
+silently demote the whole ordering story to that defence. Volume 4 must gate this: a test that
+asserts exactly one goroutine consumes QD, and a source scan that fails the build if the consumer is
+started in a loop.
+
+#### 9.5.6 The budget split
+
+One budget becomes two, both fatal on expiry, because there are now two critical-path queues:
+
+| Budget | Owner | Covers | Expiry means |
+|---|---|---|---|
+| **enqueue** | receiver | the QD publish for one datagram | QD is full *and* the decoder is not draining — the decoder is wedged or starved |
+| **fan-out** | decoder | every Q1 send a dequeued datagram produces | the shards are behind |
+
+The receiver's budget should be almost unused: publishing is a 1 KB copy and an atomic store, so a
+non-zero `qd_send_blocked` is a signal about the **decoder**, not about the socket. That separation
+is the diagnostic value of the split — previously both conditions presented identically.
+
+#### 9.5.7 Shutdown gains a stage
+
+Close the socket → the receiver returns → **close QD and let the decoder drain it** → the decoder
+returns → close each `shardCh[k]` → shards drain and perform their final flush. Volume 4 owns the
+sequencing; the new obligation is that **QD must be drained, not abandoned**, or the no-loss property
+has a hole at shutdown precisely where it is easiest to overlook.
 
 ---
 
