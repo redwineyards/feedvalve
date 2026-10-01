@@ -1,0 +1,249 @@
+//go:build testutil
+
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"net"
+	"strings"
+	"testing"
+)
+
+func mustWrite(t *testing.T, buf *bytes.Buffer, v any) {
+	t.Helper()
+	if err := binary.Write(buf, binary.BigEndian, v); err != nil {
+		t.Fatalf("write field %T: %v", v, err)
+	}
+}
+
+func buildBroadcastHeader(t *testing.T, transactionCode, messageLength int16) []byte {
+	t.Helper()
+
+	buf := new(bytes.Buffer)
+	mustWrite(t, buf, [2]byte{})         // reserved1
+	mustWrite(t, buf, [2]byte{})         // reserved2
+	mustWrite(t, buf, int32(1700000000)) // logTime
+	mustWrite(t, buf, [2]byte{'N', 'C'}) // alphaChar
+	mustWrite(t, buf, transactionCode)   // transactionCode
+	mustWrite(t, buf, int16(0))          // errorCode
+	mustWrite(t, buf, int32(42))         // sequenceNumber
+	mustWrite(t, buf, byte(0))           // reserved3
+	mustWrite(t, buf, [3]byte{})         // reserved4
+	mustWrite(t, buf, [8]byte{})         // timestamp2
+	mustWrite(t, buf, [8]byte{})         // filler2
+	mustWrite(t, buf, messageLength)     // messageLength
+	return buf.Bytes()
+}
+
+// buildMSBroadcastOnlyMBPMessage builds a 470-byte transaction-code-7208
+// message matching the wire layout parsed by parseMSBroadcastOnlyMBP.
+func buildMSBroadcastOnlyMBPMessage(t *testing.T, token int32) []byte {
+	t.Helper()
+
+	const recordCount = 2
+
+	buf := new(bytes.Buffer)
+	buf.Write(buildBroadcastHeader(t, 7208, 470))
+	mustWrite(t, buf, int16(recordCount)) // recordCount
+
+	for i := 0; i < recordCount; i++ {
+		mustWrite(t, buf, token+int32(i)) // token
+		mustWrite(t, buf, int16(1))       // bookType
+		mustWrite(t, buf, int16(1))       // tradingStatus
+		mustWrite(t, buf, int32(1000))    // volumeTradedToday
+		mustWrite(t, buf, int32(2500))    // lastTradedPrice
+		mustWrite(t, buf, byte(0))        // netChangeIndicator
+		mustWrite(t, buf, int32(0))       // netPriceChangeFromClosingPrice
+		mustWrite(t, buf, int32(10))      // lastTradeQuantity
+		mustWrite(t, buf, int32(0))       // lastTradeTime
+		mustWrite(t, buf, int32(2500))    // averageTradePrice
+		mustWrite(t, buf, int16(0))       // auctionNumber
+		mustWrite(t, buf, int16(0))       // auctionStatus
+		mustWrite(t, buf, int16(0))       // initiatorType
+		mustWrite(t, buf, int32(0))       // initiatorPrice
+		mustWrite(t, buf, int32(0))       // initiatorQuantity
+		mustWrite(t, buf, int32(0))       // auctionPrice
+		mustWrite(t, buf, int32(0))       // auctionQuantity
+
+		for j := 0; j < 10; j++ {
+			mustWrite(t, buf, int32(100+j)) // quantity
+			mustWrite(t, buf, int32(2500))  // price
+			mustWrite(t, buf, int16(1))     // numberOfOrders
+			mustWrite(t, buf, int16(1))     // bbBuySellFlag
+		}
+
+		mustWrite(t, buf, int16(0))      // bbTotalBuyFlag
+		mustWrite(t, buf, int16(0))      // bbTotalSellFlag
+		mustWrite(t, buf, float64(1000)) // totalBuyQuantity
+		mustWrite(t, buf, float64(1000)) // totalSellQuantity
+		mustWrite(t, buf, byte(0))       // indicator.flags
+		mustWrite(t, buf, byte(0))       // indicator.reserved
+		mustWrite(t, buf, int32(2400))   // closingPrice
+		mustWrite(t, buf, int32(2450))   // openPrice
+		mustWrite(t, buf, int32(2550))   // highPrice
+		mustWrite(t, buf, int32(2400))   // lowPrice
+	}
+
+	mustWrite(t, buf, [2]byte{}) // padding: header+recordCount+records is 468 bytes, messageSize is 470
+
+	return buf.Bytes()
+}
+
+// buildMSSecurityUpdateInfoMessage builds a 294-byte transaction-code-7305
+// message matching the wire layout parsed by parseMSSecurityUpdateInfo.
+func buildMSSecurityUpdateInfoMessage(t *testing.T, token int32, symbol string) []byte {
+	t.Helper()
+
+	var symbolField [10]byte
+	copy(symbolField[:], symbol)
+
+	buf := new(bytes.Buffer)
+	buf.Write(buildBroadcastHeader(t, 7305, 294))
+	mustWrite(t, buf, token) // token
+
+	// securityInfo
+	mustWrite(t, buf, [6]byte{})         // instrumentName
+	mustWrite(t, buf, symbolField)       // symbol
+	mustWrite(t, buf, [2]byte{'E', 'Q'}) // series
+	mustWrite(t, buf, int32(0))          // expiryDate
+	mustWrite(t, buf, int32(0))          // strikePrice
+	mustWrite(t, buf, [2]byte{})         // optionType
+	mustWrite(t, buf, int16(0))          // caLevel
+
+	mustWrite(t, buf, int16(1))     // permittedToTrade
+	mustWrite(t, buf, float64(1e6)) // issuedCapital
+	mustWrite(t, buf, int32(0))     // warningQuantity
+	mustWrite(t, buf, int32(0))     // freezeQuantity
+	mustWrite(t, buf, [12]byte{})   // creditRating
+
+	for i := 0; i < 4; i++ {
+		mustWrite(t, buf, byte(0))  // eligibilityPerMarket[i].flags
+		mustWrite(t, buf, int16(0)) // eligibilityPerMarket[i].status
+	}
+
+	mustWrite(t, buf, int16(0))    // issueRate
+	mustWrite(t, buf, int32(0))    // issueStartDate
+	mustWrite(t, buf, int32(0))    // interestPaymentDate
+	mustWrite(t, buf, int32(0))    // issueMaturityDate
+	mustWrite(t, buf, int32(0))    // marginPercentage
+	mustWrite(t, buf, int32(1))    // minimumLotQuantity
+	mustWrite(t, buf, int32(1))    // boardLotQuantity
+	mustWrite(t, buf, int32(5))    // tickSize
+	mustWrite(t, buf, [25]byte{})  // name
+	mustWrite(t, buf, byte(0))     // reserved
+	mustWrite(t, buf, int32(0))    // listingDate
+	mustWrite(t, buf, int32(0))    // expulsionDate
+	mustWrite(t, buf, int32(0))    // reAdmissionDate
+	mustWrite(t, buf, int32(0))    // recordDate
+	mustWrite(t, buf, int32(0))    // lowPriceRange
+	mustWrite(t, buf, int32(0))    // highPriceRange
+	mustWrite(t, buf, int32(0))    // expiryDate (message-level)
+	mustWrite(t, buf, int32(0))    // noDeliveryStartDate
+	mustWrite(t, buf, int32(0))    // noDeliveryEndDate
+	mustWrite(t, buf, byte(0))     // eligibilityIndicators.flags
+	mustWrite(t, buf, byte(0))     // eligibilityIndicators.reserved
+	mustWrite(t, buf, int32(0))    // bookClosureStartDate
+	mustWrite(t, buf, int32(0))    // bookClosureEndDate
+	mustWrite(t, buf, int32(0))    // exerciseStartDate
+	mustWrite(t, buf, int32(0))    // exerciseEndDate
+	mustWrite(t, buf, int32(1))    // multiplier
+	mustWrite(t, buf, [6]byte{})   // assetInstrument
+	mustWrite(t, buf, [10]byte{})  // assetName
+	mustWrite(t, buf, int32(0))    // underlyingToken
+	mustWrite(t, buf, int32(0))    // intrinsicValue
+	mustWrite(t, buf, int32(0))    // extrinsicValue
+	mustWrite(t, buf, byte(0))     // purpose.flags1
+	mustWrite(t, buf, byte(0))     // purpose.flags2
+	mustWrite(t, buf, int32(0))    // localUpdateDateTime
+	mustWrite(t, buf, byte(0))     // deleteFlag
+	mustWrite(t, buf, [25]byte{})  // remark
+	mustWrite(t, buf, int32(2400)) // basePrice
+
+	return buf.Bytes()
+}
+
+// buildBroadcastPackedData wraps a single compressed sub-packet in the
+// envelope format expected by processBroadcastPackData.
+func buildBroadcastPackedData(t *testing.T, compressed []byte) []byte {
+	t.Helper()
+
+	buf := new(bytes.Buffer)
+	mustWrite(t, buf, [2]byte{})              // netID
+	mustWrite(t, buf, int16(1))               // packetCount
+	mustWrite(t, buf, int16(len(compressed))) // sub-packet length
+	buf.Write(compressed)
+	return buf.Bytes()
+}
+
+// decompressAndLog reproduces main's per-sub-packet handling: decompress via
+// the pure-Go Decompress function, then hand the result to processPacket so
+// packetLogger records it exactly as the running relay would.
+func decompressAndLog(t *testing.T, envelope []byte) {
+	t.Helper()
+
+	from := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
+	decompressBuf := make([]byte, maxDecompressedPacketLen)
+
+	err := processBroadcastPackData(envelope, func(i, packetCount int, compressedLength int16, compressedData []byte, compressed bool) {
+		if !compressed {
+			processPacket(from, i, packetCount, compressedLength, compressedData[:0])
+			return
+		}
+
+		n, err := Decompress(decompressBuf, compressedData)
+		if err != nil {
+			t.Fatalf("Decompress: %v", err)
+		}
+		processPacket(from, i, packetCount, compressedLength, decompressBuf[:n])
+	})
+	if err != nil {
+		t.Fatalf("processBroadcastPackData: %v", err)
+	}
+}
+
+func TestTransactionCode7208MSBroadcastOnlyMBP(t *testing.T) {
+	message := buildMSBroadcastOnlyMBPMessage(t, 12345)
+	compressed := testLZO1ZCompress(t, message)
+	envelope := buildBroadcastPackedData(t, compressed)
+
+	var logBuf bytes.Buffer
+	initPacketLogger(&logBuf)
+	defer initPacketLogger(nopWriter{})
+
+	decompressAndLog(t, envelope)
+
+	got := logBuf.String()
+	t.Logf("packetLogger output:\n%s", got)
+	if !strings.Contains(got, "MSBroadcastOnlyMBP=") {
+		t.Errorf("packetLogger did not print a parsed MSBroadcastOnlyMBP packet, got:\n%s", got)
+	}
+	if !strings.Contains(got, "token:12345") {
+		t.Errorf("packetLogger output missing expected token 12345, got:\n%s", got)
+	}
+}
+
+func TestTransactionCode7305MSSecurityUpdateInfo(t *testing.T) {
+	message := buildMSSecurityUpdateInfoMessage(t, 999, "TESTSYM")
+	compressed := testLZO1ZCompress(t, message)
+	envelope := buildBroadcastPackedData(t, compressed)
+
+	var logBuf bytes.Buffer
+	initPacketLogger(&logBuf)
+	defer initPacketLogger(nopWriter{})
+
+	decompressAndLog(t, envelope)
+
+	got := logBuf.String()
+	t.Logf("packetLogger output:\n%s", got)
+	if !strings.Contains(got, "MSSecurityUpdateInfo=") {
+		t.Errorf("packetLogger did not print a parsed MSSecurityUpdateInfo packet, got:\n%s", got)
+	}
+	if !strings.Contains(got, "token:999") {
+		t.Errorf("packetLogger output missing expected token 999, got:\n%s", got)
+	}
+}
+
+type nopWriter struct{}
+
+func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }

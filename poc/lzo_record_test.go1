@@ -1,0 +1,79 @@
+package main
+
+// Fixture recorder for testdata/lzo_fixtures.json. INERT BY DEFAULT: this file
+// normally lives as lzo_record_test.go1, and files ending .go1 are excluded
+// from the build by their extension (CLAUDE.md, "Disabled files"). Only while
+// it is renamed to .go does the module depend on github.com/rhnvrm/lzo1z.
+//
+// Activating it sets recordHook (declared in decompress_test.go), which
+// diverts compressWithReference away from the frozen lookup and back to the
+// live reference compressor, recording every (input -> compressed) pair it is
+// asked for. Running the suite therefore discovers exactly the fixtures the
+// tests need -- there is no list to keep in step by hand.
+//
+// See the regeneration procedure at the top of decompress_test.go.
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"sync"
+	"testing"
+
+	reflzo1z "github.com/rhnvrm/lzo1z"
+)
+
+func init() {
+	if path := os.Getenv("FEEDVALVE_RECORD_LZO"); path != "" {
+		recordHook = func(t *testing.T, data []byte) []byte {
+			return compressAndRecord(t, path, data)
+		}
+	}
+}
+
+var recordMu sync.Mutex
+
+// compressAndRecord compresses with the reference implementation and appends
+// one JSON object per line to path. Lines are deduplicated when they are
+// folded into lzo_fixtures.json; writing them append-only keeps the recorder
+// free of any ordering assumption about how tests run.
+func compressAndRecord(t *testing.T, path string, data []byte) []byte {
+	t.Helper()
+
+	dst := make([]byte, reflzo1z.MaxCompressedSize(len(data)))
+	n, err := reflzo1z.Compress(data, dst)
+	if err != nil {
+		t.Fatalf("reference Compress: %v", err)
+	}
+	compressed := dst[:n]
+
+	sum := sha256.Sum256(data)
+	line, err := json.Marshal(struct {
+		SHA256     string `json:"sha256"`
+		InputLen   int    `json:"inputLen"`
+		Compressed string `json:"compressed"`
+	}{
+		SHA256:     hex.EncodeToString(sum[:]),
+		InputLen:   len(data),
+		Compressed: base64.StdEncoding.EncodeToString(compressed),
+	})
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+
+	recordMu.Lock()
+	defer recordMu.Unlock()
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+
+	return compressed
+}

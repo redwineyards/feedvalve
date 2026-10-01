@@ -1,0 +1,49 @@
+//go:build testutil
+
+package main
+
+/*
+#include <lzo/lzoconf.h>
+#include <lzo/lzo1z.h>
+
+static int feedvalve_test_lzo1z_compress(const lzo_bytep src, lzo_uint src_len,
+                                          lzo_bytep dst, lzo_uintp dst_len,
+                                          lzo_voidp wrkmem) {
+	return lzo1z_999_compress(src, src_len, dst, dst_len, wrkmem);
+}
+*/
+import "C"
+
+import (
+	"testing"
+	"unsafe"
+)
+
+// lzo1z999MemCompress mirrors LZO1Z_999_MEM_COMPRESS from lzo1z.h
+// (14 * 16384 * sizeof(short)), computed in Go to avoid depending on cgo's
+// evaluation of a sizeof-based macro.
+const lzo1z999MemCompress = 14 * 16384 * 2
+
+// testLZO1ZCompress compresses src using lzo1z_999_compress, the
+// counterpart to the lzo1z_decompress wrapper under test. It lives behind
+// the "testutil" build tag (rather than in a _test.go file) because Go's
+// module indexer does not support cgo in _test.go files.
+func testLZO1ZCompress(t *testing.T, src []byte) []byte {
+	t.Helper()
+
+	wrkmem := make([]byte, lzo1z999MemCompress)
+	dst := make([]byte, len(src)+len(src)/16+64+3)
+	dstLen := C.lzo_uint(len(dst))
+
+	rc := C.feedvalve_test_lzo1z_compress(
+		(C.lzo_bytep)(unsafe.Pointer(&src[0])),
+		C.lzo_uint(len(src)),
+		(C.lzo_bytep)(unsafe.Pointer(&dst[0])),
+		&dstLen,
+		unsafe.Pointer(&wrkmem[0]),
+	)
+	if rc != C.LZO_E_OK {
+		t.Fatalf("lzo1z_999_compress failed: rc=%d", int(rc))
+	}
+	return dst[:int(dstLen)]
+}

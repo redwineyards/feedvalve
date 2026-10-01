@@ -209,7 +209,7 @@ them may name `database/sql`, `go-ora` or `oradb`, and `mirror` additionally may
 | `github.com/sijms/go-ora/v2` | `oradb` only | yes | yes | Pure Go driver, no Instant Client. CLAUDE.md records the `go list -deps ./poc` verification and `go mod why gorm.io/gorm` showing the gorm/xorm entries belong to go-ora's test tree |
 | `hash/maphash` | `mirror` (digest, §5) | yes | yes | stdlib. Uses runtime assembly on some architectures; **assembly is not cgo**. On ppc64 `useAeshash` is false, so it takes the portable word-at-a-time path — *(assumed; measure with `go test -bench -benchmem` cross-compiled to the LPAR, OQ-L3)* |
 | `encoding/binary` | `wire`, `destinations`, `writer` | yes | yes | stdlib; `binary.BigEndian.Uint32` and friends are pure Go and alignment-agnostic, which §4.1 relies on |
-| `github.com/rhnvrm/lzo1z` | **test files only** | yes | n/a | Reference *compressor* for fixtures. CLAUDE.md: it must never be imported by non-test code |
+| `github.com/rhnvrm/lzo1z` | **not a dependency** | n/a | n/a | Was the reference *compressor* for fixtures. Removed from the module: the compressed bytes it produced are frozen in `poc/testdata/lzo_fixtures.json`, keyed by SHA-256 of the input, so the independence is preserved without the dependency. Gate G-DEP-3 now guards against reintroduction rather than against leakage into the binary |
 | `golang.org/x/sys` | **not used** | — | — | HLD §7.8 excludes it deliberately: req §4 warns its AIX surface is thin. `SetReadBuffer` comes from `net`, signals from `os/signal` |
 
 No new third-party dependency is introduced by this volume. The digest (§5) is stdlib; the image
