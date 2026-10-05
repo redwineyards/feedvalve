@@ -1,0 +1,100 @@
+{
+  "_comment": [
+    "The destination field map. This file is the single source for which image field",
+    "becomes which SQL column, and the writer builds its MERGE statements from it at",
+    "runtime. Transcribed from docs/lld/00-foundations.md sections 4.3, 4.4 and 4.5.",
+    "",
+    "Offsets are NOT declared: rule R2 makes the image packed in declared order with",
+    "no padding, so an offset is the running sum of the widths before it. Declaring",
+    "them too would be a second source of truth for the same arithmetic.",
+    "",
+    "Bit indices ARE declared, and must equal the column's index. They are redundant",
+    "on purpose: a reordered column list with stale bits fails the load instead of",
+    "silently re-mapping every live entry and stored digest.",
+    "",
+    "imageLen is declared and checked against the computed sum, so a width typo is",
+    "caught here rather than becoming a quiet layout change.",
+    "",
+    "Widths are WIRE widths (R1). The image holds exactly what the exchange sent,",
+    "big-endian and unscaled; scale, epoch and blank-trim conversions happen in the",
+    "writer at bind time."
+  ],
+
+  "destinations": [
+    {
+      "name": "MD_TOKEN_QUOTE",
+      "table": "MD_TOKEN_QUOTE",
+      "rowKey": "token",
+      "imageLen": 181,
+      "contributors": [7208, 7200],
+      "_contributors": "7200 and 7208 are mutually exclusive and the choice is the exchange's, without notice (bible 4.8a), so both are declared. A build that knows only one goes blind the day it switches.",
+      "columns": [
+        {"bit": 0,  "width": 4,   "kind": "long",     "scaled": true, "scale": 2, "sql": ["last_traded_price"],    "sqlPrecision": 7},
+        {"bit": 1,  "width": 4,   "kind": "long",     "sql": ["volume_traded_today"],                              "sqlPrecision": 10},
+        {"bit": 2,  "width": 4,   "kind": "long",     "scaled": true, "scale": 2, "sql": ["open_price"],           "sqlPrecision": 7},
+        {"bit": 3,  "width": 4,   "kind": "long",     "scaled": true, "scale": 2, "sql": ["high_price"],           "sqlPrecision": 7},
+        {"bit": 4,  "width": 4,   "kind": "long",     "scaled": true, "scale": 2, "sql": ["low_price"],            "sqlPrecision": 7},
+        {"bit": 5,  "width": 4,   "kind": "long",     "scaled": true, "scale": 2, "sql": ["closing_price"],        "sqlPrecision": 7},
+        {"bit": 6,  "width": 2,   "kind": "short",    "sql": ["trading_status"],                                   "sqlPrecision": 5},
+        {"bit": 7,  "width": 1,   "kind": "char1",    "sql": ["net_change_indicator"], "sqlMaxBytes": 1, "domain": ["+", "-"]},
+        {"bit": 8,  "width": 4,   "kind": "long",     "sql": ["last_trade_quantity"],                              "sqlPrecision": 10},
+        {"bit": 9,  "width": 4,   "kind": "time1980", "sql": ["last_trade_time"]},
+        {"bit": 10, "width": 4,   "kind": "long",     "scaled": true, "scale": 2, "sql": ["average_trade_price"],  "sqlPrecision": 7},
+        {"bit": 11, "width": 8,   "kind": "double",   "sql": ["total_buy_quantity"],                               "sqlPrecision": 20},
+        {"bit": 12, "width": 8,   "kind": "double",   "sql": ["total_sell_quantity"],                              "sqlPrecision": 20},
+        {"bit": 13, "width": 2,   "kind": "short",    "sql": ["book_type"],                                        "sqlPrecision": 5},
+        {"bit": 14, "width": 120, "kind": "group",    "scaled": true, "scale": 2,
+         "_note": "MBP_INFORMATION[10]: 10 records of 12 bytes. Five best buys then five best sells, copied as one run. BbBuySellFlag is discarded because the side is positional. Prices inside the run are scaled.",
+         "sql": [
+           "bid_qty_1", "bid_px_1", "bid_ord_1", "bid_qty_2", "bid_px_2", "bid_ord_2",
+           "bid_qty_3", "bid_px_3", "bid_ord_3", "bid_qty_4", "bid_px_4", "bid_ord_4",
+           "bid_qty_5", "bid_px_5", "bid_ord_5",
+           "ask_qty_1", "ask_px_1", "ask_ord_1", "ask_qty_2", "ask_px_2", "ask_ord_2",
+           "ask_qty_3", "ask_px_3", "ask_ord_3", "ask_qty_4", "ask_px_4", "ask_ord_4",
+           "ask_qty_5", "ask_px_5", "ask_ord_5"
+         ]},
+        {"bit": 15, "width": 4,   "kind": "time1980", "sql": ["effective_ts"],
+         "_note": "BCAST_HEADER.LogTime, not TimeStamp2 -- which is the machine number, not a time."}
+      ]
+    },
+
+    {
+      "name": "MD_SECURITY_MASTER",
+      "table": "MD_SECURITY_MASTER",
+      "rowKey": "token",
+      "imageLen": 37,
+      "contributors": [7305, 7340],
+      "_contributors": "7340 is the periodic re-send of 7305, identical structure.",
+      "columns": [
+        {"bit": 0, "width": 10, "kind": "text",     "lenBit": -1, "sql": ["symbol"], "sqlMaxBytes": 10, "notNull": true,
+         "_note": "Fixed width, blank-padded. lenBit -1 means the length is implicit and the writer right-trims at bind time; there is no NUL terminator (bible 2.6)."},
+        {"bit": 1, "width": 2,  "kind": "text",     "lenBit": -1, "sql": ["series"], "sqlMaxBytes": 2},
+        {"bit": 2, "width": 4,  "kind": "time1980", "sql": ["expiry_date"]},
+        {"bit": 3, "width": 4,  "kind": "long",     "scaled": true, "scale": 2, "sql": ["strike_price"],       "sqlPrecision": 7},
+        {"bit": 4, "width": 4,  "kind": "long",     "sql": ["board_lot_quantity"],                             "sqlPrecision": 10},
+        {"bit": 5, "width": 4,  "kind": "long",     "scaled": true, "scale": 2, "sql": ["tick_size"],          "sqlPrecision": 7},
+        {"bit": 6, "width": 4,  "kind": "long",     "scaled": true, "scale": 2, "sql": ["base_price"],         "sqlPrecision": 7},
+        {"bit": 7, "width": 1,  "kind": "char1",    "sql": ["delete_flag"], "sqlMaxBytes": 1, "domain": ["Y", "N"]},
+        {"bit": 8, "width": 4,  "kind": "time1980", "sql": ["effective_ts"]}
+      ]
+    },
+
+    {
+      "name": "MD_MARKET_STATUS",
+      "table": "MD_MARKET_STATUS",
+      "rowKey": "marketType",
+      "imageLen": 142,
+      "contributors": [6511, 6521, 6522, 6531, 6571],
+      "_contributors": "Five contributors, which is why MaxContributors must exceed the HLD's four. They share one row per market_type and differ only in which last wrote it, so transcode (bit 0) is how a reader tells Open from Closed.",
+      "columns": [
+        {"bit": 0, "width": 2,   "kind": "short", "sql": ["transcode"],         "sqlPrecision": 5, "notNull": true},
+        {"bit": 1, "width": 2,   "kind": "short", "sql": ["message_len"],       "sqlPrecision": 5},
+        {"bit": 2, "width": 128, "kind": "text",  "lenBit": 1, "sql": ["message_text"], "sqlMaxBytes": 128,
+         "_note": "Length comes from message_len (bit 1), a different image field. The wire carries 239 bytes but the bible says the tail past the valid length is not meaningful; 128 is a schema choice, not a limit imageSize forces. The region is fully rewritten and zero-filled past the valid length (R5), which is what the digest depends on."},
+        {"bit": 3, "width": 2,   "kind": "text",  "lenBit": -1, "sql": ["bcast_destination"], "sqlMaxBytes": 2},
+        {"bit": 4, "width": 4,   "kind": "long",  "sql": ["token"],             "sqlPrecision": 10},
+        {"bit": 5, "width": 4,   "kind": "time1980", "sql": ["effective_ts"]}
+      ]
+    }
+  ]
+}

@@ -1252,7 +1252,7 @@ bit  img.off  w   Go read                       src rec.off  SQL column(s)      
  11       39   8  float64 Float64frombits        180         total_buy_quantity         Double
  12       47   8  float64                        188         total_sell_quantity        Double
  13       55   2  int16                            4         book_type                  Short
- 14       57 120  [120]byte copy                  56         bid_qty_1..5, bid_px_1..5, Group → 40 cols
+ 14       57 120  [120]byte copy                  56         bid_qty_1..5, bid_px_1..5, Group → 30 cols
                                                               bid_ord_1..5, ask_qty_1..5,
                                                               ask_px_1..5, ask_ord_1..5
  15      177   4  int32                     hdr off 4         effective_ts               Time1980
@@ -1264,9 +1264,13 @@ Notes that matter:
 
 - **Bit 14 is `MBP_INFORMATION[10]`** — 10 records of 12 bytes at record offset 56 (bible §4.8):
   `Quantity LONG @0`, `Price LONG @4`, `NumberOfOrders SHORT @8`, `BbBuySellFlag SHORT @10`. Five
-  best buys then five best sells. Copied as one 120-byte run; the writer expands it to 40 columns
+  best buys then five best sells. Copied as one 120-byte run; the writer expands it to **30 columns**
   (quantity, price, orders × 5 levels × 2 sides) and **discards `BbBuySellFlag`**, because the side
   is positional. Prices inside the run are scaled (bible §2.4).
+  *(Corrected during P1-04: this said 40, which contradicted both the parenthetical arithmetic
+  — 3 × 5 × 2 — and the column list in the table above, which names 30. Three kept fields across
+  ten records is 30. R7's argument is unaffected: 30 bits would still be half the mask spent on a
+  distinction 7208 never makes.)*
 - **`BbTotalBuyFlag` and `BbTotalSellFlag` (record offsets 176, 178) are NOT stored.** Bible §4.8:
   they currently contain zero, the buy-back concept is not implemented, and "do not build logic on
   them". Storing them would spend 4 image bytes and two mask bits on constants.
