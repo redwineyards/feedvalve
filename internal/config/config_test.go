@@ -83,7 +83,9 @@ func TestFullConfigRoundTrips(t *testing.T) {
 	  "debug": {"traceTranscodes": [7208, 7305], "hexDump": true},
 	  "transcodes": [
 	    {"code": 7208, "class": "rate-limited", "expectedRatePerSec": 2000,
-	     "contributions": [{"destination": "MD_TOKEN_QUOTE", "columns": ["last_traded_price"]}]}
+	     "contributions": [{"destination": "MD_TOKEN_QUOTE", "columns": ["last_traded_price"]}]},
+	    {"code": 7305, "class": "rate-limited",
+	     "contributions": [{"destination": "MD_SECURITY_MASTER", "columns": ["symbol"]}]}
 	  ]
 	}`
 

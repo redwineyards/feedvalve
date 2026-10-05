@@ -49,7 +49,12 @@ func TestSelfCheckNeedsNeitherPasswordNorNetwork(t *testing.T) {
 		"MD_TOKEN_QUOTE", "181/256",
 		"MD_SECURITY_MASTER", "37/256",
 		"MD_MARKET_STATUS", "142/256",
-		"NOT yet checked",
+		// The rules that cannot run yet are named by identifier, so a
+		// reader can look them up in Vol 4 section 2.2 rather than guess
+		// what "some checks were skipped" means.
+		"NOT checked -- V-T1",
+		"NOT checked -- V-T6",
+		"NOT checked -- V-X7",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("selfcheck output omits %q:\n%s", want, out)
@@ -94,8 +99,8 @@ func TestRejectedCombinations(t *testing.T) {
 
 	t.Run("dbcheck with no db configured", func(t *testing.T) {
 		_, err := run(t, app.Options{DBCheck: true})
-		if err == nil || !strings.Contains(err.Error(), "no db object") {
-			t.Errorf("got %v, want a missing-db error", err)
+		if err == nil || !strings.Contains(err.Error(), "V-DB1") {
+			t.Errorf("got %v, want rule V-DB1 to reject it", err)
 		}
 		if got := app.ExitCode(err); got != app.ExitStartup {
 			t.Errorf("exit code = %d, want %d", got, app.ExitStartup)
@@ -162,10 +167,33 @@ func TestDBCheckFailureDoesNotLeakThePassword(t *testing.T) {
 	}
 }
 
-// TestDefaultModeIsHonestAboutNotBeingBuilt: silently doing nothing and
-// exiting 0 would look like a working relay to a supervisor.
-func TestDefaultModeIsHonestAboutNotBeingBuilt(t *testing.T) {
+// TestRunModeRequiresADatabase is rule V-DB1.
+//
+// poc no-ops the write when no database is configured, which is right for a
+// proof-of-concept and wrong for a relay whose only purpose is to persist: it
+// would start, look healthy, and store nothing. Decoder-only operation is
+// -selfcheck, never an accident.
+func TestRunModeRequiresADatabase(t *testing.T) {
 	_, err := run(t, app.Options{})
+	if err == nil {
+		t.Fatal("the relay must not start with nowhere to persist to")
+	}
+	if !strings.Contains(err.Error(), "V-DB1") {
+		t.Errorf("want rule V-DB1 to reject it: %v", err)
+	}
+	if got := app.ExitCode(err); got != app.ExitStartup {
+		t.Errorf("exit code = %d, want %d", got, app.ExitStartup)
+	}
+}
+
+// TestDefaultModeIsHonestAboutNotBeingBuilt: silently doing nothing and
+// exiting 0 would look like a working relay to a supervisor. With a database
+// configured, validation passes and the run path is reached -- where it says
+// plainly that the receive path does not exist yet.
+func TestDefaultModeIsHonestAboutNotBeingBuilt(t *testing.T) {
+	path := write(t, "db.json", `{"db":{"host":"h","service":"s","user":"u"}}`)
+
+	_, err := run(t, app.Options{ConfigPath: path})
 	if err == nil {
 		t.Fatal("the default mode must not report success while the relay does not exist")
 	}

@@ -108,7 +108,15 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 			"one deliberately does not connect and the other exists only to connect")
 	}
 
-	cfg, dests, err := loadAll(opts.ConfigPath)
+	mode := config.ModeRun
+	switch {
+	case opts.SelfCheck:
+		mode = config.ModeSelfCheck
+	case opts.DBCheck:
+		mode = config.ModeDBCheck
+	}
+
+	cfg, dests, err := loadAll(opts.ConfigPath, mode)
 	if err != nil {
 		// A broken configuration under -selfcheck is the ANSWER, not a
 		// startup failure, and CI branches on the difference.
@@ -134,20 +142,26 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 		"Use -selfcheck or -dbcheck; the receive path arrives in Phase 2")
 }
 
-// loadAll resolves the configuration and the field map together, because
-// neither is usable without the other and reporting them separately would
-// make an operator fix one problem at a time.
-func loadAll(path string) (*config.Config, *destinations.Set, error) {
+// loadAll resolves the configuration and the field map, then validates them
+// TOGETHER.
+//
+// Together, because the rules that matter most span both. ASM-15 compares a
+// destination's row key against its contributors' shard keys; ASM-16a sums a
+// transcode's contributed column widths, which only the field map knows.
+// Validating each half alone would pass a pair that cannot work.
+func loadAll(path string, mode config.Mode) (*config.Config, *destinations.Set, error) {
 	var (
 		cfg *config.Config
 		err error
 	)
+	// Unvalidated on purpose: validating the configuration here and the
+	// schema a moment later would report only the first set of problems,
+	// and the operator would fix one layer per run. ValidateAll below is
+	// the single gate, so a range error and an ASM-15 violation come back
+	// in one message.
 	if path == "" {
 		cfg = config.Defaults()
-		if err := config.Validate(cfg, nil); err != nil {
-			return nil, nil, err
-		}
-	} else if cfg, err = config.Load(path); err != nil {
+	} else if cfg, err = config.LoadUnvalidated(path); err != nil {
 		return nil, nil, err
 	}
 
@@ -158,6 +172,10 @@ func loadAll(path string) (*config.Config, *destinations.Set, error) {
 		dests, err = destinations.Default()
 	}
 	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := config.ValidateAll(cfg, dests, nil, mode); err != nil {
 		return nil, nil, err
 	}
 	return cfg, dests, nil
@@ -190,11 +208,16 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 		fmt.Fprintln(out, "selfcheck: no database configured")
 	}
 
-	// Stated rather than implied, so nobody reads a pass as more than it is.
-	fmt.Fprintln(out, "selfcheck: NOT yet checked -- that every transcode resolves to a "+
-		"registered decoder, that contributions name declared columns, and ASM-15 "+
-		"(row keys derivable from every contributor's shard key). Those need the "+
-		"decoder registry and arrive with P1-06.")
+	// Stated rather than implied, so nobody reads a pass as more than it
+	// is. The list comes from the validator itself rather than from a
+	// string here, so it shrinks automatically as rules become checkable.
+	for rule, why := range config.Unchecked() {
+		fmt.Fprintf(out, "selfcheck: NOT checked -- %s: %s\n", rule, why)
+	}
+	fmt.Fprintln(out, "selfcheck: NOT checked -- V-X7: db.connMaxLifetimeMinutes against the "+
+		"Oracle profile's IDLE_TIME. Un-checkable from here by nature; the observable "+
+		"is a recurring ORA-03113 on first reuse of a session the server already closed")
+
 	fmt.Fprintln(out, "selfcheck: PASSED")
 	return nil
 }
@@ -209,10 +232,9 @@ func passwordState() string {
 // dbCheck connects, proves a round trip and reports the server version. It
 // writes nothing to the database.
 func dbCheck(ctx context.Context, cfg *config.Config, out io.Writer) error {
-	if !cfg.HasDB {
-		return exitf(ExitStartup, "-dbcheck: no db object is configured")
-	}
-
+	// No "is a db configured?" check here: rule V-DB1 in ModeDBCheck has
+	// already rejected that case during load, and a second check would be
+	// a second place for the answer to change.
 	fmt.Fprintf(out, "dbcheck: connecting to %s\n", cfg.DB.Describe())
 
 	version, err := oradb.Check(ctx, cfg.DB)

@@ -162,21 +162,49 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
-// Parse decodes, resolves and validates a configuration.
-func Parse(raw []byte) (*Config, error) {
+// LoadUnvalidated reads and resolves a file WITHOUT running the rule set.
+//
+// It exists for the one caller that also has a field map: validating the
+// configuration alone and then the pair separately means a file with a range
+// error and a schema error reports only the first, and the operator fixes one
+// problem per run. app uses this and then calls ValidateAll once, so every
+// problem in both halves comes back together.
+//
+// Any other caller should use Load. The name is deliberately awkward.
+func LoadUnvalidated(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: reading %s: %w", path, err)
+	}
+	f, err := decode(raw)
+	if err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
+	return resolve(f), nil
+}
+
+// decode performs the strict JSON decode shared by both load paths.
+func decode(raw []byte) (fileConfig, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 
-	// Unknown keys are REJECTED, not ignored. A typo'd key silently dropped
-	// means the operator believes they changed something and did not --
-	// "stallBudgetMS" ignored leaves the budget at its default while the
-	// runbook says otherwise.
+	// V-STRICT1. Unknown keys are REJECTED, not ignored. A typo'd key
+	// silently dropped means the operator believes they changed something
+	// and did not -- during the incident they are trying to fix.
 	dec.DisallowUnknownFields()
 
 	var f fileConfig
 	if err := dec.Decode(&f); err != nil {
-		return nil, fmt.Errorf("decoding configuration: %w", err)
+		return f, fmt.Errorf("decoding configuration: %w", err)
 	}
+	return f, nil
+}
 
+// Parse decodes, resolves and validates a configuration.
+func Parse(raw []byte) (*Config, error) {
+	f, err := decode(raw)
+	if err != nil {
+		return nil, err
+	}
 	c := resolve(f)
 	if err := Validate(c, nil); err != nil {
 		return nil, err
