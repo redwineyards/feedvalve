@@ -1,6 +1,9 @@
 package model
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // TransCode is an NNF transaction code -- the dispatch key of the whole feed
 // (bible section 2.8: BCAST_HEADER offset 10, payload offset 18).
@@ -89,6 +92,29 @@ const (
 
 // Has reports whether every flag in f is set.
 func (u UnitFlags) Has(f UnitFlags) bool { return u&f == f }
+
+func (u UnitFlags) String() string {
+	if u == 0 {
+		return "none"
+	}
+	var set []string
+	for _, f := range []struct {
+		bit  UnitFlags
+		name string
+	}{
+		{FlagGeneral, "general"},
+		{FlagNonRateLimited, "non-rate-limited"},
+		{FlagOrderingUnusable, "ordering-unusable"},
+	} {
+		if u.Has(f.bit) {
+			set = append(set, f.name)
+		}
+	}
+	if rest := u &^ (FlagGeneral | FlagNonRateLimited | FlagOrderingUnusable); rest != 0 {
+		set = append(set, "unknown("+strconv.FormatUint(uint64(rest), 2)+")")
+	}
+	return strings.Join(set, "|")
+}
 
 // RowOutcome is the writer's verdict on ONE row of a batch.
 //

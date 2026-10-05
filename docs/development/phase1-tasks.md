@@ -37,12 +37,18 @@ Counts taken from Volume 0 by command, not from memory:
 | Quantity | Count | Where |
 |---|---|---|
 | Packages under `internal/` | **14** (+ `cmd/feedvalve`) | §1.1 |
-| Type declarations in the inventory | **24** | §3 |
+| Type declarations in the inventory | **24** — of which **16** are `model`'s | §3 |
 | Structs with a byte-exact pinned size | **7** | §3.4–3.8, §9.5.2 |
-| Configuration keys | **65** | §7.2 |
+| Configuration keys | **62** — 58 in the config file, 4 in the mapping file | §7.2 |
 | Instruments | **129** | §8.2 + §8.2a |
 | Build-time gates (unbypassable) | **9** | Vol 4 §7.1 |
 | Config-load gates | **2** | Vol 4 §7.2 |
+
+> **Two counts corrected during implementation.** §3's 24 declarations span four packages: 16 in
+> `model`, 4 in `decode`, 2 in `config`, 2 in `oradb`. With `Datagram` and `SessionEvent` from §9.5.2
+> and Vol 4, `model` holds **18** types. And §7.2's key table has 65 rows but three of them —
+> `db.maxOpenConns`, `db.maxIdleConns`, `db.password` — are marked **"not a key"**; of the remaining
+> 62, four moved into the mapping file with P1-04.
 
 The seven size-pinned structs and their required totals:
 
@@ -127,15 +133,18 @@ from the database is a property the whole mirror design rests on, and prose cann
 
 ### P1-03 · `model` — the value types
 
-**Scope.** All 24 declarations of Vol 0 §3:
+**Scope.** `model`'s share of Vol 0 §3 — **18 types** (16 from §3, plus `Datagram` from §9.5.2 and
+`SessionEvent` from Vol 4):
 
-- **Scalars and enumerations** (§3.1): `DestID`, `TransCode`, `Class`, `HeaderKind`, `ColKind`,
-  `RowOutcome`, with `String()` methods.
+- **Scalars and enumerations** (§3.1): `DestID`, `TransCode`, `ShardID`, `Class`, `HeaderKind`,
+  `UnitFlags`, `RowOutcome`, with `String()` methods. *(`ColKind` is **not** one of them — Vol 0 §4.2
+  declares it in `destinations`, where P1-04 built it.)*
 - **`RowKey`** (§3.2) and **`ColMask`** (§3.3), including the mask helpers.
 - **The seven size-pinned structs** listed in §2 above, each with explicit `_ [n]byte` padding
   fields — never implicit compiler padding (Vol 0 §2 rule 6).
-- **`Batch`** (§3.8), the decoder registry entry (§3.9), the `Config` root forward declaration
-  (§3.10), and the error sentinels and `Reject` type (§3.11).
+- **`Batch`** (§3.8), and the `Reject` type with `Counter()` plus the error sentinels (§3.11, §3.13).
+  *(§3.9's decoder registry belongs to `decode` and lands in Phase 2; §3.10's `Config` root belongs
+  to `config` and landed with P1-05.)*
 
 **Done when.**
 1. Every struct's `unsafe.Sizeof` **and every field's `unsafe.Offsetof`** match Vol 0's offset tables
@@ -196,7 +205,10 @@ declared type, default, range and **reload class** (`startup-only` /
   `statementFailWriters ≤ writers.count` and `heartbeatDown > heartbeatWarn`, both **rejected
   wholesale** rather than clamped.
 - `db.maxOpenConns` / `maxIdleConns` **derived** from `writers.count + 1`, not independent keys.
-- The three flags: `-config`, `-dbcheck`, `-selfcheck`.
+- ~~The three flags: `-config`, `-dbcheck`, `-selfcheck`.~~ **Moved.** Flag parsing lives in
+  `main`, which P1-09 owns, and `-selfcheck`'s behaviour is P1-06's rule set. Listing them here
+  would have P1-05 write a `main` that P1-09 immediately replaces. **P1-09 must deliver all three**;
+  P1-06 supplies what `-selfcheck` runs.
 
 **Done when.** A full config round-trips; a typo'd key fails the load with the offending key named;
 a `startup-only` key changing across a reload is refused **and the previous config keeps running**;

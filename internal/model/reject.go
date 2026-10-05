@@ -1,5 +1,7 @@
 package model
 
+import "errors"
+
 // Reject is the receive path's error type: a small enum, not an error.
 //
 // Returned by value, costs nothing, and maps 1:1 onto a counter name and onto a
@@ -79,3 +81,17 @@ func (r Reject) String() string {
 
 // Rejected reports whether this is an actual rejection.
 func (r Reject) Rejected() bool { return r != RejectNone }
+
+// ErrStallBudgetExpired is returned when a stall budget runs out -- either
+// the receiver's enqueue budget or the decoder's fan-out budget.
+//
+// It is a RETURNED ERROR and not a fatal log, and that is the whole point of
+// its existence. Overflow of a critical-path queue must stop the process
+// loudly rather than discard silently, but stopping via os.Exit would skip
+// every deferred cleanup: the drain would not run, in-flight batches would be
+// abandoned and Oracle sessions left open. This travels up to main, which
+// maps it to an exit code after the ordered shutdown has run.
+//
+// A sentinel rather than a formatted error because the paths that return it
+// are the hot paths, and they must not allocate.
+var ErrStallBudgetExpired = errors.New("model: stall budget expired")

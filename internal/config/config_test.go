@@ -54,6 +54,77 @@ func TestAbsentIsNotZero(t *testing.T) {
 	}
 }
 
+// TestFullConfigRoundTrips exercises a file that sets EVERY key, so a field
+// present in the resolved shape but missing from the on-disk shape -- or
+// spelled differently between them -- shows up here rather than as a key an
+// operator sets and nothing reads.
+func TestFullConfigRoundTrips(t *testing.T) {
+	const full = `{
+	  "udp": {"listen": ":9100", "readBufferBytes": 131072, "expectedNetId": 9,
+	          "sourceAllowList": ["10.0.0.1"], "sourceEnforce": true, "stallBudgetMs": 40},
+	  "runtime": {"gomaxprocs": 8, "shards": 8, "generalShard": 2,
+	              "shardQueueCapacity": 8192, "datagramQueueCapacity": 16384,
+	              "maxInFlightPerShard": 4, "maxBatchSizeCeiling": 2000,
+	              "expectedRows": 400000, "arenaChunkRows": 8192,
+	              "time1980UnixOffsetSec": 315552600, "destinationsFile": "dest.json"},
+	  "flush": {"windowMs": 250, "maxBatchSize": 1500, "drainTimeoutMs": 7000,
+	            "epochStallWarnMs": 45000},
+	  "writers": {"count": 6, "statementFailWriters": 3, "statementFailWindowSec": 90,
+	              "failFastSeconds": 45, "failFastWrites": 50, "retryInitialMs": 200,
+	              "retryMaxMs": 8000, "connIdleReleaseSec": 120, "stmtCacheSize": 512},
+	  "db": {"host": "db.internal", "port": 1522, "service": "FEEDPRD", "user": "feedvalve",
+	         "connectTimeoutSec": 15, "queryTimeoutSec": 45, "connMaxLifetimeMinutes": 20},
+	  "ordering": {"guard": "on", "guardSuppressionRatio": 0.25, "guardMinSamples": 500,
+	               "guardEvalIntervalSec": 10, "gapScope": "per-transcode",
+	               "gapAuditPackets": 1000},
+	  "stats": {"intervalSec": 30, "logLevel": "warn", "eventRatePerMin": 20},
+	  "liveness": {"heartbeatWarnSec": 15, "heartbeatDownSec": 40, "startupGraceSec": 90,
+	               "tradingWindow": {"start": "08:30", "end": "22:00", "tz": "UTC"}},
+	  "debug": {"traceTranscodes": [7208, 7305], "hexDump": true},
+	  "transcodes": [
+	    {"code": 7208, "class": "rate-limited", "expectedRatePerSec": 2000,
+	     "contributions": [{"destination": "MD_TOKEN_QUOTE", "columns": ["last_traded_price"]}]}
+	  ]
+	}`
+
+	c, err := Parse([]byte(full))
+	if err != nil {
+		t.Fatalf("a file setting every key must load: %v", err)
+	}
+
+	// Every value must be the file's, not a default. Checking a sample from
+	// each section is enough to catch a section wired to the wrong struct.
+	for _, tc := range []struct {
+		name      string
+		got, want any
+	}{
+		{"udp.listen", c.UDP.Listen, ":9100"},
+		{"udp.sourceEnforce", c.UDP.SourceEnforce, true},
+		{"runtime.generalShard", c.Runtime.GeneralShard, 2},
+		{"runtime.destinationsFile", c.Runtime.DestinationsFile, "dest.json"},
+		{"runtime.time1980UnixOffsetSec", c.Runtime.Time1980UnixOffsetSec, 315552600},
+		{"flush.maxBatchSize", c.Flush.MaxBatchSize, 1500},
+		{"writers.stmtCacheSize", c.Writers.StmtCacheSize, 512},
+		{"db.port", c.DB.Port, 1522},
+		{"db.maxOpenConns (derived)", c.DB.MaxOpenConns, 7},
+		{"ordering.guardSuppressionRatio", c.Ordering.GuardSuppressionRatio, 0.25},
+		{"stats.logLevel", c.Stats.LogLevel, "warn"},
+		{"liveness.tradingWindow.tz", c.Liveness.TradingWindow.TZ, "UTC"},
+		{"debug.hexDump", c.Debug.HexDump, true},
+		{"transcodes[0].code", c.Transcodes[0].Code, 7208},
+		{"transcodes[0].contributions[0].destination",
+			c.Transcodes[0].Contributions[0].Destination, "MD_TOKEN_QUOTE"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if len(c.Debug.TraceTranscodes) != 2 || len(c.UDP.SourceAllowList) != 1 {
+		t.Errorf("slice-valued keys did not survive: %+v / %+v",
+			c.Debug.TraceTranscodes, c.UDP.SourceAllowList)
+	}
+}
+
 // TestUnknownKeyIsRejected: a typo'd key silently ignored means the operator
 // believes they changed something and did not.
 func TestUnknownKeyIsRejected(t *testing.T) {
@@ -221,6 +292,31 @@ func TestReloadClasses(t *testing.T) {
 
 		if err := Validate(next, prev); err != nil {
 			t.Errorf("reloadable changes should be accepted: %v", err)
+		}
+	})
+
+	// C2 in full. The contradiction section 7.3 resolves is that HLD
+	// section 6.9 called maxBatchSize "reloadable downward only" while
+	// justifying it with a reason -- the row buffers are pre-allocated to
+	// the ceiling -- that permits raising it too. Both directions must work
+	// inside the ceiling, so testing only the rejection above it would
+	// leave the half that was actually contradicted unchecked.
+	t.Run("maxBatchSize is reloadable in both directions", func(t *testing.T) {
+		for _, to := range []int{1, 250, 1000} {
+			prev, next := base(t), base(t)
+			prev.Flush.MaxBatchSize = 500
+			next.Flush.MaxBatchSize = to
+
+			if err := Validate(next, prev); err != nil {
+				t.Errorf("500 -> %d within the ceiling should be accepted: %v", to, err)
+			}
+		}
+
+		// And still rejected past the ceiling.
+		prev, next := base(t), base(t)
+		next.Flush.MaxBatchSize = next.Runtime.MaxBatchSizeCeiling + 1
+		if err := Validate(next, prev); err == nil {
+			t.Error("maxBatchSize above the ceiling should be rejected")
 		}
 	})
 

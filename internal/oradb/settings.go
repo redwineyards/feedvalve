@@ -21,6 +21,23 @@ const PasswordEnv = "FEEDVALVE_DB_PASSWORD"
 // os.Exit and skips every deferred cleanup. Startup failures return.
 var ErrNoPassword = errors.New("oradb: " + PasswordEnv + " is not set")
 
+// The other two sentinels of Vol 0 section 3.11. Declared here with
+// ErrNoPassword so the set is complete and callers in later phases branch on
+// identity rather than on error text; the code that returns them arrives with
+// the writer pool (Phase 4) and the drain (Phase 5).
+var (
+	// ErrPoolStopped is returned once the statement-failure rule has stopped
+	// the writer pool: the same statement identity failed on enough distinct
+	// writers inside the window that the fault is the statement, not the
+	// session.
+	ErrPoolStopped = errors.New("oradb: writer pool stopped by the statement-failure rule")
+
+	// ErrDrainTimeout is returned when the shutdown drain deadline passes
+	// with dirty rows still outstanding. The process exits anyway; this is
+	// what makes the loss explicit rather than silent.
+	ErrDrainTimeout = errors.New("oradb: drain deadline reached with dirty rows outstanding")
+)
+
 // DBSettings is everything needed to reach the database EXCEPT the password.
 //
 // The omission is structural, not an oversight. A type that cannot hold the
