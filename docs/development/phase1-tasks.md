@@ -205,10 +205,13 @@ declared type, default, range and **reload class** (`startup-only` /
   `statementFailWriters ≤ writers.count` and `heartbeatDown > heartbeatWarn`, both **rejected
   wholesale** rather than clamped.
 - `db.maxOpenConns` / `maxIdleConns` **derived** from `writers.count + 1`, not independent keys.
-- ~~The three flags: `-config`, `-dbcheck`, `-selfcheck`.~~ **Moved.** Flag parsing lives in
-  `main`, which P1-09 owns, and `-selfcheck`'s behaviour is P1-06's rule set. Listing them here
-  would have P1-05 write a `main` that P1-09 immediately replaces. **P1-09 must deliver all three**;
-  P1-06 supplies what `-selfcheck` runs.
+- The three flags: `-config`, `-dbcheck`, `-selfcheck` — **delivered here**, along with the
+  `main` → `run(ctx) error` split and the Vol 4 §1.2 exit codes, so the flags have somewhere to
+  live. P1-09 extends that skeleton with the relay's startup ordering, signal handling and drain
+  rather than replacing it; P1-06 adds the cross-checks `-selfcheck` runs.
+  `-dbcheck` needed a real connection, so `oradb` gained `dsn`/`redactDSN`/`Open`/`Check` early —
+  the rest of the connection layer (statement cache, `oracleErrCode`, the writer's pinned session)
+  stays in Phase 4.
 
 **Done when.** A full config round-trips; a typo'd key fails the load with the offending key named;
 a `startup-only` key changing across a reload is refused **and the previous config keeps running**;
