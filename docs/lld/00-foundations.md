@@ -121,7 +121,7 @@ no logic beyond flag parsing and the `main` → `run(ctx) error` split that CLAU
 | `policy` | Transcode → `Class`; inventory validation | — (new) | `oradb`, `writer`, `mirror`, `database/sql` |
 | `mirror` | `Shard`: index, arenas, accumulating/cohort rings, epoch state, batch free list. **Volume 2** | — (new) | `oradb`, `writer`, `database/sql`, `net` |
 | `writer` | Statement assembly from a batch mask, array binds, transaction boundary, per-row outcome attribution | `db.go` (the `Exec`/`ExecTx` usage pattern) | `framing`, `decode`, `mirror`, `net` |
-| `oradb` | `DBConfig`, `dsn()`, `describe()`, `redactDSN`, `OpenDB`, pool settings, `oracleErrCode` | `db.go` | `framing`, `decode`, `mirror`, `destinations` |
+| `oradb` | `DBSettings`, `dsn()`, `Describe()`, `redactDSN`, `OpenDB`, pool settings, `oracleErrCode` | `db.go` | `framing`, `decode`, `mirror`, `destinations` |
 | `config` | `Config` root, JSON load with pointer-optional fields, validation, `atomic.Pointer[Config]` | `config.go` | `framing`, `decode`, `mirror`, `writer` |
 | `obs` | Counter/gauge registry, the 60 s emission line, the three loggers (`app`, `debug`, and the *deleted* packet logger — see below) | `logger.go` | every other `internal/` package (so anything may import `obs`) |
 | `health` | Circuit liveness (HLD Figure 6) and market-session (Figure 7) state machines | — (new) | `oradb`, `writer`, `mirror` |
@@ -887,7 +887,7 @@ type Config struct {
     Runtime      RuntimeConfig
     Flush        FlushConfig
     Writers      WritersConfig
-    DB           oradb.DBConfig      // password is NOT here — see §7.4
+    DB           oradb.DBSettings    // password is NOT here — see §7.5
     Ordering     OrderingConfig
     Stats        StatsConfig
     Liveness     LivenessConfig
