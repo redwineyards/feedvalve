@@ -40,7 +40,7 @@ Counts taken from Volume 0 by command, not from memory:
 | Type declarations in the inventory | **24** — of which **16** are `model`'s | §3 |
 | Structs with a byte-exact pinned size | **7** | §3.4–3.8, §9.5.2 |
 | Configuration keys | **62** — 58 in the config file, 4 in the mapping file | §7.2 |
-| Instruments | **129** | §8.2 + §8.2a |
+| Instruments | **131** in 129 table rows | §8.2 + §8.2a |
 | Build-time gates (unbypassable) | **9** | Vol 4 §7.1 |
 | Config-load gates | **2** | Vol 4 §7.2 |
 
@@ -76,7 +76,7 @@ P1-01 scaffolding
         ├─→ P1-04 destinations + mapping file     │
         │     └─→ P1-05 config (65 keys)          │
         │           ├─→ P1-06 -selfcheck          │
-        │           └─→ P1-07 obs (129 instr.) ─┐ │
+        │           └─→ P1-07 obs (131 instr.) ─┐ │
         │                                        │ │
         ├─→ P1-08 QD ring (standalone)           │ │
         │                                        ↓ │
@@ -255,7 +255,7 @@ in Phase 2; the config-side half lands here.)*
 
 ### P1-07 · `obs` — the instrument ledger
 
-**Scope.** The three instrument shapes of Vol 0 §8.1 and all **129** instruments of §8.2 + §8.2a.
+**Scope.** The three instrument shapes of Vol 0 §8.1 and all **131** instruments of §8.2 + §8.2a.
 
 | Shape | Semantics |
 |---|---|
@@ -268,7 +268,7 @@ in Phase 2; the config-side half lands here.)*
 - The grouped 60-second emission line of Vol 4 §6.1.
 - The two loggers `appLogger` and `debugLogger`.
 
-**Done when.** All 129 instruments are declared and reachable; one emission produces the specified
+**Done when.** All 131 instruments are declared and reachable; one emission produces the specified
 grouped line; a benchmark shows **zero allocations** on the counter and max paths.
 
 **Depends on.** P1-03, P1-05.  **Rough:** 2–3 days.
@@ -420,3 +420,13 @@ Every count in §2 was taken from `docs/lld/00-foundations.md` by command at the
 from recollection. Three figures quoted in earlier discussion were wrong and are corrected here:
 config keys **65** (not 77), instruments **129** (not 128), and size-pinned structs **7** (not 6).
 The type count, **24**, was right.
+
+> **A fourth correction, found in P1-07: 129 was a row count.** §8.2 holds 69 table rows and §8.2a
+> holds 60, which is where 129 came from — but two rows name several instruments each
+> (`gap_audit_agree` / `gap_audit_disagree`, and `writes_attempted` / `writes_succeeded` /
+> `writes_failed`) and `decompress_failed` appears in both tables, so there are **131** distinct
+> instruments across those 129 rows. The registry declares 131 and §2 now says both numbers, because
+> a reviewer checking G-OBS-3 against the old figure would conclude two instruments were missing.
+> Beware also that a naive grep of §8.2a returns 62 rather than 60: its closing collision sub-table
+> begins two of its rows with a backticked instrument name. See Vol 0 §8.2a for the full
+> reconciliation and the four other points settled with it.

@@ -1295,6 +1295,25 @@ Three rules make that workable without losing trendability:
 All lines of one emission share the same timestamp and the same `gen=` (the config generation), so
 they are a single snapshot that can be reassembled by grep. Recorded as delta **D4-6**.
 
+> **Delta D4-7, settled in P1-07: one timestamp layout, and it is this one.** The example line above
+> renders a date as `2026-09-24`, with hyphens. `poc`'s `appLogger` uses `log.LstdFlags`, which
+> renders `2026/09/24` with **slashes** — so as written, the stats line and every WARN beside it
+> would not share a format, and the grep correlation this section depends on could not work. Since
+> §6.7 leaves an operator no other way to join a log event to a trend, the two have to agree, and
+> this is the only place in the contract where a timestamp is actually written out. `obs` therefore
+> uses `2006-01-02 15:04:05.000000` for **both** paths: the emission builds it in place with
+> `AppendFormat` (no `log.Printf`, which allocates and would fail G-OBS-2), and `appLogger` runs with
+> `log.Logger` flags set to zero and writes the same layout by hand. `poc`'s slashes were the
+> standard library's default rather than a decision. A test asserts a log line's prefix parses with
+> the emission layout, so the two cannot drift again.
+>
+> Two further corrections to the example line itself, both settled in P1-07: it writes `uptime_s=`
+> where the ledger name is **`uptime_seconds`** (Vol 0 §8.2a, delta D0-3 — the ledger wins, because
+> G-OBS-3 round-trips emitted names against it), and it shows `gen=1` alongside
+> `config_reload_rejected` and a `config_generation=3`, which cannot all hold at once. The prose is
+> authoritative: `gen=` **is** the config generation, read from the `config_generation` gauge, so
+> there is one source for it and the line is internally consistent.
+
 **Cost.** ~200 atomic loads and one `strconv` pass per value, once a minute, on a goroutine that is
 otherwise asleep. Unmeasurable against a 4-way LPAR.
 

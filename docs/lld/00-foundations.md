@@ -2166,90 +2166,118 @@ Volumes 1–4 were written in parallel against §8.2 and each ended with instrum
 "Additions to the Vol 0 ledger" sections in those volumes are superseded by it and remain only as
 provenance. Shapes are §8.1's C / M / G; nothing below needs a reservoir.
 
+> **The `Group` column was added in P1-07, and five things were settled with it.** This table
+> originally carried no group, because §8.2's groups are bold heading rows and this one is organised
+> by source volume instead — which left 60 of the 129 rows with no line to be emitted on, while Vol 4
+> §6.1 emits one line per group and expects "all fifteen". Every row now names its home group.
+> Where Vol 4 gave evidence it won over tidiness: its own §6.1 example line shows
+> `shard_depth_max{0}` on the `group=stall` line, so that instrument is **Stall**, not Queues beside
+> `shard_depth`. The other four, recorded as deltas **D0-1** to **D0-4**:
+>
+> 1. **129 rows, 131 instruments.** §8.2 has 69 rows and this table 60. Two rows name several
+>    instruments (`gap_audit_agree` / `gap_audit_disagree`, and `writes_attempted` /
+>    `writes_succeeded` / `writes_failed`) and `decompress_failed` appears in both tables, so the
+>    distinct instrument count is **131**. The task breakdown's "129 instruments" is a row count.
+>    Note also that a naive grep of this section returns **62** rows, because the collision
+>    sub-table below begins two of its rows with a backticked instrument name.
+> 2. **`health` is a sixteenth, emission-only group** — a projection, not an owner. Every instrument
+>    keeps exactly one home group; the health line is an explicit ordered list, emitted first and
+>    every interval, so an instrument named on it is emitted twice. Its membership is the union of
+>    §6.1's example line and §6.6 Q1–Q3, which disagreed on four instruments.
+> 3. **`uptime_seconds`, not `uptime_s`.** §6.1's example line writes the short form; the ledger name
+>    is authoritative, because G-OBS-3 asserts the emitted name set equals this table's.
+> 4. **High-cardinality labels are emitted sparsely.** §6.1 sized the group split against "≈200
+>    values ≈ 5 KB", an arithmetic performed before this table existed and one whose own breakdown
+>    does not list `{destination,column}`. Three instruments carry that dimension, which at three
+>    destinations by 64 columns is 576 slots almost entirely in **Schema fit** — a dense line of
+>    roughly 18 KB, worse than the single line the grouping exists to avoid. A *labelled* slot is
+>    therefore emitted only when it carries data; unlabelled instruments and the health line always
+>    emit. G-OBS-3 is unaffected, because its setup touches every instrument before emitting.
+
 **Receive and decode** *(Vol 1)*
 
-| Instrument | Shape | Writer | Labels | Earns its place |
-|---|---|---|---|---|
-| `decompress_failed` | C | framing | **`{reason}`** = input_overrun, output_overrun, lookbehind_overrun, input_not_consumed | `output_overrun` means ASM-14 is broken and has a known fix; the other three mean wire corruption. Two operator actions behind one number |
-| `decompressed_len_mismatch` | C | decode | `{code}` | HLD §3.3 names this cross-check as one of two things this design adds over `poc`, and nothing counted it |
-| `seq_regression` | C | receiver | — | A duplicate or reordered datagram is **not** a gap; folding it into the gap counter corrupts the only loss figure the system produces |
-| `seq_resync` | C | receiver | — | The observable for "the sequence source restarted"; without it the resync rule is a silent re-baseline |
-| `unconfigured_transcode` | C | decode | `{code}` | ADR-011 explicitly requires "we can decode this but nobody told us what to do with it" to be distinguishable from "never seen". Different remedies: a config edit versus an exchange conversation |
-| `booktype_skipped` | C | decode | `{code}` | A deliberate discard with no counter is indistinguishable from a decode failure |
-| `blob_overrun` | C | decode | `{code}` | Runtime half of the ASM-16a gate. Should be unreachable; non-zero is a code defect `-selfcheck` missed |
-| `short_payload` | C | decode | `{stage}` = header, body | §3.11 promises every `Reject` value maps to a counter name; this was the one without |
-| `udp_read_errors` | C | receiver | — | `poc` logs-and-continues on a read error, which spins at full CPU. With the consecutive-error bound this becomes a bounded, visible failure |
-| `last_datagram_mono_ns` | **G** | receiver | — | The liveness machine transitions on **any** datagram, so what `health` needs is a receipt timestamp, not a heartbeat message |
+| Instrument | Shape | Group | Writer | Labels | Earns its place |
+|---|---|---|---|---|---|
+| `decompress_failed` | C | Decode | framing | **`{reason}`** = input_overrun, output_overrun, lookbehind_overrun, input_not_consumed | `output_overrun` means ASM-14 is broken and has a known fix; the other three mean wire corruption. Two operator actions behind one number |
+| `decompressed_len_mismatch` | C | Decode | decode | `{code}` | HLD §3.3 names this cross-check as one of two things this design adds over `poc`, and nothing counted it |
+| `seq_regression` | C | Loss | receiver | — | A duplicate or reordered datagram is **not** a gap; folding it into the gap counter corrupts the only loss figure the system produces |
+| `seq_resync` | C | Loss | receiver | — | The observable for "the sequence source restarted"; without it the resync rule is a silent re-baseline |
+| `unconfigured_transcode` | C | Decode | decode | `{code}` | ADR-011 explicitly requires "we can decode this but nobody told us what to do with it" to be distinguishable from "never seen". Different remedies: a config edit versus an exchange conversation |
+| `booktype_skipped` | C | Decode | decode | `{code}` | A deliberate discard with no counter is indistinguishable from a decode failure |
+| `blob_overrun` | C | Decode | decode | `{code}` | Runtime half of the ASM-16a gate. Should be unreachable; non-zero is a code defect `-selfcheck` missed |
+| `short_payload` | C | Decode | decode | `{stage}` = header, body | §3.11 promises every `Reject` value maps to a counter name; this was the one without |
+| `udp_read_errors` | C | Ingress | receiver | — | `poc` logs-and-continues on a read error, which spins at full CPU. With the consecutive-error bound this becomes a bounded, visible failure |
+| `last_datagram_mono_ns` | **G** | Liveness | receiver | — | The liveness machine transitions on **any** datagram, so what `health` needs is a receipt timestamp, not a heartbeat message |
 
 **Datagram ring and pre-validation** *(new in this merge — B3, B2)*
 
-| Instrument | Shape | Writer | Labels | Earns its place |
-|---|---|---|---|---|
-| `qd_depth_max` | **M** | receiver | — | QD is empty almost always; a sampled gauge would read 0 forever. The high-water mark is the only form that can show it filling (§9.5) |
-| `qd_send_blocked` | C | receiver | — | Publishes that had to wait. **A signal about the decoder, not the socket** — publishing is a copy and an atomic store |
-| `qd_wake_parked` | C | decoder | — | How often the consumer exhausted its spin and parked. Rising with load means the spin bound is mistuned; near-constant means the feed is idle, which is normal |
-| `decoder_loop_max_ns` | **M** | decoder | — | One dequeue-to-fan-out pass. The direct measurement of ASM-1/ASM-3, which are the assumptions QD exists to insure against |
-| `prevalidate_rejected` | C | shard | `{destination,reason}` = precision, length, domain, time, nonfinite | The rate at which the mirror refuses values before Oracle has to, and which kind (§5A) |
-| `prevalidate_rejected_transcode` | C | shard | `{transcode}` | Which message type produces them — the field an operator acts on |
-| `rows_rejected_by_oracle_unpredicted` | C | shard | `{destination}` | **The honesty counter.** A row Oracle refused that pre-validation passed: a gap between the mapping and the real DDL. Without it, pre-validation degrades silently as the schema drifts |
+| Instrument | Shape | Group | Writer | Labels | Earns its place |
+|---|---|---|---|---|---|
+| `qd_depth_max` | **M** | Queues | receiver | — | QD is empty almost always; a sampled gauge would read 0 forever. The high-water mark is the only form that can show it filling (§9.5) |
+| `qd_send_blocked` | C | Stall | receiver | — | Publishes that had to wait. **A signal about the decoder, not the socket** — publishing is a copy and an atomic store |
+| `qd_wake_parked` | C | Queues | decoder | — | How often the consumer exhausted its spin and parked. Rising with load means the spin bound is mistuned; near-constant means the feed is idle, which is normal |
+| `decoder_loop_max_ns` | **M** | Stall | decoder | — | One dequeue-to-fan-out pass. The direct measurement of ASM-1/ASM-3, which are the assumptions QD exists to insure against |
+| `prevalidate_rejected` | C | Schema fit | shard | `{destination,reason}` = precision, length, domain, time, nonfinite | The rate at which the mirror refuses values before Oracle has to, and which kind (§5A) |
+| `prevalidate_rejected_transcode` | C | Schema fit | shard | `{transcode}` | Which message type produces them — the field an operator acts on |
+| `rows_rejected_by_oracle_unpredicted` | C | Schema fit | shard | `{destination}` | **The honesty counter.** A row Oracle refused that pre-validation passed: a gap between the mapping and the real DDL. Without it, pre-validation degrades silently as the schema drifts |
 
 **Shard and mirror** *(Vol 2)*
 
-| Instrument | Shape | Writer | Labels | Earns its place |
-|---|---|---|---|---|
-| `flush_wake_dropped` | C | shard | `{k}` | Cap-1 wake coalescing made visible; divergence from `flush_coalesced` means the flag and the edge are out of step |
-| `flush_wake_received` | C | shard | `{k}` | Proves the L1 wakeup fires. Zero here against a non-zero `flush_triggered` means only the loop's level check is carrying the design |
-| `tick_send_dropped` | C | **ticker** | `{k}` | A tick dropped *at the ticker* never reaches `TickMissed` and is otherwise invisible — a worse condition than a skipped tick |
-| `rows_created` | C | shard | `{destination}` | The live growth curve of the row universe: validates ASM-7 from production instead of from a guess |
-| `arena_chunks` | **G** | shard | `{k,destination}` | With `rows_created`, makes chunk utilisation — the quantisation correction of Vol 2 §10 — observable |
-| `ring_grown` | C | shard | `{k,destination}` | A pre-sized ring that grew means `expectedRows` is wrong **and** a long copy landed on a shard. Should be 0 forever |
-| `blob_len_mismatch` | C | shard | `{code}` | The merge's validation pass. A decoder or configuration defect; warrants a rebuild, not tuning |
-| `merge_into_quarantined` | C | shard | `{destination}` | How much live data the quarantine is costing — a dead contract versus a hot row |
-| `row_quarantined` | C | shard | `{destination}` | The **rate** of new permanent failures |
-| `rows_quarantined_current` | **G** | shard | `{destination}` | The **standing set**, and the one to alert on. A counter alone cannot say whether the operator's fix worked |
-| `quarantine_released` | C | shard | `{destination}` | Should step once per reload-fix; proves the runbook action landed |
-| `quarantine_skipped` | C | shard | `{destination}` | A rejected row released immediately because a merge touched columns disjoint from those refused — "we recovered the data" versus "we held it back" |
-| `inflight_desync` | C | shard | `{k}` | Zero, or the process has stopped |
-| `cohort_not_empty` | C | shard | `{k}` | Zero, or the process has stopped |
-| `epoch_stalled` | C | shard | `{k}` | Distinguishes "the database is slow" from "the epoch is stuck" |
-| `shard_depth_max` | **M** | shard | `{k}` | *(Vol 4)* §8.2's `shard_depth` is a gauge sampled every 60 s against a queue empty 99.9 % of the time — it reads 0 forever. **The high-water mark is the only form that can show Q1 rising**, and F9's whole early-warning story depends on it |
+| Instrument | Shape | Group | Writer | Labels | Earns its place |
+|---|---|---|---|---|---|
+| `flush_wake_dropped` | C | Flush | shard | `{k}` | Cap-1 wake coalescing made visible; divergence from `flush_coalesced` means the flag and the edge are out of step |
+| `flush_wake_received` | C | Flush | shard | `{k}` | Proves the L1 wakeup fires. Zero here against a non-zero `flush_triggered` means only the loop's level check is carrying the design |
+| `tick_send_dropped` | C | Epoch | **ticker** | `{k}` | A tick dropped *at the ticker* never reaches `TickMissed` and is otherwise invisible — a worse condition than a skipped tick |
+| `rows_created` | C | Coalescing | shard | `{destination}` | The live growth curve of the row universe: validates ASM-7 from production instead of from a guess |
+| `arena_chunks` | **G** | Queues | shard | `{k,destination}` | With `rows_created`, makes chunk utilisation — the quantisation correction of Vol 2 §10 — observable |
+| `ring_grown` | C | Queues | shard | `{k,destination}` | A pre-sized ring that grew means `expectedRows` is wrong **and** a long copy landed on a shard. Should be 0 forever |
+| `blob_len_mismatch` | C | Schema fit | shard | `{code}` | The merge's validation pass. A decoder or configuration defect; warrants a rebuild, not tuning |
+| `merge_into_quarantined` | C | Schema fit | shard | `{destination}` | How much live data the quarantine is costing — a dead contract versus a hot row |
+| `row_quarantined` | C | Schema fit | shard | `{destination}` | The **rate** of new permanent failures |
+| `rows_quarantined_current` | **G** | Schema fit | shard | `{destination}` | The **standing set**, and the one to alert on. A counter alone cannot say whether the operator's fix worked |
+| `quarantine_released` | C | Schema fit | shard | `{destination}` | Should step once per reload-fix; proves the runbook action landed |
+| `quarantine_skipped` | C | Schema fit | shard | `{destination}` | A rejected row released immediately because a merge touched columns disjoint from those refused — "we recovered the data" versus "we held it back" |
+| `inflight_desync` | C | Write pool | shard | `{k}` | Zero, or the process has stopped |
+| `cohort_not_empty` | C | Epoch | shard | `{k}` | Zero, or the process has stopped |
+| `epoch_stalled` | C | Epoch | shard | `{k}` | Distinguishes "the database is slow" from "the epoch is stuck" |
+| `shard_depth_max` | **M** | Stall | shard | `{k}` | *(Vol 4)* §8.2's `shard_depth` is a gauge sampled every 60 s against a queue empty 99.9 % of the time — it reads 0 forever. **The high-water mark is the only form that can show Q1 rising**, and F9's whole early-warning story depends on it |
 
 **Writer and persistence** *(Vol 3)*
 
-| Instrument | Shape | Writer | Labels | Earns its place |
-|---|---|---|---|---|
-| `writers_running` | **G** | writer | — | `writers_stopped` is cumulative and cannot answer "how many are running now" after a resize. The operator ratio is `writers_busy / writers_running` |
-| `commit_duration_max_ns` | **M** | writer | — | Closes HLD §4.2's *assumed* 5–20 ms commit. Three later sections divide by that range and nothing measured it |
-| `writer_batch_duration_max_ns` | **M** | writer | — | Take-to-return. With the above it separates bind cost from commit cost — the difference between "raise `writers`" and "the database is slow" |
-| `array_bind_rows_max` | **M** | writer | `{destination}` | The only way to answer "is `maxBatchSize` actually being reached?" |
-| `stmt_cache_entries` | **G** | writer | `{writer}` | Predicted occupancy is 3. Above ~20 means the mask space is not what the analysis assumed |
-| `stmt_cache_uncached` | C | writer | — | Executions that ran uncached because the cap was hit |
-| `batch_fallback_perrow` | C | writer | — | Entries into the serial attribution phase. Rising means a schema or scaling defect is producing bad rows continuously — read the logged row keys, do not add writers |
-| `rows_affected_mismatch` | C | writer | `{destination}` | Also the only external symptom of a short-arena silent write loss |
-| `batch_row_empty_mask` | C | writer | `{destination}` | A row arriving with an empty mask — a shard defect. Without it, it looks like a token that stopped updating |
-| `writer_conn_recycled` | C | writer | `{reason}` = hold, idle, error | Separates "working as designed" from "the database keeps dropping us" |
-| `write_probe` | C | writer | `{result}` = ok, fail | Without it the degraded-state probe is invisible and "why did it fail-fast against a healthy database?" is unanswerable |
-| `oracle_error` | C | writer | `{code}` — a **fixed 24-slot** table plus `other` | `write_retry{class}` is too coarse for a runbook: two codes in the same class can mean entirely different things. Fixed slots, because the taxonomy is closed |
-| `bind_nonfinite` | C | writer | `{destination,column}` | A non-finite value reaching a price column means the decoder or the image is wrong |
-| `bind_bad_time` | C | writer | `{destination,column}` | Also the first thing to read if OQ-W2 resolves badly |
+| Instrument | Shape | Group | Writer | Labels | Earns its place |
+|---|---|---|---|---|---|
+| `writers_running` | **G** | Write pool | writer | — | `writers_stopped` is cumulative and cannot answer "how many are running now" after a resize. The operator ratio is `writers_busy / writers_running` |
+| `commit_duration_max_ns` | **M** | Writes | writer | — | Closes HLD §4.2's *assumed* 5–20 ms commit. Three later sections divide by that range and nothing measured it |
+| `writer_batch_duration_max_ns` | **M** | Writes | writer | — | Take-to-return. With the above it separates bind cost from commit cost — the difference between "raise `writers`" and "the database is slow" |
+| `array_bind_rows_max` | **M** | Writes | writer | `{destination}` | The only way to answer "is `maxBatchSize` actually being reached?" |
+| `stmt_cache_entries` | **G** | Write pool | writer | `{writer}` | Predicted occupancy is 3. Above ~20 means the mask space is not what the analysis assumed |
+| `stmt_cache_uncached` | C | Write pool | writer | — | Executions that ran uncached because the cap was hit |
+| `batch_fallback_perrow` | C | Writes | writer | — | Entries into the serial attribution phase. Rising means a schema or scaling defect is producing bad rows continuously — read the logged row keys, do not add writers |
+| `rows_affected_mismatch` | C | Writes | writer | `{destination}` | Also the only external symptom of a short-arena silent write loss |
+| `batch_row_empty_mask` | C | Writes | writer | `{destination}` | A row arriving with an empty mask — a shard defect. Without it, it looks like a token that stopped updating |
+| `writer_conn_recycled` | C | Write pool | writer | `{reason}` = hold, idle, error | Separates "working as designed" from "the database keeps dropping us" |
+| `write_probe` | C | Write pool | writer | `{result}` = ok, fail | Without it the degraded-state probe is invisible and "why did it fail-fast against a healthy database?" is unanswerable |
+| `oracle_error` | C | Writes | writer | `{code}` — a **fixed 24-slot** table plus `other` | `write_retry{class}` is too coarse for a runbook: two codes in the same class can mean entirely different things. Fixed slots, because the taxonomy is closed |
+| `bind_nonfinite` | C | Schema fit | writer | `{destination,column}` | A non-finite value reaching a price column means the decoder or the image is wrong |
+| `bind_bad_time` | C | Schema fit | writer | `{destination,column}` | Also the first thing to read if OQ-W2 resolves badly |
 
 **Lifecycle, liveness and observability** *(Vol 4)*
 
-| Instrument | Shape | Writer | Labels | Earns its place |
-|---|---|---|---|---|
-| `panics_recovered` | C | decode / shard / writer / stats | `{stage}` | **Canonical for every recovered panic** — see the collision note below. HLD §9.5 layer 4 specifies panic containment per sub-packet and nothing counted it, so a decoder bug degraded to one silently lost message per packet, forever, with nothing to read |
-| `circuit_quiet_events` | C | health | — | `circuit_state` is sampled every 60 s: a 20-second quiet episode between samples is **completely invisible** |
-| `circuit_down_events` | C | health | — | A three-minute overnight outage that recovered must still be countable in the morning |
-| `circuit_outage_max_ns` | **M** | health | — | The magnitude of the worst outage in the interval |
-| `session_transitions` | C | health | `{market_type}` | `session_state` is a gauge; the re-open's three transitions inside one second are otherwise invisible |
-| `session_anomalies` | C | health | `{market_type}` | Distinguishes "we lost the message" from "the exchange sent something unexpected" |
-| `session_events_dropped` | C | decoder | — | The drop policy of the session channel. **Must remain zero** |
-| `writer_health_state` | **G** | writer | — | Healthy / Degraded / FailFast. Without it, `writes_failed` rising cannot be told from "retrying and recovering" |
-| `log_events_suppressed` | C | obs | `{class}` | Makes rate-limiting visible in the 60 s line; a large value is itself a signal |
-| `clock_step_detected` | C | stats | — | Explains a discontinuity in log timestamps in ten seconds instead of an hour |
-| `readbuf_effective_bytes` | **G** | lifecycle | — | The kernel silently caps the requested buffer, and the **effective** value is what bounds Q0's slack |
-| `uptime_seconds` | **G** | stats | — | A value that keeps resetting is a restart loop, which invalidates every other reading |
-| `config_generation` | **G** | lifecycle | — | The **positive acknowledgement** that a reload took effect. `config_reload_rejected` staying zero is an absence of a negative, not a confirmation |
+| Instrument | Shape | Group | Writer | Labels | Earns its place |
+|---|---|---|---|---|---|
+| `panics_recovered` | C | Configuration and lifecycle | decode / shard / writer / stats | `{stage}` | **Canonical for every recovered panic** — see the collision note below. HLD §9.5 layer 4 specifies panic containment per sub-packet and nothing counted it, so a decoder bug degraded to one silently lost message per packet, forever, with nothing to read |
+| `circuit_quiet_events` | C | Liveness | health | — | `circuit_state` is sampled every 60 s: a 20-second quiet episode between samples is **completely invisible** |
+| `circuit_down_events` | C | Liveness | health | — | A three-minute overnight outage that recovered must still be countable in the morning |
+| `circuit_outage_max_ns` | **M** | Liveness | health | — | The magnitude of the worst outage in the interval |
+| `session_transitions` | C | Liveness | health | `{market_type}` | `session_state` is a gauge; the re-open's three transitions inside one second are otherwise invisible |
+| `session_anomalies` | C | Liveness | health | `{market_type}` | Distinguishes "we lost the message" from "the exchange sent something unexpected" |
+| `session_events_dropped` | C | Liveness | decoder | — | The drop policy of the session channel. **Must remain zero** |
+| `writer_health_state` | **G** | Write pool | writer | — | Healthy / Degraded / FailFast. Without it, `writes_failed` rising cannot be told from "retrying and recovering" |
+| `log_events_suppressed` | C | Configuration and lifecycle | obs | `{class}` | Makes rate-limiting visible in the 60 s line; a large value is itself a signal |
+| `clock_step_detected` | C | Configuration and lifecycle | stats | — | Explains a discontinuity in log timestamps in ten seconds instead of an hour |
+| `readbuf_effective_bytes` | **G** | Ingress | lifecycle | — | The kernel silently caps the requested buffer, and the **effective** value is what bounds Q0's slack |
+| `uptime_seconds` | **G** | Configuration and lifecycle | stats | — | A value that keeps resetting is a restart loop, which invalidates every other reading |
+| `config_generation` | **G** | Configuration and lifecycle | lifecycle | — | The **positive acknowledgement** that a reload took effect. `config_reload_rejected` staying zero is an absence of a negative, not a confirmation |
 
 #### Collisions resolved in this merge
 
@@ -2320,6 +2348,20 @@ type Registry interface {
 > directly. `Registry.Counter(...)` is never called from the receive, shard or writer path — a
 > per-event map lookup and a `[]Label` allocation on the receive goroutine is exactly the cost
 > ADR-006 exists to avoid.
+
+> **Delta D0-5: the key is an `ID`, not a `name string`.** P1-07 implements this interface with
+> `Counter(id ID)` / `CounterAt(id ID, i int)` / `CounterAt2(id ID, i, j int)` and the matching
+> `Max`/`Gauge` forms, where `ID` is a constant naming a row of §8.2 + §8.2a. The reason is the MUST
+> directly above it: a name-keyed accessor can only honour "never called from the hot path" by
+> convention, while an ID-keyed one honours it by construction — there is no map to look up and no
+> `[]Label` to allocate — and a mistyped instrument becomes a build error rather than a startup
+> panic. What this interface is *for*, per HLD §10.1, is substitutability of the **backend**, so that
+> a later phase can add an implementation recording a histogram or serving a scrape endpoint; a
+> histogram implementation keys off this same ledger, so nothing is given up. The arity is split
+> across three accessors rather than taken as a variadic because a `{k,destination}` instrument
+> handed one index would otherwise land on destination zero of that shard and look entirely
+> plausible. `Freeze`, `SetIntervalSec`, `UnknownTranscode` and `OracleError` are **not** on the
+> interface: they are owner operations, and the interface is what subsystems consume.
 
 ---
 
