@@ -185,6 +185,13 @@ a destination whose columns exceed `imageSize` is rejected; a ninth contributor 
 **Gates.** G-LAY-3 (build-time, one-sided `const _ = uint(imageSize - destImageLen)` per compiled-in
 destination).  **Depends on.** P1-03.  **Rough:** 2–3 days.
 
+> **Where it lives, settled in P1-08: `internal/framing`.** This is the only Phase 1 card whose
+> heading named no package, and no package claimed the ring — §1.1's tree and §1.2's ownership table
+> listed fourteen and mentioned no queue. Both now name `framing`, which is the receive-path package
+> nearest the socket and the one the receiver goroutine that owns the producer index runs in. See
+> Vol 0 §9.5 deltas **D0-6** (the wake send is unconditional), **D0-7** (single *producer* is
+> non-negotiable too), and **D0-8** (the enqueue budget lives in a wrapper, not in the publish).
+
 **Note.** The pre-validation metadata lives **here**, not in `oradb` — `mirror` must be able to read
 it, and `mirror` may not import the database packages. That constraint is why these fields are on
 `Column` and not somewhere more natural-looking.
@@ -279,7 +286,7 @@ grouped line; a benchmark shows **zero allocations** on the counter and max path
 
 ---
 
-### P1-08 · QD — the lock-free SPSC datagram ring
+### P1-08 · QD — the lock-free SPSC datagram ring (in `framing`)
 
 **Scope.** The single-producer/single-consumer ring of Vol 0 §9.5, as a standalone, independently
 tested primitive.
@@ -402,7 +409,13 @@ Recorded here so they are decided deliberately rather than discovered.
 ## 7. Exit criteria, restated as a checklist
 
 - [ ] `go build ./...`, `go vet ./...`, `go test ./...` all green on the dev host
-- [ ] `go test -race ./internal/...` green (QD property test included)
+- [ ] `go test -race ./internal/...` green (QD property test included) — **requires `CC` pointed at
+      clang on the Windows dev host**: `CC=/c/msys64/clang64/bin/clang.exe`, with
+      `/c/msys64/clang64/bin` on `PATH`. The mingw64 gcc 16.1.0 installed there has a broken
+      preprocessor driver (`gcc -E` emits nothing and exits 1, while `gcc -c` works), and cgo needs
+      `gcc -E -dM`, so `-race` fails with a bare `cgo.exe: exit status 2`. Reinstalling gcc does not
+      fix it and the Go version is irrelevant — go1.23.3 and go1.25.0 fail identically. Diagnosed
+      and worked around in P1-08.
 - [ ] `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go build ./...` green; zero cgo in `go list -deps`
 - [ ] All **8** Phase 1 build-time gates demonstrated failing, then restored
 - [ ] **G-SC-1** green, with one deliberately-broken config per rule id

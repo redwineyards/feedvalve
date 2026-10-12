@@ -90,7 +90,7 @@ feedvalve/
     ├── model/                          the value types every other package speaks
     ├── wire/                           protocol constants, header layouts, fieldReader, layout gates
     ├── lzo/                            LZO1Z decompression
-    ├── framing/                        envelope split, FIFO sub-packet loop, prefix skip
+    ├── framing/                        QD datagram ring; envelope split, FIFO sub-packet loop, prefix skip
     ├── decode/                         decoder registry and the per-transcode decoders
     ├── destinations/                   destination schema, image layout, contribution mapping
     ├── policy/                         transcode → rate-limited | non-rate-limited
@@ -115,7 +115,7 @@ no logic beyond flag parsing and the `main` → `run(ctx) error` split that CLAU
 | `model` | `UpdateUnit`, `Contribution`, `Entry`, `RowKey`, `ColMask`, `Batch`, `BatchRow`, `RowOutcome`, `DestID`, `TransCode`, `MsgHeader`, `HeaderKind`, `Class`. Pure data; no behaviour beyond accessors and `String()` | — (new) | everything except stdlib. Specifically **not** `database/sql`, `go-ora`, `log`, and no other `internal/` package |
 | `wire` | Protocol constants (`broadcastDataPrefixLen` 8, `broadcastHeaderSize` 40, `maxPackedDataLen` 512, `maxDatagramLen` 516, netIds), the wire struct declarations, the `fieldReader` cursor, `hexDump`, and the pack(2) compile-time layout assertions | `exchange_communication.go`, `reader.go` | `oradb`, `writer`, `mirror`, `config`, `database/sql` |
 | `lzo` | `DecompressSafe` (bounds-checked) and `Decompress` (tests only) | `decompress.go`, `errors.go` | everything but stdlib |
-| `framing` | Envelope split, `iNoPackets` FIFO loop, the `iCompLen > 0` branch, cursor arithmetic, the 8-byte prefix rule, the netId frame-alignment oracle | `gobrdclnt.go` (`processBroadcastPackData`, `handleSubPacket`) | `oradb`, `writer`, `mirror`, `database/sql` |
+| `framing` | **QD, the lock-free SPSC datagram ring of §9.5** (`Producer`/`Consumer`, the spin-then-park wakeup, close-and-drain); envelope split, `iNoPackets` FIFO loop, the `iCompLen > 0` branch, cursor arithmetic, the 8-byte prefix rule, the netId frame-alignment oracle | `gobrdclnt.go` (`processBroadcastPackData`, `handleSubPacket`); QD is new | `oradb`, `writer`, `mirror`, `database/sql` |
 | `decode` | `Registry`, `Decoder`, one file per transaction code, per-decoder Part V layout assertions | `gobrdclnt.go` (`parseBroadcastHeader`, `parseMS*`) | `oradb`, `writer`, `mirror`, `database/sql` |
 | `destinations` | The destination table: name, target table, row-key rule, ordered column list, image layout, `ColMask` bit assignment, contributor slot assignment, and the transcode→contribution mapping | — (new) | `oradb`, `writer`, `mirror`, `database/sql` |
 | `policy` | Transcode → `Class`; inventory validation | — (new) | `oradb`, `writer`, `mirror`, `database/sql` |
@@ -2580,7 +2580,49 @@ queue.** A consumer that finds the ring empty has two options:
 
 **Chosen: bounded spin, then park on a capacity-1 wake channel** — the same level-plus-edge shape
 Volume 2 uses for the flush wakeup, for the same reason. The producer does a non-blocking send on
-the wake channel after publishing into an empty ring.
+the wake channel after publishing.
+
+> **Delta D0-6, settled in P1-08: the send is UNCONDITIONAL, and this paragraph used to say "after
+> publishing into an *empty* ring".** That qualifier is wrong, and wrong in the dangerous direction —
+> the reading a competent implementer reaches first is the broken one.
+>
+> Testing emptiness *before* the publish drops wakeups. With head=0 and tail=1, the consumer reads
+> slot 0, stores head=1, tests `head == load(tail)` → empty, and parks. The producer then publishes
+> item 2; its `load(head)` is ordered before the consumer's store and returns 0, so it computes
+> `tail_before − head = 1 ≠ 0`, concludes the ring was non-empty, and **skips the token**. Now head=1,
+> tail=2: a datagram is queued, the consumer is asleep, and it stays asleep until the *next* publish.
+> The symptom is a datagram arriving roughly one inter-datagram gap late — ~400 µs — or, if that
+> publish was the last before shutdown, never. Never a crash.
+>
+> A conditional send *can* be made correct, by deciding after the tail store and re-loading head —
+> send iff `(tail+1) − load(head) == 1` — and that is provable under sequential consistency. It is
+> **not** what P1-08 implements, because the proof rests on three premises nothing in the code states:
+> the channel must be exactly capacity 1; the consumer's head store must precede its final emptiness
+> check; and the producer's head load must be fresh. The second dies under *batched head publication*
+> (drain *n*, store head once), a standard SPSC optimisation that a future reader would see as free.
+>
+> The unconditional send costs one non-blocking channel operation per publish — ~25 ns against a
+> 2,400/s feed, 0.006 % of a core, by this section's own numbers — and it reduces the invariant to one
+> sentence that is true by construction: *every publish leaves a token pending or the consumer
+> running.* This section already argues for exactly that trade twice over ("Lock-free buys no
+> throughput here and it would be dishonest to claim otherwise"; "a buffered channel is a correct
+> drop-in"). And **Vol 2 §3 settles the shape question**: the flush wakeup this section claims to match
+> sends unconditionally, with no emptiness predicate and no special case, because "a special case
+> would be one more branch and one more thing to get wrong". So this is a clarification, not a
+> reversal.
+>
+> The governing rule, which makes all three wake paths correct at once: **announce, then signal.** A
+> publish stores `tail` before it sends; a close stores its flag before it sends; the consumer observes
+> `tail`, then `closed`, then parks. There is no parked flag — with an unconditional send it has no
+> job.
+>
+> **Gated by a source scan, not a runtime test**, and the distinction is worth recording. A runtime
+> test cannot catch this reliably: the interleaving needs the producer's head load to race the
+> consumer's head store, and any test that waits for the park — the only way to know the consumer got
+> there — thereby guarantees the store is visible and the stale read cannot occur. P1-08 confirmed
+> this by mutation: with the conditional send reintroduced, every park-and-wake test still passed.
+> `TestTheWakeSendIsUnconditional` therefore asserts the source property — the send is not nested in a
+> conditional — and is itself mutation-verified.
 
 > **What "lock-free" is buying, measured rather than assumed.** At ~2,400 datagrams/s a Go channel's
 > internal mutex would cost on the order of 25 ns per operation — about **0.006 % of one core**.
@@ -2601,6 +2643,22 @@ silently demote the whole ordering story to that defence. Volume 4 must gate thi
 asserts exactly one goroutine consumes QD, and a source scan that fails the build if the consumer is
 started in a loop.
 
+> **Delta D0-7, added in P1-08: QD has exactly one PRODUCER too, and that was missing.** This section
+> and the P1-08 card both make single-*consumer* non-negotiable and argue it well; neither mentions
+> the producer. It is just as load-bearing, and its failure is worse. `tail` is a read-modify-write
+> through a producer-local — load it, write the slot, store `tail+1` — so two producers both write a
+> slot and both store the same next index, and **one datagram is lost silently**: no error, no
+> counter, no reordering to notice, and no race detector on the target platform (req §4) to catch it.
+> A lost consumer shows up as reordering; a lost producer shows up as nothing at all.
+>
+> P1-08 enforces both the same way, by *shape* rather than by comment: `NewRing` returns a
+> `*Producer` and a `*Consumer`, and only one of them has `TryPublish`/`Close` while only the other
+> has `Drain`. Handing out one of each makes both invariants a property of the type system. The
+> runtime guard is a compare-and-swap in `Drain`, which is the part that cannot be refactored away;
+> the source scan asked for above is belt and braces, and in P1-08 it can only see `framing`'s own
+> sources, because the decoder that will call `Drain` arrives in Phase 2. The tree-wide version
+> belongs in P1-10 with the other gates.
+
 #### 9.5.6 The budget split
 
 One budget becomes two, both fatal on expiry, because there are now two critical-path queues:
@@ -2613,6 +2671,21 @@ One budget becomes two, both fatal on expiry, because there are now two critical
 The receiver's budget should be almost unused: publishing is a 1 KB copy and an atomic store, so a
 non-zero `qd_send_blocked` is a signal about the **decoder**, not about the socket. That separation
 is the diagnostic value of the split — previously both conditions presented identically.
+
+> **Delta D0-8, settled in P1-08: the enqueue budget lives in a wrapper, not in the publish.** The
+> ring's primitive is `TryPublish`, which is total, non-blocking, allocation-free and knows nothing
+> about time; `PublishWithin(d, t0, budget)` holds the retry loop and returns
+> `model.ErrStallBudgetExpired`. Three reasons. The budget is a policy about what to do when the ring
+> is full, not a property of the ring. This section defines *two* budgets owned by two goroutines, and
+> the other one covers Q1 sends the ring cannot see. And a clock read on the publish path would be a
+> measurable regression on an operation this very paragraph describes as "a 1 KB copy and an atomic
+> store" — Vol 1 §10.5 property 3 makes the same argument about the shard send, and P1-08 asserts the
+> fast path reads no clock at all. `t0` is the **caller's**, which is what preserves §10.5 property 1:
+> one budget per read-loop iteration, shared across every unit the datagram fans out.
+>
+> Note also that §7.2 never added a key for this budget. P1-08 needs none — the caller supplies it —
+> but whether the receiver shares `udp.stallBudgetMs` with the fan-out or gets a key of its own is a
+> **Phase 2 decision** and is recorded here as open.
 
 #### 9.5.7 Shutdown gains a stage
 
