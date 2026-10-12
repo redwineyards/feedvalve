@@ -333,6 +333,31 @@ partially-built graph without panicking.
 
 **Gates.** G-BLD-3 (half — the fatal-logger scan).  **Depends on.** P1-05, P1-07.  **Rough:** 1–2 days.
 
+> **Delivered in P1-09, and what is deferred.** The lifecycle orders what exists: the loggers, the
+> instrument registry, the database handle, QD, the decoder, the stats goroutine and the listener.
+> The shard and writer pools are Phase 3 and Phase 4; the slots they take in both sequences are
+> marked in `internal/app/lifecycle.go`. The receiver reads, stamps `RecvMono` and publishes to QD --
+> which is the part of it the LIFECYCLE owns -- while the envelope split, the source check, the
+> oversize rule and the gap detector are Vol 1's and arrive with Phase 2 through the `Deps.Decode`
+> seam.
+>
+> **G-BLD-3's scan excludes `poc/`, and the exclusion is the point**: `poc/gobrdclnt.go:24` calls
+> `os.Exit(1)`, and that call is the regression the gate exists to prevent recurring. The gate
+> protects the replacement, so it scans the replacement. It is an AST scan and not a grep because
+> grepping `internal/` and `cmd/` for `os.Exit` today returns six hits, every one of them in a
+> comment explaining why `os.Exit` must not be called.
+>
+> **Gates G-LIFE-1, -2, -3 and -5 all landed here** rather than waiting for P1-10, because each one
+> tests an ordering the lifecycle fixes and none of them needs a shard or a writer. G-LIFE-1
+> (socket bound last) and G-LIFE-3 (a bind failure still closes the database) are mutation-verified,
+> as is the QD drain stage. G-LIFE-4 needs the writer pool and stays in Phase 4.
+>
+> **`-race` earned its keep immediately.** It found a real data race in the lifecycle: `Graph.conn`
+> is written by `bind` on the lifecycle goroutine and read by the receiver, the teardown and
+> `LocalAddr` from others. Nothing about it was visible in behaviour, and the AIX target has no race
+> detector -- so without the toolchain fix made in P1-08 it would have shipped. See §7's note on
+> `CC`.
+
 **Why the lifecycle belongs at the start and not the end.** You need a clean, provable shutdown
 before you can test anything downstream of it. Retrofitting ordered drain onto a running pipeline is
 how drain bugs become permanent. This is also the regression `CLAUDE.md` is written about: `poc` was

@@ -361,6 +361,34 @@ const (
 )
 ```
 
+> **Delta D4-10, settled in P1-09: four departures from this sketch, all in the same direction.**
+>
+> 1. **`Build(Deps)` rather than four positional parameters.** It needs the two loggers, the
+>    destination table, the stderr writer, the resolved instrument handles and the Phase 2 decode
+>    seam as well — the sketch predates P1-07 — and a nine-field positional signature is one a future
+>    addition can silently reorder.
+> 2. **`db` is a `*sql.DB`, not a `*oradb.DB`.** No such type exists: `oradb` exposes
+>    `Open(ctx, DBSettings) (*sql.DB, error)`, because the package is the connection *policy* — pool
+>    sizes, timeouts, DSN hygiene — and not a wrapper type.
+> 3. **`Build` starts no goroutine.** The sketch has it starting the writer and shard pools, which
+>    arrive in Phase 3. Keeping it allocation-only means a failure between `Build` and `Run` has
+>    nothing running to stop, which is what makes the unwind that gate **G-LIFE-3** tests simple
+>    enough to be obviously correct. The same argument will apply to those pools: start them in
+>    `Run`, where the teardown that must stop them also lives.
+> 4. **The registry (step 9) is constructed before the loggers (step 6).** Nothing in step 6 needs
+>    the registry but the logger *wants* it, because `log_events_suppressed{class}` is what makes the
+>    rate limiter visible. Validation — the reason step 6 is not earlier still — already happened at
+>    step 4, so the swap costs nothing and leaves exactly one `AppLogger` for the life of the process
+>    instead of an unattached one replaced moments later.
+>
+> P1-09 also adds a `Decode func(*model.Datagram) error` field to `Deps`: the seam Phase 2 fills with
+> framing, the decoder registry and the fan-out. Until then the decoder drains and discards — which
+> still has to *take* each datagram, or shutdown abandons a ring with items in it.
+>
+> **`runtime.GOMAXPROCS` is called from `relay`, not from `main`.** Step 8 requires it before the
+> first goroutine, and `relay` starts none before it; `main` holds only flag parsing, the signal
+> context and the exit-code mapping, which is what §1.1 asks of it.
+
 ---
 
 ## 2. Configuration reload

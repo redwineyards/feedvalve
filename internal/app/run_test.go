@@ -186,22 +186,27 @@ func TestRunModeRequiresADatabase(t *testing.T) {
 	}
 }
 
-// TestDefaultModeIsHonestAboutNotBeingBuilt: silently doing nothing and
-// exiting 0 would look like a working relay to a supervisor. With a database
-// configured, validation passes and the run path is reached -- where it says
-// plainly that the receive path does not exist yet.
-func TestDefaultModeIsHonestAboutNotBeingBuilt(t *testing.T) {
+// TestDefaultModeFailsStartupWithoutACredential replaces a test that used to
+// assert the relay said "not built yet". P1-09 built it, so the honest
+// assertion changed: with a db object configured and no FEEDVALVE_DB_PASSWORD,
+// startup must stop at step 11 with exit 1.
+//
+// That it stops THERE rather than later is the property worth pinning. sql.Open
+// does not connect, so a process that deferred the credential check would bind
+// the socket, start draining the feed, and fail on the first write at 09:00:03
+// instead of refusing to start.
+func TestDefaultModeFailsStartupWithoutACredential(t *testing.T) {
 	path := write(t, "db.json", `{"db":{"host":"h","service":"s","user":"u"}}`)
 
 	_, err := run(t, app.Options{ConfigPath: path})
 	if err == nil {
-		t.Fatal("the default mode must not report success while the relay does not exist")
+		t.Fatal("startup succeeded with no database credential")
 	}
 	if got := app.ExitCode(err); got != app.ExitStartup {
 		t.Errorf("exit code = %d, want %d", got, app.ExitStartup)
 	}
-	if !strings.Contains(err.Error(), "not built yet") {
-		t.Errorf("message should say what is missing: %v", err)
+	if !strings.Contains(err.Error(), "FEEDVALVE_DB_PASSWORD") {
+		t.Errorf("message should name the missing credential: %v", err)
 	}
 }
 
