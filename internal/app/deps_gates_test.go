@@ -33,6 +33,7 @@ import (
 // The cross-compile is the slow half, so it skips under -short. The dependency
 // audit is instant and always runs.
 func TestG_DEP_2_CrossCompilesForAIXWithoutCgo(t *testing.T) {
+	requireGoToolchain(t)
 	root := moduleRoot(t)
 
 	// The audit half. Run on BOTH patterns deliberately.
@@ -101,6 +102,7 @@ func TestG_DEP_2_CrossCompilesForAIXWithoutCgo(t *testing.T) {
 // of poc/decompress_test.go is exactly that sequence.
 func TestG_DEP_3_TheReferenceCompressorIsAbsent(t *testing.T) {
 	const forbidden = "github.com/rhnvrm/lzo1z"
+	requireGoToolchain(t)
 	root := moduleRoot(t)
 
 	// The NON-TEST build: goListDepsAt does not pass -test, which is the
@@ -130,6 +132,7 @@ func TestG_DEP_3_TheReferenceCompressorIsAbsent(t *testing.T) {
 // version of one: the module has precisely one non-stdlib requirement, and
 // adding a second should be a decision somebody makes on purpose.
 func TestTheOnlyThirdPartyDependencyIsTheOracleDriver(t *testing.T) {
+	requireGoToolchain(t)
 	root := moduleRoot(t)
 	const driver = "github.com/sijms/go-ora/v2"
 

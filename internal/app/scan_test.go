@@ -147,10 +147,7 @@ type scannedFile struct {
 func scanTree(t *testing.T) []scannedFile {
 	t.Helper()
 
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("locating the module root: %v", err)
-	}
+	root := requireSourceTree(t)
 
 	var out []scannedFile
 	fset := token.NewFileSet()

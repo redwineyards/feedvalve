@@ -337,7 +337,17 @@ func goList(t *testing.T, pattern string) []string {
 
 func goListArgs(t *testing.T, args ...string) []string {
 	t.Helper()
-	out, err := exec.Command("go", append([]string{"list"}, args...)...).Output()
+	requireGoToolchain(t)
+	root := requireSourceTree(t)
+
+	// Run from the module root rather than from wherever the test binary
+	// happens to sit. Before P1-11 this inherited the working directory, so the
+	// gate's answer depended on where it was invoked from -- which is how it
+	// came to fail rather than skip when the cross-compiled binary ran on a
+	// host with no module around it.
+	cmd := exec.Command("go", append([]string{"list"}, args...)...)
+	cmd.Dir = root
+	out, err := cmd.Output()
 	if err != nil {
 		var stderr string
 		if ee, ok := err.(*exec.ExitError); ok {

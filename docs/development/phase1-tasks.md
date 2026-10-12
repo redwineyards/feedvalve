@@ -439,6 +439,34 @@ restored. A gate that has never been seen to fail has not been tested.
 
 **Depends on.** All.  **Rough:** 1 day *plus LPAR access*.
 
+> **STATUS: blocked on LPAR access. Everything that does not need the hardware is done.**
+>
+> All five assertions above are specified *on the target*, and none can be made from a
+> windows/amd64 host: the binary cannot execute, big-endian behaviour cannot be observed on a
+> little-endian machine, and `udp_recvspace` is an AIX tunable. What is ready:
+>
+> - `scripts/build-aix.sh` produces the artefact set Vol 4 §8 names — one static binary built
+>   `-trimpath -ldflags "-X main.version=…"`, `config.json`, the `deps.txt` golden list — plus the
+>   cross-compiled test binaries for **G-AIX-1**. All 14 packages cross-compile, gated by
+>   `TestG_AIX_1_TestBinariesCrossCompileForTheTarget` so a test-only import that does not exist on
+>   aix/ppc64 breaks the build host rather than the shipment.
+> - `scripts/lpar-smoke.sh` encodes the five assertions **in dependency order**, so each failure says
+>   what is wrong rather than what noticed it.
+> - **Assertion 4 is already half-proven off-target.** §7.5 grounds it in `unsafe.Sizeof` being
+>   architecture-dependent, which makes it a compile-time property the cross-compile evaluates under
+>   ppc64's own rules. The LPAR adds the runtime half: `TestMemoryFigures` and the pointer-free walk.
+> - **Assertion 4 of this card's list is resolved** — see seam 4; `time/tzdata` is imported.
+> - **The on-target suite actually runs.** Measured: before P1-11 the cross-compiled test binaries
+>   produced ten failures and one vacuous pass when run away from the source tree, which is the LPAR's
+>   condition. The source-scanning gates now skip, with a reason, and a counter-test asserts they do
+>   *not* skip on the build host — because a package of skips reports `ok` exactly like a package of
+>   passes.
+>
+> **A prerequisite this card does not state:** assertion 2 needs a **reachable Oracle**. Rule V-DB1
+> requires a `db` object in run mode and startup step 11 pings it, so "the binary starts" cannot
+> happen without one. `-selfcheck` is the only item needing neither password nor network, which is
+> why the smoke script runs it first and `-dbcheck` before the full start.
+
 > **Start the access request now.** This is the longest-lead item in Phase 1 and the one most likely
 > to slip. Everything else is keyboard work; this one needs another team.
 
@@ -465,7 +493,7 @@ Recorded here so they are decided deliberately rather than discovered.
 | **1** | ~~**G-LAY-2 lists 6 types; there are 7.**~~ **CLOSED.** Vol 4 §7.1 predated the QD merge that added `Datagram` | **P1-03 implemented all 7**, not P1-10 — `internal/model/layout.go` pins every total and every field offset. P1-10 corrected Vol 4's table and added the mutation rows that demonstrate the pin firing for `Datagram` |
 | **2** | **Read buffer vs. `Datagram.Buf`.** Vol 4 F6 specifies a 64 KB read buffer (so oversize is distinguishable from full) and trims to 512. Vol 0 §9.5.2 sizes `Datagram.Buf` at 1024 "so an oversize datagram is carried intact and diagnosable". A datagram between 1024 B and 64 KB would be truncated on the copy into QD | **Phase 2 decision**, in the receive path. Flagged here because it constrains `Datagram`, which P1-03 freezes. The 1040 B size itself is not in question — only what the receiver does with an oversize frame before enqueueing |
 | **3** | **G-SC-2 spans phases.** Its transcode-resolution half needs the decoder registry | Config-side half in P1-06; decoder-side half in Phase 2 |
-| **4** | **OQ-L5 — zoneinfo on AIX** | Import `time/tzdata` unconditionally (~450 KB, pure Go). P1-11 assertion 4 confirms. Failing open — treating every hour as in-window — is the safe default |
+| **4** | ~~**OQ-L5 — zoneinfo on AIX**~~ **CLOSED on the build side** | `time/tzdata` is now imported unconditionally (~450 KB, pure Go), which is what Vol 0 §7.2 and Vol 4 §8.7 always specified. It had been left out over a link failure (`time.registerLoadFromEmbeddedTZData not defined`) that **P1-11 re-tested and could not reproduce** — go1.23.3 links it for aix/ppc64, linux/amd64 and native, surviving `go build -a`, and the native binary resolves `Asia/Kolkata`. §7.2's hard-error rule therefore stands and the fail-open fallback is not needed. G-AIX-1 assertion 3 still confirms it on the target, because a cross-compile is not proof of runtime behaviour on AIX |
 
 ---
 

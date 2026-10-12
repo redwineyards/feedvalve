@@ -179,6 +179,7 @@ func TestEveryBuildTimeGateCanBeSeenToFail(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes the Go toolchain once per gate")
 	}
+	requireGoToolchain(t)
 	root := moduleRoot(t)
 
 	// FIRST, the clean build of every package a mutation targets.
@@ -230,6 +231,7 @@ func TestTheHarnessLeavesTheWorkingTreeUntouched(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes the Go toolchain")
 	}
+	requireGoToolchain(t)
 	root := moduleRoot(t)
 
 	for _, m := range mutations {
@@ -265,6 +267,7 @@ func TestTheHarnessDetectsAGateThatDoesNotFire(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes the Go toolchain")
 	}
+	requireGoToolchain(t)
 	root := moduleRoot(t)
 
 	inert := mutation{
@@ -355,18 +358,6 @@ func distinctPkgs() []string {
 		}
 	}
 	return out
-}
-
-func moduleRoot(t *testing.T) string {
-	t.Helper()
-	root, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatalf("locating the module root: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
-		t.Fatalf("%s is not the module root: %v", root, err)
-	}
-	return root
 }
 
 // devNull is os.DevNull, as a function so the cross-compile gate can name it

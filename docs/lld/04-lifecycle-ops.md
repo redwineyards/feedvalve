@@ -1735,7 +1735,7 @@ becomes "cannot be loaded at all".
 
 | ID | Gate | Specification |
 |---|---|---|
-| **G-AIX-1** | Cross-compile the test binaries (`go test -c -o … ./internal/...`) with `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64` and run them **on the LPAR** | Five assertions no amd64 run can make |
+| **G-AIX-1** | Cross-compile the test binaries (`go test -c -o … ./internal/...`) with `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64` and run them **on the LPAR** | Five assertions no amd64 run can make. **Phase 1 owns 3, 4 and 5**; assertion 1 needs the Phase 2 decoders and assertion 2 the Phase 3 mirror. P1-11 automated the *preparation* (`TestG_AIX_1_TestBinariesCrossCompileForTheTarget`) and made the suite survive having no source tree, which is the target's condition — the scans skip there and a counter-test proves they do not skip on the build host |
 
 The five, in order of value:
 

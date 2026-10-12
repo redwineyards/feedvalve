@@ -104,6 +104,12 @@ type Options struct {
 	// is what makes the startup-ordering and drain gates possible; nil means
 	// os.Stderr.
 	Stderr io.Writer
+
+	// Version is the build stamp from main.version, reported on the startup
+	// line so a running process can be matched to a commit. Empty is fine --
+	// it reads as "unstamped", which is itself the answer to "which build is
+	// this?"
+	Version string
 }
 
 // Run is the whole process, with main holding nothing but flag parsing and
@@ -188,6 +194,8 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 	// useful artifact in a postmortem, and safe to dump wholesale because
 	// Config has no password field at any depth (Vol 0 section 7.5) -- the
 	// password comes only from the environment and never enters Config.
+	lg.Infof("starting feedvalve version=%s goos=%s goarch=%s", versionOf(opts),
+		runtime.GOOS, runtime.GOARCH)
 	lg.Infof("starting with the effective configuration: %+v", cfg)
 
 	// Step 8: GOMAXPROCS, BEFORE the first goroutine, so every goroutine is
@@ -233,6 +241,14 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 
 	// Steps 15 to 17, then the drain.
 	return g.Run(ctx)
+}
+
+// versionOf reports the build stamp, or "unstamped" when nothing set it.
+func versionOf(opts Options) string {
+	if opts.Version == "" {
+		return "unstamped"
+	}
+	return opts.Version
 }
 
 // openDB is oradb.Open behind a variable, so gate G-LIFE-3 -- "OpenDB

@@ -2,6 +2,7 @@ package framing
 
 import (
 	"io/fs"
+	"os"
 
 	"go/ast"
 	"go/parser"
@@ -32,6 +33,7 @@ import (
 // unlike a counter on the publish path, and it fails the moment someone
 // "optimises" the send back into an `if`.
 func TestTheWakeSendIsUnconditional(t *testing.T) {
+	requireSourceDir(t)
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "ring.go", nil, 0)
 	if err != nil {
@@ -214,6 +216,7 @@ func TestWakeSendDetectorCatchesAGuardedSend(t *testing.T) {
 //
 // The runtime CAS in Drain is the real guard; this is belt and braces.
 func TestDrainIsNotStartedInALoopInThisTree(t *testing.T) {
+	requireSourceDir(t)
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
@@ -274,4 +277,43 @@ func calleeName(e ast.Expr) string {
 		return fn.Sel.Name
 	}
 	return ""
+}
+
+// requireSourceDir skips when this package's own sources are not beside the
+// test binary.
+//
+// Gate G-AIX-1 ships the cross-compiled test binaries to the LPAR and runs them
+// there, where there is no source tree -- so a scan that reads ring.go has
+// nothing to read. Skipping says that; the alternatives are both worse.
+//
+// TestDrainIsNotStartedInALoopInThisTree in particular PASSED VACUOUSLY before
+// this guard existed, and that is the defect worth naming: parser.ParseDir on a
+// directory with no Go files returns no error and no packages, so the loop ran
+// zero times and the gate reported success. A scan that cannot tell "no Drain
+// in a loop" from "no files at all" is exactly the rot that TestMatchForbidden
+// and the detector self-tests exist to prevent, and on the one host where the
+// gate cannot run it was reporting a pass.
+func requireSourceDir(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat("ring.go"); err != nil {
+		t.Skip("no source tree beside the test binary: these two gates read this " +
+			"package's own sources, and the cross-compiled binary is running without " +
+			"them -- on the LPAR, for gate G-AIX-1. They run on the build host.")
+	}
+}
+
+// TestTheBuildHostHasThisPackagesSources is the counterweight: skipping is
+// correct on the LPAR and wrong here, and a package of skips reports ok exactly
+// like a package of passes.
+func TestTheBuildHostHasThisPackagesSources(t *testing.T) {
+	if _, err := os.Stat("ring.go"); err != nil {
+		t.Skip("running without a source tree; the build-host assertion does not apply")
+	}
+	for _, want := range []string{"ring.go", "consume.go", "budget.go"} {
+		if _, err := os.Stat(want); err != nil {
+			t.Errorf("%s is missing beside the test: %v. The two source gates in this "+
+				"file would both skip, and skips are indistinguishable from passes in "+
+				"the summary line.", want, err)
+		}
+	}
 }
