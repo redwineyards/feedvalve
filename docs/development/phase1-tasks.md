@@ -331,7 +331,10 @@ this code under `-race` is on the dev host, which argues for doing it in isolati
 cleanup observed to run** (assert it, don't eyeball it); a forced error in construction unwinds the
 partially-built graph without panicking.
 
-**Gates.** G-BLD-3 (half — the fatal-logger scan).  **Depends on.** P1-05, P1-07.  **Rough:** 1–2 days.
+**Gates.** G-BLD-3 — **both halves**, not just the fatal-logger scan: P1-09 also landed the
+`runtime.NumCPU` ban and a positive check that `GOMAXPROCS` is set from configuration, since a gate
+that only forbids `NumCPU` passes on a process that never sets `GOMAXPROCS` at all. Plus G-LIFE-1,
+G-LIFE-2, G-LIFE-3 and G-LIFE-5.  **Depends on.** P1-05, P1-07.  **Rough:** 1–2 days.
 
 > **Delivered in P1-09, and what is deferred.** The lifecycle orders what exists: the loggers, the
 > instrument registry, the database handle, QD, the decoder, the stats goroutine and the listener.
@@ -386,6 +389,41 @@ restored. A gate that has never been seen to fail has not been tested.
 
 **Depends on.** P1-02, P1-03, P1-09.  **Rough:** 1 day.
 
+> **What P1-10 actually found, and what it built.** An inventory against §7.1 said most of this was
+> already done: **G-LAY-2** (all seven types, by P1-03), **G-LAY-3**, **G-BLD-2**, **G-BLD-3** and
+> **G-DEP-1** were complete, several over-delivered. Genuinely unbuilt were **G-BLD-1** (no reference
+> in any Go source), **G-DEP-2** and **G-DEP-3** (comment-only) — plus the tree-wide single-consumer
+> scan that `internal/framing/ring_source_test.go` had handed forward in code, which only became
+> possible once P1-09 created the consumer.
+>
+> **The real gap was the "done when".** Most of these gates are constant expressions, and a constant
+> expression cannot be mutation-tested from inside `go test`: breaking it breaks the build. So none of
+> G-LAY-2, G-LAY-3, G-BLD-1 or G-BLD-2 had ever been *demonstrated* failing by anything reproducible —
+> the verification existed only as sentences in commit messages.
+> `TestEveryBuildTimeGateCanBeSeenToFail` closes it with `go build -overlay`: for each gate it writes
+> a mutated copy of the real source into `t.TempDir()` and builds the **real** package against it,
+> asserting the build fails and that the complaint names the right file. Real compiler, real types,
+> real gate, working tree never touched. Twelve rows today, one per build-time gate in the tree,
+> including the ones P1-07 and P1-08 added that §7.1 does not list.
+>
+> Three guards keep the harness itself honest, each of them a lesson from a gate that nearly passed
+> vacuously: the clean build of every target package must succeed first (or a broken overlay path
+> reports every gate as firing while nothing is tested); the mutation must be shown to have applied
+> (or a renamed constant turns a row into a silent no-op); and a deliberately **inert** mutation must
+> still compile (or the harness cannot tell a firing gate from its own machinery misbehaving).
+>
+> **Two small gaps fell out of counting.** `TestArenaTypesArePointerFree` claimed G-PTR-1 but covered
+> four types where §7.3.6 names five — `Contribution` was only transitively covered and `SessionEvent`
+> was covered by nothing; both are now explicit. And **G-SC-1 had no label**: it was fully implemented
+> in P1-06 as `TestEachRuleFiresExactlyOnce`, so a reviewer grepping for the gate id found nothing.
+>
+> **G-DEP-3 passes vacuously and the test says so.** Vol 0 §2 records that `lzo1z` was removed from
+> the module and its output frozen in `poc/testdata/lzo_fixtures.json`, so the gate now guards against
+> *reintroduction* rather than against leakage into the binary. It fires the day somebody runs the
+> fixture-regeneration recipe and forgets to drop the requirement again. A positive companion was
+> added alongside it, because G-DEP-2 and G-DEP-3 both only forbid: the module has exactly one
+> non-stdlib requirement, and a second should be somebody's decision.
+
 ---
 
 ### P1-11 · Cross-compile and LPAR smoke — *the exit criterion*
@@ -424,7 +462,7 @@ Recorded here so they are decided deliberately rather than discovered.
 
 | # | Seam | Resolution |
 |---|---|---|
-| **1** | **G-LAY-2 lists 6 types; there are 7.** Vol 4 §7.1 predates the QD merge that added `Datagram` | P1-10 implements all 7. Vol 4's table should be corrected to match on the next documentation pass |
+| **1** | ~~**G-LAY-2 lists 6 types; there are 7.**~~ **CLOSED.** Vol 4 §7.1 predated the QD merge that added `Datagram` | **P1-03 implemented all 7**, not P1-10 — `internal/model/layout.go` pins every total and every field offset. P1-10 corrected Vol 4's table and added the mutation rows that demonstrate the pin firing for `Datagram` |
 | **2** | **Read buffer vs. `Datagram.Buf`.** Vol 4 F6 specifies a 64 KB read buffer (so oversize is distinguishable from full) and trims to 512. Vol 0 §9.5.2 sizes `Datagram.Buf` at 1024 "so an oversize datagram is carried intact and diagnosable". A datagram between 1024 B and 64 KB would be truncated on the copy into QD | **Phase 2 decision**, in the receive path. Flagged here because it constrains `Datagram`, which P1-03 freezes. The 1040 B size itself is not in question — only what the receiver does with an oversize frame before enqueueing |
 | **3** | **G-SC-2 spans phases.** Its transcode-resolution half needs the decoder registry | Config-side half in P1-06; decoder-side half in Phase 2 |
 | **4** | **OQ-L5 — zoneinfo on AIX** | Import `time/tzdata` unconditionally (~450 KB, pure Go). P1-11 assertion 4 confirms. Failing open — treating every hour as in-window — is the safe default |
@@ -442,7 +480,11 @@ Recorded here so they are decided deliberately rather than discovered.
       fix it and the Go version is irrelevant — go1.23.3 and go1.25.0 fail identically. Diagnosed
       and worked around in P1-08.
 - [ ] `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go build ./...` green; zero cgo in `go list -deps`
-- [ ] All **8** Phase 1 build-time gates demonstrated failing, then restored
+- [ ] All **8 of §7.1's 9** build-time gates demonstrated failing, then restored — the ninth is
+      **G-LAY-1**, which needs the Phase 2 decoders before its stride arithmetic constrains
+      anything. (§2's "9" counts the contract; this counts the Phase 1 deliverable. Neither figure
+      is wrong.) Automated in P1-10 by `TestEveryBuildTimeGateCanBeSeenToFail`, which mutates each
+      gate through a `go build -overlay` and asserts the build fails
 - [ ] **G-SC-1** green, with one deliberately-broken config per rule id
 - [ ] All **7** size pins hold, verified **on the LPAR**, big-endian
 - [ ] `-selfcheck` runs with no password and no network

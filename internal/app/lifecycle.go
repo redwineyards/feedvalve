@@ -13,12 +13,18 @@ import (
 	"feedvalve/internal/model"
 )
 
-// maxDatagramLen bounds one read. 64 KB and not 516, deliberately: ReadFrom
-// silently discards whatever does not fit and reports no error, so an
-// exactly-sized buffer would make an oversized datagram indistinguishable from
-// a full one. Carried over from poc, where the same comment sits on the same
-// buffer.
-const maxDatagramLen = 65536
+// readBufferLen bounds one read. 64 KB and not wire.MaxDatagramLen's 516,
+// deliberately: ReadFrom silently discards whatever does not fit and reports no
+// error, so an exactly-sized buffer would make an oversized datagram
+// indistinguishable from a full one -- and an oversized datagram is an
+// envelope-assumption break (F6) that must be reported, not hidden.
+//
+// NAMED FOR THE BUFFER AND NOT FOR THE DATAGRAM. This was maxDatagramLen until
+// P1-10, which is the name wire now gives the envelope cap of 516 -- two very
+// different quantities under one word, in a package that will import wire in
+// Phase 2. poc had already made the same distinction with two names
+// (maxDatagramLen 516, udpReadBufferLen 65536); this follows it.
+const readBufferLen = 65536
 
 // Run binds the socket, starts the goroutines, blocks until the context is
 // cancelled or a terminal condition is delivered, then drains and returns.
@@ -130,7 +136,7 @@ func (g *Graph) startReader(ctx context.Context) {
 
 		// Allocated once, outside the loop. Allocating per datagram is the
 		// first thing that would show up as jitter at market open.
-		buf := make([]byte, maxDatagramLen)
+		buf := make([]byte, readBufferLen)
 		var d model.Datagram
 		consecutive := 0
 

@@ -130,6 +130,12 @@ type selCall struct {
 type scannedFile struct {
 	rel   string
 	calls []selCall
+
+	// file and fset are kept so a scan with different questions -- the
+	// single-consumer scan below -- can walk the same parse rather than
+	// reading the tree twice.
+	file *ast.File
+	fset *token.FileSet
 }
 
 // scanTree parses every non-test .go file under scanRoots and returns the
@@ -165,6 +171,8 @@ func scanTree(t *testing.T) []scannedFile {
 			out = append(out, scannedFile{
 				rel:   filepath.ToSlash(rel),
 				calls: qualifiedCalls(fset, file),
+				file:  file,
+				fset:  fset,
 			})
 			return nil
 		})
@@ -259,6 +267,139 @@ func TestFatalScanDetectorFindsWhatItMustFind(t *testing.T) {
 			if hits != tc.wantHits {
 				t.Errorf("found %d hits for %s.%s in %q, want %d",
 					hits, tc.wantPkg, tc.wantSel, tc.body, tc.wantHits)
+			}
+		})
+	}
+}
+
+// TestVol0Section955_DrainIsNeverStartedInALoop is the tree-wide half of the
+// single-consumer invariant, and it is the gate P1-08 could not finish.
+//
+// Vol 0 section 9.5.5 asks Volume 4 for "a test that asserts exactly one
+// goroutine consumes QD, and a source scan that fails the build if the consumer
+// is started in a loop". P1-08 built the runtime guard -- a compare-and-swap in
+// framing.Consumer.Drain -- and scoped its scan to framing's own sources,
+// saying so in code: "P1-10 is where the tree-wide version belongs, next to the
+// other gates in internal/app." P1-09 then created the consumer
+// (Graph.startDecoder), so there is finally something tree-wide to scan.
+//
+// Why it matters more than it looks: a second consumer does not corrupt
+// anything or crash. It reorders datagrams relative to arrival, and arrival
+// order at a single goroutine is ADR-007's mechanism 1 -- the thing that makes
+// ordering STRUCTURAL rather than dependent on the sequence guard, which is a
+// defence that can auto-disable itself per transcode. Widening QD would
+// silently demote the whole ordering story to that defence, and the symptom
+// would be occasional wrong-order updates in Oracle months later.
+//
+// The compare-and-swap in Drain is the real guard, because it holds whatever
+// the source looks like. This is belt and braces: it catches the shape the
+// contract names, `for ... { go c.Drain(fn) }`, at review time rather than at
+// 03:00.
+func TestVol0Section955_DrainIsNeverStartedInALoop(t *testing.T) {
+	for _, f := range scanTree(t) {
+		forEachGoStmtInLoop(f.file, func(pos token.Pos, callee string) {
+			if callee != "Drain" {
+				return
+			}
+			t.Errorf("%s: Drain is started inside a loop at %s.\n"+
+				"QD has exactly one consumer -- not a pool, not now, not later "+
+				"(Vol 0 section 9.5.5). A second consumer reorders datagrams relative "+
+				"to arrival and silently demotes the whole ordering story to the "+
+				"sequence guard, which can disable itself per transcode.",
+				f.rel, f.fset.Position(pos))
+		})
+	}
+}
+
+// forEachGoStmtInLoop reports every `go f()` that appears lexically inside a
+// for or range statement, with the called function's final selector name.
+//
+// Lexical nesting, not reachability: a Drain started from a helper that a loop
+// calls would not be caught. That limit is why the runtime CAS is the real
+// guard and this is the cheap check -- stated rather than left for a reader to
+// discover when it misses one.
+func forEachGoStmtInLoop(root ast.Node, report func(token.Pos, string)) {
+	var depth int
+	var walk func(ast.Node) bool
+	walk = func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.ForStmt, *ast.RangeStmt:
+			depth++
+			for _, child := range childrenOf(n) {
+				ast.Inspect(child, walk)
+			}
+			depth--
+			return false
+		case *ast.GoStmt:
+			if depth > 0 {
+				if name := calleeName(node.Call.Fun); name != "" {
+					report(node.Pos(), name)
+				}
+			}
+		}
+		return true
+	}
+	ast.Inspect(root, walk)
+}
+
+// childrenOf returns the statement bodies of a loop, so the walker can descend
+// without re-entering the loop node itself and recursing forever.
+func childrenOf(n ast.Node) []ast.Node {
+	switch node := n.(type) {
+	case *ast.ForStmt:
+		return []ast.Node{node.Body}
+	case *ast.RangeStmt:
+		return []ast.Node{node.Body}
+	}
+	return nil
+}
+
+func calleeName(e ast.Expr) string {
+	switch fn := e.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	}
+	return ""
+}
+
+// TestDrainLoopDetectorCatchesTheShapeTheContractNames exercises the detector
+// against synthetic sources, following TestMatchForbidden's precedent above --
+// "so the gate cannot rot into one that passes everything".
+//
+// This one needs it more than most: the tree-wide scan currently finds ZERO
+// occurrences and will pass for as long as nobody writes the bug. A detector
+// that silently stopped working would be indistinguishable from a clean tree.
+func TestDrainLoopDetectorCatchesTheShapeTheContractNames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"go Drain in a for loop", "for i := 0; i < 4; i++ {\ngo c.Drain(fn)\n}", 1},
+		{"go Drain in a range loop", "for range 4 {\ngo c.Drain(fn)\n}", 1},
+		{"go Drain nested two loops deep", "for range 2 {\nfor range 2 {\ngo c.Drain(fn)\n}\n}", 1},
+		{"a bare Drain call in a loop is not a goroutine", "for range 4 {\nc.Drain(fn)\n}", 0},
+		{"go Drain outside any loop is the correct shape", "go c.Drain(fn)", 0},
+		{"a different method in a loop is ignored", "for range 4 {\ngo c.Publish(fn)\n}", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "package p\nvar c struct{}\nvar fn func()\nfunc f() {\n" + tc.body + "\n}\n"
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+			if err != nil {
+				t.Fatalf("parse: %v\n%s", err, src)
+			}
+			got := 0
+			forEachGoStmtInLoop(file, func(_ token.Pos, callee string) {
+				if callee == "Drain" {
+					got++
+				}
+			})
+			if got != tc.want {
+				t.Errorf("detector found %d Drain-in-a-loop occurrences, want %d, in:\n%s",
+					got, tc.want, tc.body)
 			}
 		})
 	}

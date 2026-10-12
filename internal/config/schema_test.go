@@ -78,7 +78,7 @@ func rulesOf(t *testing.T, err error) []string {
 	return ve.Rules()
 }
 
-// TestEachRuleFiresExactlyOnce is the done-when of P1-06: one deliberately
+// TestG_SC_1_EachRuleFiresExactlyOnce is the done-when of P1-06: one deliberately
 // broken configuration per rule identifier, each producing THAT identifier
 // and no other.
 //
@@ -86,7 +86,13 @@ func rulesOf(t *testing.T, err error) []string {
 // implemented while a different rule catches every input that would have
 // exercised it -- which is exactly what happened in P1-04, where an image
 // length check fired before the kind/width rule it was meant to test.
-func TestEachRuleFiresExactlyOnce(t *testing.T) {
+// It carries gate G-SC-1's identifier because it IS G-SC-1 (Vol 4 section
+// 7.2): "the shipped config.json ... zero failures; and separately, one
+// deliberately-broken configuration per rule id, each producing exactly that id
+// and no other". The gate was implemented in P1-06 without its label, so a
+// reviewer grepping for G-SC-1 found nothing -- which P1-10 noticed while
+// counting the gates and is the cheapest possible fix.
+func TestG_SC_1_EachRuleFiresExactlyOnce(t *testing.T) {
 	dests := shippedDests(t)
 
 	for _, tc := range []struct {
