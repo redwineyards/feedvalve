@@ -24,18 +24,7 @@ import (
 // gives it rather than halved, because halving it on one platform and not the
 // other is how a figure stops being comparable to netstat.
 func readBufferSize(c *net.UDPConn) (int, error) {
-	raw, err := c.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-	var (
-		size   int
-		optErr error
-	)
-	if err := raw.Control(func(fd uintptr) {
-		size, optErr = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
-	}); err != nil {
-		return 0, err
-	}
-	return size, optErr
+	return sockoptInt(c, func(fd uintptr) (int, error) {
+		return syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	})
 }

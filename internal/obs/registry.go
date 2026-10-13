@@ -80,12 +80,11 @@ type Reg struct {
 	// caller, the stats goroutine, and Vol 0 section 9.1 makes that goroutine
 	// the sole owner of "the previous-emission snapshot of every counter".
 	//
-	// prevC and prevG hold the last emission's values, so a delta is a
-	// subtraction and a gauge's movement is a comparison. curC, curM, curG and
-	// deltaC hold the current snapshot, which is what the render pass reads --
-	// never the instruments themselves.
-	prevC  []uint64
-	prevG  []int64
+	// curC, curM, curG and deltaC hold the current snapshot, which is what the
+	// render pass reads -- never the instruments themselves. curC and curG
+	// double as the previous-emission snapshot: each is read for the delta or
+	// the movement comparison immediately before it is overwritten, so a
+	// separate prev copy would hold the same value at every observable instant.
 	curC   []uint64
 	curM   []uint64
 	curG   []int64
@@ -175,11 +174,9 @@ func (r *Reg) Freeze() {
 	r.prefixM = r.renderPrefixes(shapeMax, len(r.maxes))
 	r.prefixG = r.renderPrefixes(shapeGauge, len(r.gauges))
 
-	r.prevC = make([]uint64, len(r.counters))
 	r.curC = make([]uint64, len(r.counters))
 	r.deltaC = make([]uint64, len(r.counters))
 	r.curM = make([]uint64, len(r.maxes))
-	r.prevG = make([]int64, len(r.gauges))
 	r.curG = make([]int64, len(r.gauges))
 	r.buf = make([]byte, 0, r.maxLineLen())
 

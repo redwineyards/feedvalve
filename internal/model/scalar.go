@@ -15,6 +15,14 @@ type TransCode uint16
 
 func (c TransCode) String() string { return strconv.FormatUint(uint64(c), 10) }
 
+// ValidTransCode reports whether an int from an untrusted source -- a config
+// file or a mapping file -- fits a TransCode. Code 0 is excluded: the wire
+// never carries it and a zero is what an absent JSON field decodes to.
+//
+// It lives here because this is where the type lives, and because every caller
+// that converts an int into a TransCode owes the same check.
+func ValidTransCode(code int) bool { return code > 0 && code <= 0xFFFF }
+
 // DestID indexes the three destinations, 0..MaxDestinations-1.
 //
 // It is the array index of every [MaxDestinations] field in this package, and

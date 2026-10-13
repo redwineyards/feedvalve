@@ -96,11 +96,12 @@ func (r *Reg) snapshot() [numGroups]bool {
 			off := r.base[id] + i*d.stride
 			switch row.shape {
 			case shapeCounter:
+				// curC still holds the previous emission's value until it is
+				// overwritten, which is what the delta is measured against.
 				v := r.counters[off].Load()
+				delta := v - r.curC[off]
 				r.curC[off] = v
-				delta := v - r.prevC[off]
 				r.deltaC[off] = delta
-				r.prevC[off] = v
 				if delta != 0 {
 					dirty[g] = true
 				}
@@ -112,11 +113,10 @@ func (r *Reg) snapshot() [numGroups]bool {
 				}
 			case shapeGauge:
 				v := r.gauges[off].Load()
-				if v != r.prevG[off] {
+				if v != r.curG[off] {
 					dirty[g] = true
 				}
 				r.curG[off] = v
-				r.prevG[off] = v
 			}
 		}
 	}

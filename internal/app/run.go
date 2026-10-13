@@ -266,19 +266,16 @@ var openDB = oradb.Open
 // the Phase 5 reload path have one to swap.
 //
 // The second deviation from section 1.4, and a small one: the section has the
-// Store existing from step 3. config.Store's publish is unexported, so the
-// only way in is Swap, which is also where validation against the previous
-// generation lives. Phase 5 owns the reload; this just establishes generation 1
-// so config_generation reads 1 rather than 0 on a process that never reloaded.
+// Store existing from step 3. Phase 5 owns the reload; this just establishes
+// generation 1 so config_generation reads 1 rather than 0 on a process that
+// never reloaded.
+//
+// config.NewStore is exactly that constructor. Going in through Swap instead
+// would re-run the whole rule set -- including time.LoadLocation, an uncached
+// zoneinfo walk -- against a cfg that passed it at step 4, and would need an
+// error branch that cannot fire.
 func storeOf(cfg *config.Config) *config.Store {
-	var s config.Store
-	if _, err := s.Swap(cfg); err != nil {
-		// Unreachable: cfg has already passed the same rule set at step 4.
-		// Returning the empty store rather than panicking keeps a validation
-		// surprise out of the startup path.
-		return &s
-	}
-	return &s
+	return config.NewStore(cfg)
 }
 
 // loadAll resolves the configuration and the field map, then validates them

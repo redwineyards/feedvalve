@@ -139,7 +139,7 @@ func buildDestination(id model.DestID, fd fileDestination) (Destination, error) 
 			"(MaxContributors sizes Entry's ordering arrays)", len(codes), model.MaxContributors)
 	}
 	for i, c := range codes {
-		if c <= 0 || c > 0xFFFF {
+		if !model.ValidTransCode(c) {
 			return d, fmt.Errorf("contributor %d is not a valid transaction code", c)
 		}
 		if i > 0 && codes[i-1] == c {

@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"feedvalve/internal/model"
 )
 
 // rangeRule is one key's absolute bounds, from Vol 0 section 7.2.
@@ -308,7 +310,7 @@ func validateTranscodes(c *Config, p *problems) {
 	for i, t := range c.Transcodes {
 		where := describeTranscode(i, t.Code)
 
-		if t.Code <= 0 || t.Code > 0xFFFF {
+		if !model.ValidTransCode(t.Code) {
 			p.add(RuleRange, "%s: code is not a valid transaction code", where)
 		}
 		if seen[t.Code] {
