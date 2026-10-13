@@ -2,6 +2,103 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Design principles
+
+Three rules govern every change in this repository: **KISS**, **SOLID**, **YAGNI**. They conflict
+less often than it looks, and where they do, the order above is the tie-break — a simple design that
+is slightly less pure beats a layered one that is harder to read against the protocol spec.
+
+### KISS — keep it simple, stupid
+
+Prefer the boring, obvious construction. Market-data decoding is already unforgiving; the code
+around it must not add difficulty of its own.
+
+- **Decode is a flat sequence of reads, not machinery.** Fields are read one at a time at a cursor,
+  in wire order, so the code can be checked line-by-line against the spec's offset table. No
+  reflection, no `encoding/binary` struct decoding, no code generation, no generic
+  schema-interpreter. Padding is written out explicitly (`r.pad(...)`, and the explicit pad fields
+  in `internal/model`) rather than left to the compiler to infer.
+- **Explicit beats clever.** Sizes and layouts are pinned by compile-time constant expressions, not
+  computed at runtime from tags or `unsafe.Sizeof` chains.
+- **Errors in non-essential paths are logged and swallowed**, not escalated into retry/circuit-breaker
+  layers. A database problem must never stop the relay decoding the feed.
+- **Simple-and-documented beats sophisticated-and-implicit.** Where a deliberately plain choice has
+  a cost, the cost is written down next to it (the POC's synchronous per-packet write is the
+  example). Don't "fix" a documented trade-off without being asked.
+- Prefer deleting a special case to adding a flag that selects between two of them.
+
+If explaining a change needs a diagram, look for the simpler version first.
+
+### SOLID — as pressure on shape, not a mandate to add types
+
+The `internal/*` tree is the worked example; keep its properties.
+
+- **S — single responsibility.** One package, one job, stated in its `doc.go`: `framing` splits the
+  envelope, `decode` turns payloads into units, `model` holds value types with no behaviour,
+  `policy` classifies transaction codes, `oradb` talks to Oracle, `writer` persists, `app` wires the
+  graph and owns the lifecycle. New code belongs in the package whose single job it shares — or in a
+  new one with a single job of its own, declared the same way. A decoder decodes; it does not log
+  packets, touch the database, or decide drop policy.
+- **O — open/closed.** Decoder selection is data-driven: a new transaction code means a new decoder
+  file plus its registration, not edits threading flags through existing decoders. Preserve that —
+  if adding a code forces you to modify a decoder that already works, the seam is in the wrong place.
+- **L — substitutability.** Anything accepted behind an interface must work for every implementation
+  passed in. The driver seam exists so a stub `database/sql` driver behaves like the real Oracle one
+  in tests; don't add behaviour that only holds for one of them.
+- **I — interface segregation.** Small interfaces, defined by the consumer, at the point of use. A
+  one- or two-method interface is normal and good here; a wide `Service`-style interface is a smell.
+  Accept the narrowest thing that does the job (`io.Writer` over a logger struct).
+- **D — dependency inversion, enforced by import rules.** The dependency direction is a hard
+  constraint, not a style preference, and it is stated per package and checked by a test rather than
+  trusted to convention (`internal/app/deps_test.go`): `model` imports nothing outside the standard
+  library; the receive-path packages (`framing`, `decode`, `policy`, …) MUST NOT import `oradb`,
+  `writer`, `mirror` or `database/sql`; `app` is the only package allowed to see both halves, which
+  is precisely why the restrictions are machine-checked there. Packages speak to each other through
+  `model`'s value types. **Never relax one of these rules to make a change fit** — a
+  `sql.NullString` or a `time.Time` reaching into the receive path drags the database in and breaks
+  the pointer-free arena rule in the same stroke.
+
+Do not introduce an interface with exactly one implementation and no test double. That is
+speculative indirection, and YAGNI overrules it.
+
+### YAGNI — you aren't gonna need it
+
+Build what the current task needs, and nothing more.
+
+- **No speculative configuration.** No flags, JSON keys, or env vars "for later". Every flag
+  documented under "Commands" exists because something needed it; a new one needs the same
+  justification. Secrets stay out of flags and config files on purpose (see "Credentials").
+- **No abstraction ahead of a second real caller** — no plugin registries, no generic field-mapping
+  frameworks, no provider indirection for a single provider.
+- **No caching, batching, pooling, or metrics subsystem** until a measurement says the simple version
+  is the problem. The small connection pool and the 30-minute connection lifetime have stated
+  reasons (see "Things that will bite you"); they are reasoned settings, not a tuning hobby.
+- **Respect the phasing.** Packages that currently hold only a `doc.go` are specified by
+  `docs/lld/` and scheduled for a named phase. Don't implement one early because it seems adjacent
+  to the task; and when you do build one, build what its LLD section specifies, not a superset.
+- Deleting speculative code is a legitimate change. Leaving a `TODO` for a feature nobody asked for
+  is not.
+
+**What YAGNI does not license.** The protocol and safety checks are not speculation — they exist
+because the failure they prevent is silent. Keep every one of them, and add the matching one when you
+add a decoder:
+
+- Layout assertions reconciling pack(2) field arithmetic against the spec's declared packet length
+  (gate G-LAY-1). A wrong stride decodes the early fields correctly and turns the later ones into
+  noise — nothing alarms.
+- Record counts clamped to the array size, so trailing padding is never decoded into a fabricated
+  security that looks real downstream.
+- Bounds-checked decompression and panic recovery on the packet path: sub-packets are untrusted
+  network input, and one malformed datagram must log an error, not kill the relay.
+- `messageLength` and envelope-cursor validation, which keep a single bad length from misframing
+  every later sub-packet in the buffer.
+- No `os.Exit`/fatal logger outside the command itself (gate G-BLD-3), so deferred cleanup of Oracle
+  sessions and in-flight batches actually runs.
+- Tests that are independent of the code under test: frozen LZO fixtures produced by an outside
+  implementation, and hand-written absolute-offset tables rather than fixtures built by walking the
+  parser's own field order. A test that shares its assumptions with the code agrees with it even when
+  both are wrong — that is exactly how the 213-byte stride survived.
+
 ## Commands
 
 All of these are plain Go — **no cgo, no C compiler, no `liblzo2`** (LZO1Z decompression is a pure Go
