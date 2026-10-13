@@ -30,29 +30,29 @@
 // permitted to call os.Exit, and gate G-BLD-3 enforces that with a source
 // scan.
 //
-// # A note on the timezone database, and OQ-L5
+// # The timezone database, and OQ-L5 -- resolved
 //
-// Vol 0 section 7.2 specifies importing time/tzdata here, so that
-// liveness.tradingWindow.tz resolves without the host supplying a zoneinfo
-// database -- AIX may ship none. That import is NOT present because it does
-// not link in this toolchain:
+// time/tzdata is imported below, which is what Vol 0 section 7.2 and Vol 4
+// section 8.7 specify: liveness.tradingWindow.tz then resolves without the host
+// supplying a zoneinfo database, and AIX may ship none. About 450 KB of pure
+// Go, no cgo.
 //
-//	time/tzdata.init.0: relocation target
-//	time.registerLoadFromEmbeddedTZData not defined
+// This file previously carried eighteen lines explaining why the import was
+// ABSENT -- a link failure, "time.registerLoadFromEmbeddedTZData not defined",
+// reported as reproducing on go1.23.3 for aix/ppc64, linux/amd64 and the native
+// target alike, and as surviving go build -a. P1-11 re-tested every one of those
+// cases and they all SUCCEED: the linkname directives are present in the
+// installed GOROOT, the cross-compile links, and the native binary resolves
+// Asia/Kolkata from the embedded database. Whatever the original failure was, it
+// does not reproduce, so the import is restored and the comment is replaced by
+// this record of why it ever went missing.
 //
-// Reproduced with go1.23.3 on a two-line program with no other dependency,
-// for aix/ppc64, linux/amd64 and the native target alike, and it survives
-// "go build -a", so it is neither a stale cache nor specific to the
-// cross-compile. The push linkname directive is present in the installed
-// time/zoneinfo_read.go, so the source is right and the link step is not.
-//
-// Consequence, which P1-11's LPAR smoke test must settle: the process relies
-// on the HOST for zoneinfo, and config validation currently treats an
-// unresolvable timezone as a hard error. If the LPAR has no zoneinfo
-// database, the process will refuse to start over a feature that only
-// downgrades log severity outside market hours. OQ-L5 notes that failing open
-// -- treating every hour as in-window -- is the safe default; adopting it is
-// a change to section 7.2's stated rule and is left as a decision.
+// That closes OQ-L5 on the build side. Section 7.2's rule -- an unresolvable
+// timezone is a hard error -- therefore stands as written, and OQ-L5's
+// alternative of failing open and treating every hour as in-window is not
+// needed. G-AIX-1 assertion 3 still confirms it on the target, because a
+// successful cross-compile is not proof that the embedded database works at
+// runtime on AIX.
 package main
 
 import (
@@ -63,8 +63,23 @@ import (
 	"os/signal"
 	"syscall"
 
+	// Embeds the IANA database so time.LoadLocation never depends on the host
+	// having one. See the note above: this import was absent for a link
+	// failure that no longer reproduces.
+	_ "time/tzdata"
+
 	"feedvalve/internal/app"
 )
+
+// version is stamped at build time:
+//
+//	go build -trimpath -ldflags "-X main.version=$(git rev-parse --short HEAD)"
+//
+// Vol 4 section 8's deployment topology specifies the artefact as built that
+// way, and nothing existed for the flag to set. It is reported on the startup
+// line so the running process can be matched to a commit, which is the first
+// question a postmortem asks.
+var version = "dev"
 
 func main() {
 	var opts app.Options
@@ -76,6 +91,7 @@ func main() {
 	flag.BoolVar(&opts.DBCheck, "dbcheck", false,
 		"connect, verify a round trip, report the server version, then exit")
 	flag.Parse()
+	opts.Version = version
 
 	// SIGINT and SIGTERM cancel the context rather than killing the
 	// process, so the shutdown path runs. P1-09 adds the ordered drain

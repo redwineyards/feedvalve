@@ -1,0 +1,60 @@
+{
+  "udp": {
+    "listen": ":9000",
+    "readBufferBytes": 655360,
+    "expectedNetId": 8,
+    "sourceAllowList": [],
+    "sourceEnforce": false,
+    "stallBudgetMs": 50
+  },
+
+  "runtime": {
+    "gomaxprocs": 4,
+    "shards": 4,
+    "generalShard": 0,
+    "datagramQueueCapacity": 8192,
+    "expectedRows": 200000
+  },
+
+  "flush": {
+    "windowMs": 200,
+    "maxBatchSize": 1000,
+    "drainTimeoutMs": 5000
+  },
+
+  "writers": {
+    "count": 4
+  },
+
+  "db": {
+    "host": "oracle.internal",
+    "port": 1521,
+    "service": "CDTSPROD",
+    "user": "feedvalve",
+    "connectTimeoutSec": 10,
+    "queryTimeoutSec": 30,
+    "connMaxLifetimeMinutes": 30
+  },
+
+  "stats": {
+    "intervalSec": 60,
+    "logLevel": "info",
+    "eventRatePerMin": 10
+  },
+
+  "liveness": {
+    "heartbeatWarnSec": 12,
+    "heartbeatDownSec": 27,
+    "startupGraceSec": 60,
+    "tradingWindow": {
+      "start": "09:00",
+      "end": "23:55",
+      "tz": "Asia/Kolkata"
+    }
+  },
+
+  "debug": {
+    "traceTranscodes": [],
+    "hexDump": false
+  }
+}

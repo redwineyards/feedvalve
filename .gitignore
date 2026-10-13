@@ -1,0 +1,10 @@
+# Build output. scripts/build-aix.sh writes the AIX/ppc64 artefact set here:
+# one binary plus a test binary per package, which is tens of megabytes of
+# cross-compiled output that must never be committed. The artefacts are
+# reproducible from any commit by running the script.
+/out/
+
+# Native binaries from a bare `go build`.
+/feedvalve
+/feedvalve.exe
+/poc.exe

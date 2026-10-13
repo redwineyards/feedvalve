@@ -2,13 +2,17 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"runtime"
 
 	"feedvalve/internal/config"
 	"feedvalve/internal/destinations"
 	"feedvalve/internal/model"
+	"feedvalve/internal/obs"
 	"feedvalve/internal/oradb"
 )
 
@@ -93,6 +97,19 @@ type Options struct {
 	// DBCheck is -dbcheck: connect, prove a round trip, report the server
 	// version, then exit. Read-only.
 	DBCheck bool
+
+	// Stderr is where the loggers and the stats emission go. Vol 4 section
+	// 6.7: "the entire observability surface is stderr". Injected rather than
+	// read from os.Stderr so the whole lifecycle is testable in-process, which
+	// is what makes the startup-ordering and drain gates possible; nil means
+	// os.Stderr.
+	Stderr io.Writer
+
+	// Version is the build stamp from main.version, reported on the startup
+	// line so a running process can be matched to a commit. Empty is fine --
+	// it reads as "unstamped", which is itself the answer to "which build is
+	// this?"
+	Version string
 }
 
 // Run is the whole process, with main holding nothing but flag parsing and
@@ -134,12 +151,134 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 		return dbCheck(ctx, cfg, out)
 	}
 
-	// The relay itself. P1-09 builds the lifecycle -- startup ordering with
-	// the socket bound last, signal handling, and the ordered drain -- and
-	// the phases after it supply the goroutines to order.
-	return exitf(ExitStartup, "the relay is not built yet: P1-01 to P1-05 deliver the "+
-		"package tree, the value types, the field map and the configuration. "+
-		"Use -selfcheck or -dbcheck; the receive path arrives in Phase 2")
+	return relay(ctx, opts, cfg, dests)
+}
+
+// relay is startup steps 6 to 17 and the ordered shutdown: the lifecycle.
+//
+// The step numbers are Vol 4 section 1.4's, and the ORDER is the contract --
+// consumers before producers, every allocation before the socket, the socket
+// last. Two deviations from that section's numbering are deliberate and
+// marked below.
+func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destinations.Set) error {
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+
+	// Step 9 BEFORE step 6, which is the first deviation. Section 1.4 orders
+	// the loggers at 6 and the registry at 9; nothing in 6 needs the registry,
+	// but the logger wants it, because log_events_suppressed{class} is what
+	// makes the rate limiter visible. Validation -- the reason step 6 is not
+	// earlier still -- already happened at step 4, so moving the registry
+	// ahead of the loggers costs nothing and means there is exactly one
+	// AppLogger for the life of the process instead of an unattached one
+	// replaced moments later.
+	reg := obs.New(obsOptions(cfg, dests))
+	inst := resolveInstruments(reg)
+	reg.SetIntervalSec(cfg.Stats.IntervalSec)
+	// Freeze ends resolution. Every accessor panics afterwards (gate G-OBS-1),
+	// which is what enforces Vol 0 section 8.4's MUST that instruments are
+	// resolved once at startup and never from a hot path.
+	reg.Freeze()
+
+	// Step 6: the loggers. appLogger to stderr, debugLogger gated per
+	// transcode. There is NO packet logger: poc's full-payload logger wrote
+	// several times the wire rate to a world-readable append-only file, and a
+	// secret that lands there is there permanently.
+	lg := obs.NewAppLogger(stderr, obs.ParseLevel(cfg.Stats.LogLevel),
+		cfg.Stats.EventRatePerMin, reg)
+	dbg := obs.NewDebugLogger(stderr, cfg.Debug.TraceTranscodes, cfg.Debug.HexDump)
+
+	// Step 7: the effective configuration, as one INFO line. The single most
+	// useful artifact in a postmortem, and safe to dump wholesale because
+	// Config has no password field at any depth (Vol 0 section 7.5) -- the
+	// password comes only from the environment and never enters Config.
+	lg.Infof("starting feedvalve version=%s goos=%s goarch=%s", versionOf(opts),
+		runtime.GOOS, runtime.GOARCH)
+	lg.Infof("starting with the effective configuration: %+v", cfg)
+
+	// Step 8: GOMAXPROCS, BEFORE the first goroutine, so every goroutine is
+	// scheduled under the intended parallelism.
+	//
+	// NEVER runtime.NumCPU: the LPAR is capped at entitled capacity 4 while
+	// the runtime may observe 32 (ADR-009), and sizing anything from a
+	// detected CPU count would silently over-commit the partition. Gate
+	// G-BLD-3 scans for that call anywhere in the tree.
+	runtime.GOMAXPROCS(cfg.Runtime.GOMAXPROCS)
+
+	// Step 11: the database. sql.Open does not connect, so Open pings under
+	// db.connectTimeoutSec -- turning a bad host, a wrong service name or a
+	// wrong credential into a startup failure rather than a first-write
+	// failure at 09:00:03. The password is read here and never enters Config.
+	//
+	// The deferred Close is registered HERE, at open time, and therefore runs
+	// after the drain in Graph.Run's body. That ordering is the whole reason
+	// the drain is not itself a defer (section 1.1).
+	var db *sql.DB
+	if cfg.HasDB {
+		var err error
+		db, err = openDB(ctx, cfg.DB)
+		if err != nil {
+			return &ExitError{Code: ExitStartup, Err: err}
+		}
+		defer func() {
+			if err := db.Close(); err != nil {
+				lg.Errorf(obsClassStartup, "closing the database: %v", err)
+			}
+		}()
+		lg.Infof("database connected %s", cfg.DB.Describe())
+	}
+
+	// Steps 10 and 12: the derived state and the pre-allocation.
+	g, err := Build(Deps{
+		Cfg: cfg, Store: storeOf(cfg), DB: db, Reg: reg,
+		Log: lg, Debug: dbg, Dests: dests, Stderr: stderr, Inst: inst,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Steps 15 to 17, then the drain.
+	return g.Run(ctx)
+}
+
+// versionOf reports the build stamp, or "unstamped" when nothing set it.
+func versionOf(opts Options) string {
+	if opts.Version == "" {
+		return "unstamped"
+	}
+	return opts.Version
+}
+
+// openDB is oradb.Open behind a variable, so gate G-LIFE-3 -- "OpenDB
+// succeeds; the socket bind is rigged to fail; run returns a non-nil error AND
+// db.Close() was called" -- can be exercised without an Oracle instance. Tests
+// replace it; nothing else may.
+//
+// The seam is here rather than in oradb because what G-LIFE-3 tests is the
+// LIFECYCLE's ordering: that the deferred Close registered at step 11 still
+// runs when step 16 fails. oradb's own round trip is covered by its stub-driver
+// tests and by -dbcheck.
+var openDB = oradb.Open
+
+// storeOf publishes a configuration into a Store so the generation gauge and
+// the Phase 5 reload path have one to swap.
+//
+// The second deviation from section 1.4, and a small one: the section has the
+// Store existing from step 3. config.Store's publish is unexported, so the
+// only way in is Swap, which is also where validation against the previous
+// generation lives. Phase 5 owns the reload; this just establishes generation 1
+// so config_generation reads 1 rather than 0 on a process that never reloaded.
+func storeOf(cfg *config.Config) *config.Store {
+	var s config.Store
+	if _, err := s.Swap(cfg); err != nil {
+		// Unreachable: cfg has already passed the same rule set at step 4.
+		// Returning the empty store rather than panicking keeps a validation
+		// surprise out of the startup path.
+		return &s
+	}
+	return &s
 }
 
 // loadAll resolves the configuration and the field map, then validates them

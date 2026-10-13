@@ -40,7 +40,7 @@ Counts taken from Volume 0 by command, not from memory:
 | Type declarations in the inventory | **24** — of which **16** are `model`'s | §3 |
 | Structs with a byte-exact pinned size | **7** | §3.4–3.8, §9.5.2 |
 | Configuration keys | **62** — 58 in the config file, 4 in the mapping file | §7.2 |
-| Instruments | **129** | §8.2 + §8.2a |
+| Instruments | **131** in 129 table rows | §8.2 + §8.2a |
 | Build-time gates (unbypassable) | **9** | Vol 4 §7.1 |
 | Config-load gates | **2** | Vol 4 §7.2 |
 
@@ -76,7 +76,7 @@ P1-01 scaffolding
         ├─→ P1-04 destinations + mapping file     │
         │     └─→ P1-05 config (65 keys)          │
         │           ├─→ P1-06 -selfcheck          │
-        │           └─→ P1-07 obs (129 instr.) ─┐ │
+        │           └─→ P1-07 obs (131 instr.) ─┐ │
         │                                        │ │
         ├─→ P1-08 QD ring (standalone)           │ │
         │                                        ↓ │
@@ -185,6 +185,13 @@ a destination whose columns exceed `imageSize` is rejected; a ninth contributor 
 **Gates.** G-LAY-3 (build-time, one-sided `const _ = uint(imageSize - destImageLen)` per compiled-in
 destination).  **Depends on.** P1-03.  **Rough:** 2–3 days.
 
+> **Where it lives, settled in P1-08: `internal/framing`.** This is the only Phase 1 card whose
+> heading named no package, and no package claimed the ring — §1.1's tree and §1.2's ownership table
+> listed fourteen and mentioned no queue. Both now name `framing`, which is the receive-path package
+> nearest the socket and the one the receiver goroutine that owns the producer index runs in. See
+> Vol 0 §9.5 deltas **D0-6** (the wake send is unconditional), **D0-7** (single *producer* is
+> non-negotiable too), and **D0-8** (the enqueue budget lives in a wrapper, not in the publish).
+
 **Note.** The pre-validation metadata lives **here**, not in `oradb` — `mirror` must be able to read
 it, and `mirror` may not import the database packages. That constraint is why these fields are on
 `Column` and not somewhere more natural-looking.
@@ -255,7 +262,7 @@ in Phase 2; the config-side half lands here.)*
 
 ### P1-07 · `obs` — the instrument ledger
 
-**Scope.** The three instrument shapes of Vol 0 §8.1 and all **129** instruments of §8.2 + §8.2a.
+**Scope.** The three instrument shapes of Vol 0 §8.1 and all **131** instruments of §8.2 + §8.2a.
 
 | Shape | Semantics |
 |---|---|
@@ -268,7 +275,7 @@ in Phase 2; the config-side half lands here.)*
 - The grouped 60-second emission line of Vol 4 §6.1.
 - The two loggers `appLogger` and `debugLogger`.
 
-**Done when.** All 129 instruments are declared and reachable; one emission produces the specified
+**Done when.** All 131 instruments are declared and reachable; one emission produces the specified
 grouped line; a benchmark shows **zero allocations** on the counter and max paths.
 
 **Depends on.** P1-03, P1-05.  **Rough:** 2–3 days.
@@ -279,7 +286,7 @@ grouped line; a benchmark shows **zero allocations** on the counter and max path
 
 ---
 
-### P1-08 · QD — the lock-free SPSC datagram ring
+### P1-08 · QD — the lock-free SPSC datagram ring (in `framing`)
 
 **Scope.** The single-producer/single-consumer ring of Vol 0 §9.5, as a standalone, independently
 tested primitive.
@@ -324,7 +331,35 @@ this code under `-race` is on the dev host, which argues for doing it in isolati
 cleanup observed to run** (assert it, don't eyeball it); a forced error in construction unwinds the
 partially-built graph without panicking.
 
-**Gates.** G-BLD-3 (half — the fatal-logger scan).  **Depends on.** P1-05, P1-07.  **Rough:** 1–2 days.
+**Gates.** G-BLD-3 — **both halves**, not just the fatal-logger scan: P1-09 also landed the
+`runtime.NumCPU` ban and a positive check that `GOMAXPROCS` is set from configuration, since a gate
+that only forbids `NumCPU` passes on a process that never sets `GOMAXPROCS` at all. Plus G-LIFE-1,
+G-LIFE-2, G-LIFE-3 and G-LIFE-5.  **Depends on.** P1-05, P1-07.  **Rough:** 1–2 days.
+
+> **Delivered in P1-09, and what is deferred.** The lifecycle orders what exists: the loggers, the
+> instrument registry, the database handle, QD, the decoder, the stats goroutine and the listener.
+> The shard and writer pools are Phase 3 and Phase 4; the slots they take in both sequences are
+> marked in `internal/app/lifecycle.go`. The receiver reads, stamps `RecvMono` and publishes to QD --
+> which is the part of it the LIFECYCLE owns -- while the envelope split, the source check, the
+> oversize rule and the gap detector are Vol 1's and arrive with Phase 2 through the `Deps.Decode`
+> seam.
+>
+> **G-BLD-3's scan excludes `poc/`, and the exclusion is the point**: `poc/gobrdclnt.go:24` calls
+> `os.Exit(1)`, and that call is the regression the gate exists to prevent recurring. The gate
+> protects the replacement, so it scans the replacement. It is an AST scan and not a grep because
+> grepping `internal/` and `cmd/` for `os.Exit` today returns six hits, every one of them in a
+> comment explaining why `os.Exit` must not be called.
+>
+> **Gates G-LIFE-1, -2, -3 and -5 all landed here** rather than waiting for P1-10, because each one
+> tests an ordering the lifecycle fixes and none of them needs a shard or a writer. G-LIFE-1
+> (socket bound last) and G-LIFE-3 (a bind failure still closes the database) are mutation-verified,
+> as is the QD drain stage. G-LIFE-4 needs the writer pool and stays in Phase 4.
+>
+> **`-race` earned its keep immediately.** It found a real data race in the lifecycle: `Graph.conn`
+> is written by `bind` on the lifecycle goroutine and read by the receiver, the teardown and
+> `LocalAddr` from others. Nothing about it was visible in behaviour, and the AIX target has no race
+> detector -- so without the toolchain fix made in P1-08 it would have shipped. See §7's note on
+> `CC`.
 
 **Why the lifecycle belongs at the start and not the end.** You need a clean, provable shutdown
 before you can test anything downstream of it. Retrofitting ordered drain onto a running pipeline is
@@ -354,6 +389,41 @@ restored. A gate that has never been seen to fail has not been tested.
 
 **Depends on.** P1-02, P1-03, P1-09.  **Rough:** 1 day.
 
+> **What P1-10 actually found, and what it built.** An inventory against §7.1 said most of this was
+> already done: **G-LAY-2** (all seven types, by P1-03), **G-LAY-3**, **G-BLD-2**, **G-BLD-3** and
+> **G-DEP-1** were complete, several over-delivered. Genuinely unbuilt were **G-BLD-1** (no reference
+> in any Go source), **G-DEP-2** and **G-DEP-3** (comment-only) — plus the tree-wide single-consumer
+> scan that `internal/framing/ring_source_test.go` had handed forward in code, which only became
+> possible once P1-09 created the consumer.
+>
+> **The real gap was the "done when".** Most of these gates are constant expressions, and a constant
+> expression cannot be mutation-tested from inside `go test`: breaking it breaks the build. So none of
+> G-LAY-2, G-LAY-3, G-BLD-1 or G-BLD-2 had ever been *demonstrated* failing by anything reproducible —
+> the verification existed only as sentences in commit messages.
+> `TestEveryBuildTimeGateCanBeSeenToFail` closes it with `go build -overlay`: for each gate it writes
+> a mutated copy of the real source into `t.TempDir()` and builds the **real** package against it,
+> asserting the build fails and that the complaint names the right file. Real compiler, real types,
+> real gate, working tree never touched. Twelve rows today, one per build-time gate in the tree,
+> including the ones P1-07 and P1-08 added that §7.1 does not list.
+>
+> Three guards keep the harness itself honest, each of them a lesson from a gate that nearly passed
+> vacuously: the clean build of every target package must succeed first (or a broken overlay path
+> reports every gate as firing while nothing is tested); the mutation must be shown to have applied
+> (or a renamed constant turns a row into a silent no-op); and a deliberately **inert** mutation must
+> still compile (or the harness cannot tell a firing gate from its own machinery misbehaving).
+>
+> **Two small gaps fell out of counting.** `TestArenaTypesArePointerFree` claimed G-PTR-1 but covered
+> four types where §7.3.6 names five — `Contribution` was only transitively covered and `SessionEvent`
+> was covered by nothing; both are now explicit. And **G-SC-1 had no label**: it was fully implemented
+> in P1-06 as `TestEachRuleFiresExactlyOnce`, so a reviewer grepping for the gate id found nothing.
+>
+> **G-DEP-3 passes vacuously and the test says so.** Vol 0 §2 records that `lzo1z` was removed from
+> the module and its output frozen in `poc/testdata/lzo_fixtures.json`, so the gate now guards against
+> *reintroduction* rather than against leakage into the binary. It fires the day somebody runs the
+> fixture-regeneration recipe and forgets to drop the requirement again. A positive companion was
+> added alongside it, because G-DEP-2 and G-DEP-3 both only forbid: the module has exactly one
+> non-stdlib requirement, and a second should be somebody's decision.
+
 ---
 
 ### P1-11 · Cross-compile and LPAR smoke — *the exit criterion*
@@ -368,6 +438,34 @@ restored. A gate that has never been seen to fail has not been tested.
 5. No cgo in the resulting binary.
 
 **Depends on.** All.  **Rough:** 1 day *plus LPAR access*.
+
+> **STATUS: blocked on LPAR access. Everything that does not need the hardware is done.**
+>
+> All five assertions above are specified *on the target*, and none can be made from a
+> windows/amd64 host: the binary cannot execute, big-endian behaviour cannot be observed on a
+> little-endian machine, and `udp_recvspace` is an AIX tunable. What is ready:
+>
+> - `scripts/build-aix.sh` produces the artefact set Vol 4 §8 names — one static binary built
+>   `-trimpath -ldflags "-X main.version=…"`, `config.json`, the `deps.txt` golden list — plus the
+>   cross-compiled test binaries for **G-AIX-1**. All 14 packages cross-compile, gated by
+>   `TestG_AIX_1_TestBinariesCrossCompileForTheTarget` so a test-only import that does not exist on
+>   aix/ppc64 breaks the build host rather than the shipment.
+> - `scripts/lpar-smoke.sh` encodes the five assertions **in dependency order**, so each failure says
+>   what is wrong rather than what noticed it.
+> - **Assertion 4 is already half-proven off-target.** §7.5 grounds it in `unsafe.Sizeof` being
+>   architecture-dependent, which makes it a compile-time property the cross-compile evaluates under
+>   ppc64's own rules. The LPAR adds the runtime half: `TestMemoryFigures` and the pointer-free walk.
+> - **Assertion 4 of this card's list is resolved** — see seam 4; `time/tzdata` is imported.
+> - **The on-target suite actually runs.** Measured: before P1-11 the cross-compiled test binaries
+>   produced ten failures and one vacuous pass when run away from the source tree, which is the LPAR's
+>   condition. The source-scanning gates now skip, with a reason, and a counter-test asserts they do
+>   *not* skip on the build host — because a package of skips reports `ok` exactly like a package of
+>   passes.
+>
+> **A prerequisite this card does not state:** assertion 2 needs a **reachable Oracle**. Rule V-DB1
+> requires a `db` object in run mode and startup step 11 pings it, so "the binary starts" cannot
+> happen without one. `-selfcheck` is the only item needing neither password nor network, which is
+> why the smoke script runs it first and `-dbcheck` before the full start.
 
 > **Start the access request now.** This is the longest-lead item in Phase 1 and the one most likely
 > to slip. Everything else is keyboard work; this one needs another team.
@@ -392,19 +490,29 @@ Recorded here so they are decided deliberately rather than discovered.
 
 | # | Seam | Resolution |
 |---|---|---|
-| **1** | **G-LAY-2 lists 6 types; there are 7.** Vol 4 §7.1 predates the QD merge that added `Datagram` | P1-10 implements all 7. Vol 4's table should be corrected to match on the next documentation pass |
+| **1** | ~~**G-LAY-2 lists 6 types; there are 7.**~~ **CLOSED.** Vol 4 §7.1 predated the QD merge that added `Datagram` | **P1-03 implemented all 7**, not P1-10 — `internal/model/layout.go` pins every total and every field offset. P1-10 corrected Vol 4's table and added the mutation rows that demonstrate the pin firing for `Datagram` |
 | **2** | **Read buffer vs. `Datagram.Buf`.** Vol 4 F6 specifies a 64 KB read buffer (so oversize is distinguishable from full) and trims to 512. Vol 0 §9.5.2 sizes `Datagram.Buf` at 1024 "so an oversize datagram is carried intact and diagnosable". A datagram between 1024 B and 64 KB would be truncated on the copy into QD | **Phase 2 decision**, in the receive path. Flagged here because it constrains `Datagram`, which P1-03 freezes. The 1040 B size itself is not in question — only what the receiver does with an oversize frame before enqueueing |
 | **3** | **G-SC-2 spans phases.** Its transcode-resolution half needs the decoder registry | Config-side half in P1-06; decoder-side half in Phase 2 |
-| **4** | **OQ-L5 — zoneinfo on AIX** | Import `time/tzdata` unconditionally (~450 KB, pure Go). P1-11 assertion 4 confirms. Failing open — treating every hour as in-window — is the safe default |
+| **4** | ~~**OQ-L5 — zoneinfo on AIX**~~ **CLOSED on the build side** | `time/tzdata` is now imported unconditionally (~450 KB, pure Go), which is what Vol 0 §7.2 and Vol 4 §8.7 always specified. It had been left out over a link failure (`time.registerLoadFromEmbeddedTZData not defined`) that **P1-11 re-tested and could not reproduce** — go1.23.3 links it for aix/ppc64, linux/amd64 and native, surviving `go build -a`, and the native binary resolves `Asia/Kolkata`. §7.2's hard-error rule therefore stands and the fail-open fallback is not needed. G-AIX-1 assertion 3 still confirms it on the target, because a cross-compile is not proof of runtime behaviour on AIX |
 
 ---
 
 ## 7. Exit criteria, restated as a checklist
 
 - [ ] `go build ./...`, `go vet ./...`, `go test ./...` all green on the dev host
-- [ ] `go test -race ./internal/...` green (QD property test included)
+- [ ] `go test -race ./internal/...` green (QD property test included) — **requires `CC` pointed at
+      clang on the Windows dev host**: `CC=/c/msys64/clang64/bin/clang.exe`, with
+      `/c/msys64/clang64/bin` on `PATH`. The mingw64 gcc 16.1.0 installed there has a broken
+      preprocessor driver (`gcc -E` emits nothing and exits 1, while `gcc -c` works), and cgo needs
+      `gcc -E -dM`, so `-race` fails with a bare `cgo.exe: exit status 2`. Reinstalling gcc does not
+      fix it and the Go version is irrelevant — go1.23.3 and go1.25.0 fail identically. Diagnosed
+      and worked around in P1-08.
 - [ ] `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go build ./...` green; zero cgo in `go list -deps`
-- [ ] All **8** Phase 1 build-time gates demonstrated failing, then restored
+- [ ] All **8 of §7.1's 9** build-time gates demonstrated failing, then restored — the ninth is
+      **G-LAY-1**, which needs the Phase 2 decoders before its stride arithmetic constrains
+      anything. (§2's "9" counts the contract; this counts the Phase 1 deliverable. Neither figure
+      is wrong.) Automated in P1-10 by `TestEveryBuildTimeGateCanBeSeenToFail`, which mutates each
+      gate through a `go build -overlay` and asserts the build fails
 - [ ] **G-SC-1** green, with one deliberately-broken config per rule id
 - [ ] All **7** size pins hold, verified **on the LPAR**, big-endian
 - [ ] `-selfcheck` runs with no password and no network
@@ -420,3 +528,13 @@ Every count in §2 was taken from `docs/lld/00-foundations.md` by command at the
 from recollection. Three figures quoted in earlier discussion were wrong and are corrected here:
 config keys **65** (not 77), instruments **129** (not 128), and size-pinned structs **7** (not 6).
 The type count, **24**, was right.
+
+> **A fourth correction, found in P1-07: 129 was a row count.** §8.2 holds 69 table rows and §8.2a
+> holds 60, which is where 129 came from — but two rows name several instruments each
+> (`gap_audit_agree` / `gap_audit_disagree`, and `writes_attempted` / `writes_succeeded` /
+> `writes_failed`) and `decompress_failed` appears in both tables, so there are **131** distinct
+> instruments across those 129 rows. The registry declares 131 and §2 now says both numbers, because
+> a reviewer checking G-OBS-3 against the old figure would conclude two instruments were missing.
+> Beware also that a naive grep of §8.2a returns 62 rather than 60: its closing collision sub-table
+> begins two of its rows with a backticked instrument name. See Vol 0 §8.2a for the full
+> reconciliation and the four other points settled with it.

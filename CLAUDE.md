@@ -131,7 +131,15 @@ port, see `poc/decompress.go`).
 - Build for AIX: `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go build -o gobrdclnt ./poc`. Since the cgo
   dependency is gone this now **cross-compiles from any host** — it no longer has to be built on an
   AIX machine. `poc/build_aix.sh` predates this and still documents the old cgo/`liblzo2`
-  native-build requirements; it is stale.
+  native-build requirements; it is stale and **superseded by `scripts/build-aix.sh`**, which builds
+  the real binary (`./cmd/feedvalve`, `-trimpath -ldflags "-X main.version=…"`) plus the artefact set
+  Vol 4 §8 names: `config.json`, the `deps.txt` golden list, and the cross-compiled test binaries
+  gate G-AIX-1 ships to the LPAR.
+- Deploy and smoke-test on the target: `scripts/lpar-smoke.sh`, which runs **on the LPAR** and encodes
+  P1-11's five assertions in dependency order — `-selfcheck` (needs no password, no network, no
+  database), the test binaries, `-dbcheck`, the full start/SIGTERM cycle, then the host checks. It
+  exits non-zero on any failure and reports a check it could not make as `SKIP` rather than `FAIL`,
+  because an assertion that could not be made is not one that failed.
 
 ## Architecture
 

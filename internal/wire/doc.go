@@ -21,5 +21,9 @@
 //
 // Carried over from poc/exchange_communication.go and poc/reader.go.
 //
-// Specified by docs/lld/01-receive-decode.md. Built in Phase 2.
+// The protocol constants and their build-time pins (gate G-BLD-1) landed in
+// P1-10; they are facts about the wire format and needed no decoder. The struct
+// declarations, the fieldReader cursor, hexDump and the pack(2) layout
+// assertions are specified by docs/lld/01-receive-decode.md and arrive in
+// Phase 2 with the decoders that constrain them (gate G-LAY-1).
 package wire

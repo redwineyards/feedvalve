@@ -26,6 +26,15 @@ func TestArenaTypesArePointerFree(t *testing.T) {
 		{"UpdateUnit", reflect.TypeOf(UpdateUnit{})},
 		{"BatchRow", reflect.TypeOf(BatchRow{})},
 		{"Datagram", reflect.TypeOf(Datagram{})},
+		// Contribution and SessionEvent were missing until P1-10 found the
+		// gap while inventorying the gates. Vol 4 section 7.3.6 names five
+		// types and this covered four, substituting Datagram -- which does
+		// belong here, since QD's 8192 slots are one pointer-free allocation
+		// the collector must never trace. Contribution was at least
+		// transitively covered through UpdateUnit.Contribs; SessionEvent was
+		// covered by nothing at all.
+		{"Contribution", reflect.TypeOf(Contribution{})},
+		{"SessionEvent", reflect.TypeOf(SessionEvent{})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertPointerFree(t, tc.typ, tc.name)

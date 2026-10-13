@@ -361,6 +361,34 @@ const (
 )
 ```
 
+> **Delta D4-10, settled in P1-09: four departures from this sketch, all in the same direction.**
+>
+> 1. **`Build(Deps)` rather than four positional parameters.** It needs the two loggers, the
+>    destination table, the stderr writer, the resolved instrument handles and the Phase 2 decode
+>    seam as well — the sketch predates P1-07 — and a nine-field positional signature is one a future
+>    addition can silently reorder.
+> 2. **`db` is a `*sql.DB`, not a `*oradb.DB`.** No such type exists: `oradb` exposes
+>    `Open(ctx, DBSettings) (*sql.DB, error)`, because the package is the connection *policy* — pool
+>    sizes, timeouts, DSN hygiene — and not a wrapper type.
+> 3. **`Build` starts no goroutine.** The sketch has it starting the writer and shard pools, which
+>    arrive in Phase 3. Keeping it allocation-only means a failure between `Build` and `Run` has
+>    nothing running to stop, which is what makes the unwind that gate **G-LIFE-3** tests simple
+>    enough to be obviously correct. The same argument will apply to those pools: start them in
+>    `Run`, where the teardown that must stop them also lives.
+> 4. **The registry (step 9) is constructed before the loggers (step 6).** Nothing in step 6 needs
+>    the registry but the logger *wants* it, because `log_events_suppressed{class}` is what makes the
+>    rate limiter visible. Validation — the reason step 6 is not earlier still — already happened at
+>    step 4, so the swap costs nothing and leaves exactly one `AppLogger` for the life of the process
+>    instead of an unattached one replaced moments later.
+>
+> P1-09 also adds a `Decode func(*model.Datagram) error` field to `Deps`: the seam Phase 2 fills with
+> framing, the decoder registry and the fan-out. Until then the decoder drains and discards — which
+> still has to *take* each datagram, or shutdown abandons a ring with items in it.
+>
+> **`runtime.GOMAXPROCS` is called from `relay`, not from `main`.** Step 8 requires it before the
+> first goroutine, and `relay` starts none before it; `main` holds only flag parsing, the signal
+> context and the exit-code mapping, which is what §1.1 asks of it.
+
 ---
 
 ## 2. Configuration reload
@@ -1295,6 +1323,25 @@ Three rules make that workable without losing trendability:
 All lines of one emission share the same timestamp and the same `gen=` (the config generation), so
 they are a single snapshot that can be reassembled by grep. Recorded as delta **D4-6**.
 
+> **Delta D4-7, settled in P1-07: one timestamp layout, and it is this one.** The example line above
+> renders a date as `2026-09-24`, with hyphens. `poc`'s `appLogger` uses `log.LstdFlags`, which
+> renders `2026/09/24` with **slashes** — so as written, the stats line and every WARN beside it
+> would not share a format, and the grep correlation this section depends on could not work. Since
+> §6.7 leaves an operator no other way to join a log event to a trend, the two have to agree, and
+> this is the only place in the contract where a timestamp is actually written out. `obs` therefore
+> uses `2006-01-02 15:04:05.000000` for **both** paths: the emission builds it in place with
+> `AppendFormat` (no `log.Printf`, which allocates and would fail G-OBS-2), and `appLogger` runs with
+> `log.Logger` flags set to zero and writes the same layout by hand. `poc`'s slashes were the
+> standard library's default rather than a decision. A test asserts a log line's prefix parses with
+> the emission layout, so the two cannot drift again.
+>
+> Two further corrections to the example line itself, both settled in P1-07: it writes `uptime_s=`
+> where the ledger name is **`uptime_seconds`** (Vol 0 §8.2a, delta D0-3 — the ledger wins, because
+> G-OBS-3 round-trips emitted names against it), and it shows `gen=1` alongside
+> `config_reload_rejected` and a `config_generation=3`, which cannot all hold at once. The prose is
+> authoritative: `gen=` **is** the config generation, read from the `config_generation` gauge, so
+> there is one source for it and the line is internally consistent.
+
 **Cost.** ~200 atomic loads and one `strconv` pass per value, once a minute, on a goroutine that is
 otherwise asleep. Unmeasurable against a 4-way LPAR.
 
@@ -1476,9 +1523,22 @@ everything in §7.3.6 outside the four above, plus §7.2, §7.4, §7.5, §7.6.
 | ID | Protects | Mechanism | Would have caught |
 |---|---|---|---|
 | **G-LAY-1** | Vol 1 — every decoder's pack(2) arithmetic reconciles with its declared packet length (bible §2.3, Part V) | One constant expression per decoder, in the style of `mbpLayoutCheck` (`poc/exchange_communication.go:132-139`): `const slack = declared - (hdr + fixed + n*stride); const _ = uint(slack) + uint(-slack)` — compiles only when `slack == 0` | **7208's 213-byte stride.** The bug is *subtly* wrong, not obviously wrong: `token` and everything before record offset 17 still decode correctly while `openPrice`, `highPrice` and `lowPrice` become noise and `records[1]` starts a byte early (bible §4.8, Appendix B item 1, CLAUDE.md). Nothing alarms |
-| **G-LAY-2** | Vol 0 §2 rule 7 — every fixed-size Go type's total is pinned | `const _ = uint(unsafe.Sizeof(Entry{}) - entrySize) + uint(entrySize - unsafe.Sizeof(Entry{}))` for `Entry` 424, `UpdateUnit` 360, `Contribution` 24, `BatchRow` 288, `MsgHeader` 32, `SessionEvent` 16. `unsafe.Sizeof` is a compile-time constant and does **not** make the build cgo-dependent | A field inserted without updating the explicit `_ [n]byte` padding, which silently changes every memory figure *and* desynchronises Vol 0's offset tables from the compiler — the exact drift Vol 0 §2 rule 6 exists to prevent |
+| **G-LAY-2** | Vol 0 §2 rule 7 — every fixed-size Go type's total is pinned | `const _ = uint(unsafe.Sizeof(Entry{}) - entrySize) + uint(entrySize - unsafe.Sizeof(Entry{}))` for **all seven** size-pinned types: `Entry` 424, `UpdateUnit` 360, `Contribution` 24, `BatchRow` 288, `MsgHeader` 32, `SessionEvent` 16 and **`Datagram` 1040** — this list named only the first six, because it predates the QD merge that added the seventh (§9.5.2). Corrected in P1-10; P1-03 had already implemented all seven, and every field **offset** as well as every total, because a struct can keep its size while two fields swap places. `unsafe.Sizeof` is a compile-time constant and does **not** make the build cgo-dependent | A field inserted without updating the explicit `_ [n]byte` padding, which silently changes every memory figure *and* desynchronises Vol 0's offset tables from the compiler — the exact drift Vol 0 §2 rule 6 exists to prevent |
 | **G-LAY-3** | Vol 0 §4.7 layer 1 — ASM-16b at build time | One-sided per compiled-in destination: `const _ = uint(imageSize - destImageLen)`. A negative constant converted to `uint` is a compile-time error | A destination's declared columns growing past `Entry.Image`'s 256 bytes and silently overwriting the neighbouring arena slot. Note the **one-sided** form is correct here: the rule is `≤`, not `==` |
 | **G-BLD-1** | Vol 1 — the protocol constants (bible Appendix A) | Constant expressions pinning `broadcastDataPrefixLen == 8`, `bcastHeaderSize == 40`, `messageHeaderSize == 40`, `innerMessageHeaderSize == 40`, `maxPackedDataLen == 512`, `maxDatagramLen == 516`, `msErrorResponseLen == 182` | A "tidy-up" that computes the prefix length from a struct instead of pinning it to 8 — bible §3.4 calls the prefix "the single most common decoding error", and getting it wrong shifts **every** field by 8 bytes |
+> **Delta D4-11, settled in P1-10: G-BLD-1's constants are spelled `BroadcastHeaderSize`, not
+> `bcastHeaderSize`, and they are exported.** The long form is what `poc` uses and what
+> `internal/wire/doc.go`'s own list of what the package owns already said; matching the package beat
+> matching this table's abbreviation. They are capitalised because `framing` and `decode` read them in
+> Phase 2, the same choice `model` made for `MaxDestinations`. `MaxDatagramLen` is **derived** as
+> `2 + 2 + MaxPackedDataLen` rather than written as 516, so the envelope arithmetic and the declared
+> total have to agree — and the gate asserts they do.
+>
+> Note also that `internal/app` had a local `maxDatagramLen = 65536`, which is the *read buffer* and a
+> different quantity entirely. It was renamed `readBufferLen` in P1-10, before `app` imports `wire` in
+> Phase 2 and one word starts meaning both 516 and 65536. `poc` had already made that distinction
+> with two names.
+
 | **G-BLD-2** | Vol 0 §3.0 — the build-time constants | Pin `maxDestinations == 3`, `maxContributors == 8`, `maxColumns == 64`, `unitBlobSize == 256`, `imageSize == 256` | A change to `maxContributors` made to fix one destination, silently altering `Entry`'s size and every memory figure. ADR-L03 raised it from 4 to 8 for a reason; the next change must be as deliberate |
 | **G-BLD-3** | **C-1** — `os.Exit` skips every defer; and **ADR-009** — nothing is sized from a detected CPU count | A `go/ast` source scan, run as a test, failing on (a) any `log.Fatal*`, `logger.Fatal*`, `os.Exit` or `runtime.Goexit` outside `cmd/feedvalve/main.go`, and (b) **any reference to `runtime.NumCPU` anywhere**, which no package legitimately needs (§8.4) | **The regression CLAUDE.md is written about.** `poc` was restructured specifically because `appLogger.Fatalf` skipped the `defer` that closed the database (`poc/gobrdclnt.go:19-28`). With four Oracle sessions and eight in-flight batches, one reintroduced `Fatalf` in an error path nobody exercises leaves sessions open on every terminal condition. Also catches the literal reading of HLD §10.2's "FATAL-then-exit" (delta D4-2) |
 | **G-DEP-1** | Vol 0 §1.3 — the import-direction rule | Table-driven test shelling `go list -deps <pkg>` for each of `model`, `wire`, `lzo`, `framing`, `decode`, `destinations`, `policy`, failing on any of `database/sql`, `github.com/sijms/go-ora/v2`, `feedvalve/internal/oradb`, `feedvalve/internal/writer`. **`mirror` additionally fails on `net`** | A well-intentioned refactor at 03:00 that imports `oradb` into `decode` "just for the error type", re-coupling the receive path to the database and breaking the property HLD §7.3 depends on and states only in prose. This is the only mechanism that survives such a refactor |
@@ -1675,7 +1735,7 @@ becomes "cannot be loaded at all".
 
 | ID | Gate | Specification |
 |---|---|---|
-| **G-AIX-1** | Cross-compile the test binaries (`go test -c -o … ./internal/...`) with `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64` and run them **on the LPAR** | Five assertions no amd64 run can make |
+| **G-AIX-1** | Cross-compile the test binaries (`go test -c -o … ./internal/...`) with `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64` and run them **on the LPAR** | Five assertions no amd64 run can make. **Phase 1 owns 3, 4 and 5**; assertion 1 needs the Phase 2 decoders and assertion 2 the Phase 3 mirror. P1-11 automated the *preparation* (`TestG_AIX_1_TestBinariesCrossCompileForTheTarget`) and made the suite survive having no source tree, which is the target's condition — the scans skip there and a counter-test proves they do not skip on the build host |
 
 The five, in order of value:
 
