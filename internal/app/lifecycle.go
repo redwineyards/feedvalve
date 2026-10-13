@@ -260,7 +260,6 @@ func (g *Graph) sampleGauges() {
 	in := g.inst()
 	in.configGeneration.Store(int64(g.deps.Store.Gen()))
 	in.writersConfigured.Store(int64(g.deps.Cfg.Writers.Count))
-	in.qdWakeParked.Add(0) // owned by the decoder; see Parks below
 	// The ring's own counters are plain numbers, not instruments: the ledger
 	// assigns qd_wake_parked to the decoder, so the decoder's handle reports
 	// it rather than the ring writing it directly.

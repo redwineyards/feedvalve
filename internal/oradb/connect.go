@@ -105,7 +105,10 @@ func Check(ctx context.Context, s DBSettings) (version string, err error) {
 	// handshake: a ping can succeed against a session that cannot execute.
 	var one int
 	if err := db.QueryRowContext(queryCtx, "SELECT 1 FROM dual").Scan(&one); err != nil {
-		return "", fmt.Errorf("round trip to %s: %w", s.Describe(), redactDSN(err, "", "", s))
+		// No redactDSN here: with no dsn and no password to substitute it
+		// returns err untouched, which reads as a control while being none.
+		// Describe() is what keeps this line safe.
+		return "", fmt.Errorf("round trip to %s: %w", s.Describe(), err)
 	}
 	if one != 1 {
 		return "", fmt.Errorf("round trip to %s returned %d, want 1", s.Describe(), one)

@@ -223,14 +223,15 @@ func validateDB(c *Config, p *problems) {
 		checkRange(p, c, r)
 	}
 
-	// V-DB2.
-	for key, v := range map[string]string{
-		"db.host":    c.DB.Host,
-		"db.service": c.DB.Service,
-		"db.user":    c.DB.User,
+	// V-DB2. A slice, not a map: map iteration is randomised, and these
+	// problems are read by an operator who may be diffing two runs.
+	for _, f := range []struct{ key, val string }{
+		{"db.host", c.DB.Host},
+		{"db.service", c.DB.Service},
+		{"db.user", c.DB.User},
 	} {
-		if v == "" {
-			p.add(RuleDBFields, "%s is required when a db object is present", key)
+		if f.val == "" {
+			p.add(RuleDBFields, "%s is required when a db object is present", f.key)
 		}
 	}
 
@@ -270,13 +271,13 @@ func validateLiveness(c *Config, p *problems) {
 			l.HeartbeatDownSec, l.HeartbeatWarnSec)
 	}
 
-	// V-TW1.
-	for key, v := range map[string]string{
-		"liveness.tradingWindow.start": l.TradingWindow.Start,
-		"liveness.tradingWindow.end":   l.TradingWindow.End,
+	// V-TW1. Ordered, for the same reason as V-DB2 above.
+	for _, f := range []struct{ key, val string }{
+		{"liveness.tradingWindow.start", l.TradingWindow.Start},
+		{"liveness.tradingWindow.end", l.TradingWindow.End},
 	} {
-		if _, err := time.Parse("15:04", v); err != nil {
-			p.add(RuleTradingTimes, "%s is %q, want HH:MM", key, v)
+		if _, err := time.Parse("15:04", f.val); err != nil {
+			p.add(RuleTradingTimes, "%s is %q, want HH:MM", f.key, f.val)
 		}
 	}
 

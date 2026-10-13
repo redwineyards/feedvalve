@@ -1,6 +1,9 @@
 package destinations
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // ColKind says how the writer converts an image field at bind time. The image
 // itself holds WIRE FORM -- big-endian, wire width, unscaled, unconverted
@@ -34,32 +37,31 @@ const (
 	KindGroup
 )
 
-var kindNames = map[string]ColKind{
-	"long":     KindLong,
-	"short":    KindShort,
-	"char1":    KindChar1,
-	"double":   KindDouble,
-	"text":     KindText,
-	"time1980": KindTime1980,
-	"group":    KindGroup,
+// kindNames is indexed BY the enum, so the declaration order is the slot order
+// and one table serves both directions.
+var kindNames = [...]string{
+	KindLong:     "long",
+	KindShort:    "short",
+	KindChar1:    "char1",
+	KindDouble:   "double",
+	KindText:     "text",
+	KindTime1980: "time1980",
+	KindGroup:    "group",
 }
 
 func (k ColKind) String() string {
-	for name, kind := range kindNames {
-		if kind == k {
-			return name
-		}
+	if int(k) < len(kindNames) {
+		return kindNames[k]
 	}
 	return fmt.Sprintf("ColKind(%d)", uint8(k))
 }
 
 // parseKind resolves a mapping-file kind name.
 func parseKind(s string) (ColKind, error) {
-	k, ok := kindNames[s]
-	if !ok {
-		return 0, fmt.Errorf("unknown column kind %q", s)
+	if i := slices.Index(kindNames[:], s); i >= 0 {
+		return ColKind(i), nil
 	}
-	return k, nil
+	return 0, fmt.Errorf("unknown column kind %q", s)
 }
 
 // Column is one maskable image field.
@@ -131,16 +133,15 @@ const (
 	KeyMarketType
 )
 
-var rowKeyNames = map[string]RowKeyRule{
-	"token":      KeyToken,
-	"marketType": KeyMarketType,
+// rowKeyNames is indexed BY the enum, like kindNames above.
+var rowKeyNames = [...]string{
+	KeyToken:      "token",
+	KeyMarketType: "marketType",
 }
 
 func (r RowKeyRule) String() string {
-	for name, rule := range rowKeyNames {
-		if rule == r {
-			return name
-		}
+	if int(r) < len(rowKeyNames) {
+		return rowKeyNames[r]
 	}
 	return fmt.Sprintf("RowKeyRule(%d)", uint8(r))
 }
@@ -153,10 +154,9 @@ func (r RowKeyRule) String() string {
 // than guessing -- a row key silently defaulting to the wrong field is exactly
 // the ASM-15 failure.
 func parseRowKey(s string) (RowKeyRule, error) {
-	r, ok := rowKeyNames[s]
-	if !ok {
-		return 0, fmt.Errorf("unknown rowKey %q (want \"token\" or \"marketType\"; "+
-			"composites are not yet declared by any destination)", s)
+	if i := slices.Index(rowKeyNames[:], s); i >= 0 {
+		return RowKeyRule(i), nil
 	}
-	return r, nil
+	return 0, fmt.Errorf("unknown rowKey %q (want \"token\" or \"marketType\"; "+
+		"composites are not yet declared by any destination)", s)
 }

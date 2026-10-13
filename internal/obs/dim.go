@@ -200,7 +200,10 @@ const (
 // Appendix A), so the slot index is the market type minus one and the rendered
 // label is the market type itself -- Vol 4 section 6.1's example line shows
 // session_state{1}, not session_state{0}.
-var marketTypeValues = []int{1, 2, 3, 4}
+// Sized by marketTypes, so the G-BLD-2 gate on that constant pins the table
+// that actually sizes the dimension: a fifth market type is now a compile
+// error here rather than a silently larger slab.
+var marketTypeValues = [marketTypes]int{1, 2, 3, 4}
 
 // dimKind decides whether a slot appears on the line when it holds nothing.
 //
@@ -359,13 +362,20 @@ func resolveDims(o Options) [numDims]resolvedDim {
 	}
 	// A dynamic dimension is sized but not labelled.
 	sized := func(id Dim, n int) { d[id].size = uint32(n) }
+	// A two-label dimension gets labels, size AND inner in one call: resolve's
+	// i*inner+j offset is only correct once inner is set, and an inner left at
+	// 1 lands a write on the wrong destination plausibly rather than loudly.
+	setCross := func(id Dim, labels []string, inner int) {
+		set(id, labels)
+		d[id].inner = uint32(inner)
+	}
 
 	set(dimNone, []string{""})
-	set(dimShard, braceInts(seq(o.Shards)))
+	set(dimShard, braceStrings(seqStrings(o.Shards)))
 	set(dimDest, braceStrings(o.Destinations))
 	set(dimTranscode, braceInts(o.Transcodes))
 	set(dimHeaderCode, braceInts(headerCodes))
-	set(dimMarketType, braceInts(marketTypeValues))
+	set(dimMarketType, braceInts(marketTypeValues[:]))
 	set(dimHypothesis, braceStrings(gapHypotheses))
 	set(dimRetryClass, braceStrings(retryClasses))
 	set(dimLogClass, braceStrings(logClasses))
@@ -374,7 +384,7 @@ func resolveDims(o Options) [numDims]resolvedDim {
 	set(dimDecompressReason, braceStrings(decompressReasons))
 	set(dimRecycleReason, braceStrings(recycleReasons))
 	set(dimProbeResult, braceStrings(probeResults))
-	set(dimWriter, braceInts(seq(maxWriters)))
+	set(dimWriter, braceStrings(seqStrings(maxWriters)))
 
 	// The two dynamic tables. oracleErrorSlots+1 reserves the final slot for
 	// the overflow bucket, which renders oracle_error{other} -- the same shape
@@ -384,14 +394,7 @@ func resolveDims(o Options) [numDims]resolvedDim {
 	sized(dimOracleCode, oracleErrorSlots+1)
 
 	// {destination,reason}: row-major, destination outer.
-	dr := make([]string, 0, len(o.Destinations)*len(prevalidateReasons))
-	for _, name := range o.Destinations {
-		for _, r := range prevalidateReasons {
-			dr = append(dr, "{"+name+","+r+"}")
-		}
-	}
-	set(dimDestReason, dr)
-	d[dimDestReason].inner = uint32(len(prevalidateReasons))
+	setCross(dimDestReason, braceCross(o.Destinations, prevalidateReasons), len(prevalidateReasons))
 
 	// {destination,column}: rectangular at maxColumns per destination, so the
 	// offset is dest*maxColumns+col and no per-destination base table is
@@ -409,26 +412,32 @@ func resolveDims(o Options) [numDims]resolvedDim {
 			dc = append(dc, "{"+name+",col"+strconv.Itoa(c)+"}")
 		}
 	}
-	set(dimDestColumn, dc)
-	d[dimDestColumn].inner = maxColumns
+	setCross(dimDestColumn, dc, maxColumns)
 
 	// {k,destination}: row-major, shard outer.
-	kd := make([]string, 0, o.Shards*len(o.Destinations))
-	for k := range o.Shards {
-		for _, name := range o.Destinations {
-			kd = append(kd, "{"+strconv.Itoa(k)+","+name+"}")
-		}
-	}
-	set(dimShardDest, kd)
-	d[dimShardDest].inner = uint32(len(o.Destinations))
+	setCross(dimShardDest, braceCross(seqStrings(o.Shards), o.Destinations), len(o.Destinations))
 
 	return d
 }
 
-func seq(n int) []int {
-	out := make([]int, n)
+// seqStrings renders 0..n-1, for the dimensions whose values are just an index.
+func seqStrings(n int) []string {
+	out := make([]string, n)
 	for i := range out {
-		out[i] = i
+		out[i] = strconv.Itoa(i)
+	}
+	return out
+}
+
+// braceCross renders the row-major cartesian product as {outer,inner} labels.
+// The caller passes the inner arity to setCross, which is what keeps the offset
+// arithmetic and these labels describing the same table.
+func braceCross(outer, inner []string) []string {
+	out := make([]string, 0, len(outer)*len(inner))
+	for _, o := range outer {
+		for _, i := range inner {
+			out = append(out, "{"+o+","+i+"}")
+		}
 	}
 	return out
 }

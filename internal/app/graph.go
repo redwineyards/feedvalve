@@ -152,9 +152,6 @@ type Graph struct {
 
 	teardownOnce sync.Once
 
-	// inst are the lifecycle's instrument handles, resolved before Freeze.
-	inst_ instruments
-
 	// lastParks converts the ring's cumulative park count into the delta
 	// qd_wake_parked wants. The ring exposes a plain number because the
 	// ledger assigns that instrument to the decoder, not to framing.
@@ -205,7 +202,6 @@ func Build(d Deps) (*Graph, error) {
 
 	g := &Graph{
 		deps:        d,
-		inst_:       d.Inst,
 		fatal:       make(chan fatalEvent, 1),
 		readerDone:  make(chan struct{}),
 		decoderDone: make(chan struct{}),
@@ -279,8 +275,9 @@ func (g *Graph) snapshot(from *[]string) []string {
 	return append([]string(nil), (*from)...)
 }
 
-// inst returns the lifecycle's instrument handles.
-func (g *Graph) inst() *instruments { return &g.inst_ }
+// inst returns the lifecycle's instrument handles, resolved before Freeze and
+// carried in Deps.
+func (g *Graph) inst() *instruments { return &g.deps.Inst }
 
 // LocalAddr is the address the listener actually bound. It differs from the
 // configured one whenever the configuration asks for port 0, which is how the
