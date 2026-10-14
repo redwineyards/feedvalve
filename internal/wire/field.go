@@ -92,6 +92,55 @@ const (
 	FieldHighPrice
 	FieldLowPrice
 
+	// MS_SECURITY_UPDATE_INFO (7305 / 7340) and SEC_INFO, which the 6511
+	// family also carries.
+	FieldInstrumentName
+	FieldSymbol
+	FieldSeries
+	FieldExpiry
+	FieldStrike
+	FieldOptionType
+	FieldCALevel
+	FieldPermittedToTrade
+	FieldIssuedCapital
+	FieldWarningQuantity
+	FieldFreezeQuantity
+	FieldCreditRating
+	FieldSecEligibility
+	FieldIssueRate
+	FieldIssueStartDate
+	FieldInterestPaymentDate
+	FieldIssueMaturityDate
+	FieldMarginPercentage
+	FieldMinimumLotQuantity
+	FieldBoardLotQuantity
+	FieldTickSize
+	FieldName
+	FieldListingDate
+	FieldExpulsionDate
+	FieldReAdmissionDate
+	FieldRecordDate
+	FieldLowPriceRange
+	FieldHighPriceRange
+	FieldNoDeliveryStartDate
+	FieldNoDeliveryEndDate
+	FieldEligibilityIndicators
+	FieldBookClosureStartDate
+	FieldBookClosureEndDate
+	FieldExerciseStartDate
+	FieldExerciseEndDate
+	FieldMultiplier
+	FieldAssetInstrument
+	FieldAssetName
+	FieldUnderlyingToken
+	FieldIntrinsicValue
+	FieldExtrinsicValue
+	FieldSTPurpose
+	FieldLocalUpdateDateTime
+	FieldDeleteFlag
+	FieldRemark
+	FieldBasePrice
+
 	numFieldIDs
 )
 
@@ -150,6 +199,53 @@ var fieldNames = [numFieldIDs]string{
 	FieldOpenPrice:          "OpenPrice",
 	FieldHighPrice:          "HighPrice",
 	FieldLowPrice:           "LowPrice",
+
+	FieldInstrumentName:        "InstrumentName",
+	FieldSymbol:                "Symbol",
+	FieldSeries:                "Series",
+	FieldExpiry:                "ExpiryDate",
+	FieldStrike:                "StrikePrice",
+	FieldOptionType:            "OptionType",
+	FieldCALevel:               "CALevel",
+	FieldPermittedToTrade:      "PermittedToTrade",
+	FieldIssuedCapital:         "IssuedCapital",
+	FieldWarningQuantity:       "WarningQuantity",
+	FieldFreezeQuantity:        "FreezeQuantity",
+	FieldCreditRating:          "CreditRating",
+	FieldSecEligibility:        "ST_SEC_ELIGIBILITY_PER_MARKET",
+	FieldIssueRate:             "IssueRate",
+	FieldIssueStartDate:        "IssueStartDate",
+	FieldInterestPaymentDate:   "InterestPaymentDate",
+	FieldIssueMaturityDate:     "IssueMaturityDate",
+	FieldMarginPercentage:      "MarginPercentage",
+	FieldMinimumLotQuantity:    "MinimumLotQuantity",
+	FieldBoardLotQuantity:      "BoardLotQuantity",
+	FieldTickSize:              "TickSize",
+	FieldName:                  "Name",
+	FieldListingDate:           "ListingDate",
+	FieldExpulsionDate:         "ExpulsionDate",
+	FieldReAdmissionDate:       "ReAdmissionDate",
+	FieldRecordDate:            "RecordDate",
+	FieldLowPriceRange:         "LowPriceRange",
+	FieldHighPriceRange:        "HighPriceRange",
+	FieldNoDeliveryStartDate:   "NoDeliveryStartDate",
+	FieldNoDeliveryEndDate:     "NoDeliveryEndDate",
+	FieldEligibilityIndicators: "ST_ELIGIBILITY_INDICATORS",
+	FieldBookClosureStartDate:  "BookClosureStartDate",
+	FieldBookClosureEndDate:    "BookClosureEndDate",
+	FieldExerciseStartDate:     "ExerciseStartDate",
+	FieldExerciseEndDate:       "ExerciseEndDate",
+	FieldMultiplier:            "Multiplier",
+	FieldAssetInstrument:       "AssetInstrument",
+	FieldAssetName:             "AssetName",
+	FieldUnderlyingToken:       "UnderlyingToken",
+	FieldIntrinsicValue:        "IntrinsicValue",
+	FieldExtrinsicValue:        "ExtrinsicValue",
+	FieldSTPurpose:             "ST_PURPOSE",
+	FieldLocalUpdateDateTime:   "LocalUpdateDateTime",
+	FieldDeleteFlag:            "DeleteFlag",
+	FieldRemark:                "Remark",
+	FieldBasePrice:             "BasePrice",
 }
 
 // String resolves the name. Only a trace sink calls it, so the bounds check
