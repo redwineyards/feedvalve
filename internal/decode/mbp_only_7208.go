@@ -187,11 +187,11 @@ func (d *mbpOnly) decodeRecord(u *model.UpdateUnit, h model.MsgHeader, e *Regist
 	u.Token = token
 	contribute(u, destQuote, model.SingleKey(uint32(token)), e)
 
-	put(u, spec, q0BookType, r.Raw(wire.FieldBookType, 2))               // rec  4
-	put(u, spec, q0TradingStatus, r.Raw(wire.FieldTradingStatus, 2))     // rec  6
-	put(u, spec, q0VolumeTradedToday, r.Raw(wire.FieldVolumeTradedToday, 4))        // rec  8
-	put(u, spec, q0LastTradedPrice, r.Raw(wire.FieldLastTradedPrice, 4)) // rec 12
-	put(u, spec, q0NetChangeInd, r.Raw(wire.FieldNetChangeIndicator, 1)) // rec 16
+	put(u, spec, q0BookType, r.Raw(wire.FieldBookType, 2))                   // rec  4
+	put(u, spec, q0TradingStatus, r.Raw(wire.FieldTradingStatus, 2))         // rec  6
+	put(u, spec, q0VolumeTradedToday, r.Raw(wire.FieldVolumeTradedToday, 4)) // rec  8
+	put(u, spec, q0LastTradedPrice, r.Raw(wire.FieldLastTradedPrice, 4))     // rec 12
+	put(u, spec, q0NetChangeInd, r.Raw(wire.FieldNetChangeIndicator, 1))     // rec 16
 
 	// *** THE PAD AT RECORD OFFSET 17 ***
 	//

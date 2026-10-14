@@ -102,6 +102,21 @@ func put(u *model.UpdateUnit, spec *ColSpec, bit uint8, src []byte) {
 // declared width is rewritten on EVERY contribution, zero-filled beyond its
 // valid length. Skipping the fill makes the digest a function of history rather
 // than of state, and suppression then stops working in a way nothing reports.
+//
+// # It is currently redundant, and kept anyway
+//
+// stamp assigns a fresh zero UpdateUnit, which clears all 256 blob bytes, so
+// R5 already holds for every field before a decoder writes anything -- and a
+// break check that removed this call did NOT fail, which is how that was
+// discovered rather than assumed.
+//
+// Kept for one reason: R5 must not depend on that coincidence. stamp's clear
+// exists to stop a STALE CONTRIBUTION reaching a shard, not to satisfy R5, and
+// the obvious optimisation of it -- clearing only the fields stamp sets, or
+// only the blob prefix the ColSpec declares -- would silently take R5 with it.
+// A decoder that calls this is correct whichever way stamp evolves; one that
+// relies on the clear is correct only by accident. The cost is one clear of at
+// most 128 bytes on a path that has already copied more than that.
 func putZero(u *model.UpdateUnit, spec *ColSpec, bit uint8) {
 	off := int(spec.Off[bit])
 	n := int(spec.Len[bit])

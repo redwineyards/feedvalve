@@ -141,6 +141,13 @@ const (
 	FieldRemark
 	FieldBasePrice
 
+	// MS_BCAST_VCT_MSGS (the 6511 family).
+	FieldSecInfo
+	FieldMarketType
+	FieldBcastDestination
+	FieldBroadcastMessageLength
+	FieldBroadcastMessage
+
 	numFieldIDs
 )
 
@@ -246,6 +253,12 @@ var fieldNames = [numFieldIDs]string{
 	FieldDeleteFlag:            "DeleteFlag",
 	FieldRemark:                "Remark",
 	FieldBasePrice:             "BasePrice",
+
+	FieldSecInfo:                "SEC_INFO",
+	FieldMarketType:             "MarketType",
+	FieldBcastDestination:       "ST_BCAST_DESTINATION",
+	FieldBroadcastMessageLength: "BroadcastMessageLength",
+	FieldBroadcastMessage:       "BroadcastMessage",
 }
 
 // String resolves the name. Only a trace sink calls it, so the bounds check
