@@ -120,6 +120,49 @@ var mutations = []mutation{
 			"starts a byte early. poc carried it for months.",
 	},
 	{
+		gate: "G-LAY-1", name: "7200-inner-struct",
+		pkg: "./internal/decode", file: "internal/decode/mbo_mbp_7200.go",
+		from: "mboInnerSize   = 236", to: "mboInnerSize   = 235",
+		wantErr: "overflows",
+		why: "7208's defect in a second structure, from the same cause: " +
+			"ST_INTERACTIVE_MBO_DATA is declared 235 and NetChangeIndicator at even offset " +
+			"16 forces one pad byte at 17. Two structures, one pack(2) rule, two gates.",
+	},
+	{
+		gate: "G-LAY-1", name: "7200-corrected-outer-offset",
+		pkg: "./internal/decode", file: "internal/decode/mbo_mbp_7200.go",
+		from:    "mboTotalBuy0  = mboLadder0 + mboPriceLadder",
+		to:      "mboTotalBuy0  = mboLadder0 + mboPriceLadder - 1",
+		wantErr: "overflows",
+		why: "Bible Appendix B item 2: the specification's own outer offsets for 7200 are ONE " +
+			"BYTE TOO LOW. That is the most dangerous shape of layout error, because it reads " +
+			"as a typo and decodes as plausible garbage. Pinning the corrected values means a " +
+			"reader who 'fixes' one back to the spec's number breaks the build instead of the " +
+			"prices.",
+	},
+	{
+		gate: "G-LAY-1", name: "7305-eligibility-stride",
+		pkg: "./internal/decode", file: "internal/decode/security_update_7305.go",
+		from: "secEligStride  = 3", to: "secEligStride  = 4",
+		wantErr: "overflows",
+		why: "THE GATE THAT MUST NOT BE 'FIXED'. ST_SEC_ELIGIBILITY_PER_MARKET is the one " +
+			"odd-sized struct in the protocol NOT padded to even (Appendix B item 8), so its " +
+			"array of four occupies 12 bytes and not 16. Aligning it yields 298 against the " +
+			"declared 294 -- and raising the declared length to 298 to make the build pass " +
+			"STILL fails, because the stride is pinned independently. A parser aligned here is " +
+			"four bytes wrong from offset 116 onward.",
+	},
+	{
+		gate: "G-LAY-1", name: "6511-trailing-pad",
+		pkg: "./internal/decode", file: "internal/decode/vct_msgs_6511.go",
+		from: "vctTrailingPad = 1", to: "vctTrailingPad = 0",
+		wantErr: "overflows",
+		why: "MS_BCAST_VCT_MSGS sums to 319 and is declared 320: one TRAILING pad, because an " +
+			"odd-sized struct is padded to even (bible section 2.2 rule 3). Unlike 7208's and " +
+			"7200's interior pads this one costs nothing to get wrong WITHIN a message -- it " +
+			"is the last byte -- which is exactly why it needs a gate rather than a test.",
+	},
+	{
 		gate: "G-LAY-1", name: "registry-headroom",
 		pkg: "./internal/decode", file: "internal/decode/registry.go",
 		from: "maxRegistered = 32", to: "maxRegistered = 24",
