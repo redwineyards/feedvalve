@@ -353,18 +353,20 @@ func TestG_FIX_1_MBPFieldsMatchTheHandWrittenOffsets(t *testing.T) {
 		t.Errorf("effective_ts = %d, want the header's LogTime 1700001234", got)
 	}
 
-	// The pad is 0xEE in the fixture. No stored field may contain it.
-	for bit := range uint8(16) {
-		if !spec.Mask.Has(bit) {
-			continue
-		}
-		for _, b := range blobAt(u, spec, bit) {
-			if b == 0xEE {
-				t.Errorf("bit %d contains the pad byte 0xEE: a field was read across "+
-					"record offset 17", bit)
-				break
-			}
-		}
+	// The pad at record offset 17, checked PRECISELY.
+	//
+	// Scanning every stored field for the pad's byte value is tempting and
+	// unsound: a planted value may legitimately contain it (7200's version of
+	// this test tripped on 0x03EE, a quantity of 1006). The sound check is the
+	// field immediately after the pad -- LastTradeQuantity at record offset 22
+	// -- which a missing pad shifts by one byte, and which the assertions
+	// above already cover for every later field as well.
+	if f.payload[f.at(0, recPad)] != 0xEE {
+		t.Fatalf("the fixture's own pad byte is %#02x; the check below proves nothing",
+			f.payload[f.at(0, recPad)])
+	}
+	if got := be32(blobAt(u, spec, q0LastTradeQty)); got != want.lastQty {
+		t.Errorf("LastTradeQuantity = %d, want %d -- the field after the pad", got, want.lastQty)
 	}
 }
 
