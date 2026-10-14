@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -38,6 +39,15 @@ const (
 	// FatalShardPanic is F26 -- a panic with an arena mid-mutation, which is
 	// the one panic that cannot be contained and resumed.
 	FatalShardPanic
+	// FatalUDPReadFailure is Vol 1's V-7: maxConsecutiveReadErrors reads failed
+	// in a row with the context still alive.
+	//
+	// poc logs and continues unconditionally, which on an unrecoverable socket
+	// is a tight spin logging at full CPU -- worse on a 4-CPU capped partition
+	// than stopping. Vol 1 section 3.7 makes it terminal instead, and terminal
+	// here means the drain runs: the shards still owe their dirty rows to the
+	// database, which is exactly what an os.Exit would skip.
+	FatalUDPReadFailure
 
 	numFatalReasons
 )
@@ -48,6 +58,7 @@ var fatalReasonNames = [numFatalReasons]string{
 	FatalWriterPoolStop: "F20-writer-pool-stop",
 	FatalBatchQSendFail: "F21-batchq-send-failed",
 	FatalShardPanic:     "F26-shard-panic",
+	FatalUDPReadFailure: "V7-udp-read-failure",
 }
 
 func (r FatalReason) String() string {
@@ -129,7 +140,31 @@ type Graph struct {
 	// the receiver, the teardown and LocalAddr read it from others. The race
 	// detector found this; nothing about it is visible in behaviour, which is
 	// the whole argument for having fixed the toolchain so -race could run.
-	conn net.PacketConn
+	//
+	// THE CONCRETE TYPE, not net.PacketConn, and both reasons are load-bearing
+	// (Vol 1 section 3.1): SetReadBuffer is not on the interface, and neither
+	// is ReadFromUDPAddrPort. PacketConn.ReadFrom returns a net.Addr, which for
+	// UDP is a heap-allocated *net.UDPAddr carrying a []byte IP -- per
+	// datagram, 2,400 times a second, on the one goroutine ADR-006 keeps
+	// allocation-free.
+	conn *net.UDPConn
+
+	// readerErr is the receiver's terminal error, if it had one: written by
+	// the reader goroutine immediately before it closes readerDone, read by
+	// wait and by nothing else. The channel close is the happens-before, which
+	// is why this needs no lock (Vol 1 section 3.4: readLoop "returns a
+	// non-nil error on a fatal condition").
+	readerErr error
+
+	// srcPrefixes is udp.sourceAllowList, parsed once by bind and read only by
+	// the receiver goroutine afterwards (Vol 1 section 3.5).
+	//
+	// Needs no lock, and the reason is the ordering rather than the type: bind
+	// writes it on the lifecycle goroutine BEFORE startReader launches the
+	// goroutine that reads it, and the go statement is the happens-before.
+	// Nothing writes it again -- udp.listen and its allow-list are
+	// startup-only (C-2, C-3).
+	srcPrefixes []netip.Prefix
 
 	// fatal carries the first terminal condition. Capacity 1 and guarded by
 	// fatalOnce, so a goroutine reporting a terminal condition never blocks
@@ -293,13 +328,13 @@ func (g *Graph) LocalAddr() net.Addr {
 // setConn and getConn keep every access to the listener under one lock. The
 // listener is written once, by bind, and read by the receiver, the teardown and
 // LocalAddr -- three goroutines, so "written once" is not on its own enough.
-func (g *Graph) setConn(c net.PacketConn) {
+func (g *Graph) setConn(c *net.UDPConn) {
 	g.mu.Lock()
 	g.conn = c
 	g.mu.Unlock()
 }
 
-func (g *Graph) getConn() net.PacketConn {
+func (g *Graph) getConn() *net.UDPConn {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.conn

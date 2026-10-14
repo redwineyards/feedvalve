@@ -27,10 +27,13 @@ type instruments struct {
 	writersConfigured    *obs.Gauge
 
 	// receiver-owned, held here until Phase 2 gives the receiver a home
-	datagramsReceived *obs.Counter
-	qdSendBlocked     *obs.Counter
-	qdDepthMax        *obs.Max
-	udpReadErrors     *obs.Counter
+	datagramsReceived      *obs.Counter
+	datagramsOversize      *obs.Counter
+	datagramsUnexpectedSrc *obs.Counter
+	qdSendBlocked          *obs.Counter
+	qdDepthMax             *obs.Max
+	udpReadErrors          *obs.Counter
+	lastDatagramMonoNs     *obs.Gauge
 
 	// decoder-owned, likewise
 	qdWakeParked *obs.Counter
@@ -49,10 +52,13 @@ func resolveInstruments(reg obs.Registry) instruments {
 		readbufEffective:     reg.Gauge(obs.IDReadbufEffectiveBytes),
 		writersConfigured:    reg.Gauge(obs.IDWritersConfigured),
 
-		datagramsReceived: reg.Counter(obs.IDDatagramsReceived),
-		qdSendBlocked:     reg.Counter(obs.IDQDSendBlocked),
-		qdDepthMax:        reg.Max(obs.IDQDDepthMax),
-		udpReadErrors:     reg.Counter(obs.IDUDPReadErrors),
+		datagramsReceived:      reg.Counter(obs.IDDatagramsReceived),
+		datagramsOversize:      reg.Counter(obs.IDDatagramsOversize),
+		datagramsUnexpectedSrc: reg.Counter(obs.IDDatagramsUnexpectedSource),
+		qdSendBlocked:          reg.Counter(obs.IDQDSendBlocked),
+		qdDepthMax:             reg.Max(obs.IDQDDepthMax),
+		udpReadErrors:          reg.Counter(obs.IDUDPReadErrors),
+		lastDatagramMonoNs:     reg.Gauge(obs.IDLastDatagramMonoNs),
 
 		qdWakeParked: reg.Counter(obs.IDQDWakeParked),
 

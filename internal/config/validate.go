@@ -3,8 +3,6 @@ package config
 import (
 	"fmt"
 	"math/bits"
-	"net"
-	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -157,15 +155,18 @@ func validateUDP(c *Config, p *problems) {
 	// V-SRC1. With sourceEnforce set, an unparseable entry silently blinds
 	// the feed -- the datagram arrives and is discarded by a filter nobody
 	// realises is misconfigured.
+	//
+	// Through parseSourceEntry, which is also what UDPConfig.SourcePrefixes
+	// uses, so "valid here" and "parses for the receiver" are the same
+	// predicate by construction. They were two separate implementations until
+	// P2-04, which is the shape where a config passes validation and then
+	// fails at startup -- or worse, parses to something that matches
+	// differently than the validator accepted.
 	for i, e := range c.UDP.SourceAllowList {
-		if _, err := netip.ParseAddr(e); err == nil {
-			continue
+		if _, err := parseSourceEntry(e); err != nil {
+			p.add(RuleSourceList, "udp.sourceAllowList[%d] is %q, which is neither an IP "+
+				"address nor a CIDR block", i, e)
 		}
-		if _, _, err := net.ParseCIDR(e); err == nil {
-			continue
-		}
-		p.add(RuleSourceList, "udp.sourceAllowList[%d] is %q, which is neither an IP "+
-			"address nor a CIDR block", i, e)
 	}
 }
 

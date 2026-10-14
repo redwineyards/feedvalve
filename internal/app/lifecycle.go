@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"feedvalve/internal/model"
+	"feedvalve/internal/obs"
+	"feedvalve/internal/wire"
 )
 
 // readBufferLen bounds one read. 64 KB and not wire.MaxDatagramLen's 516,
@@ -95,40 +98,69 @@ func (g *Graph) Run(ctx context.Context) error {
 // udp_recvspace: the requested value is a wish, and only the effective one
 // bounds Q0's 0.53 s of slack. An operator who reads the requested number and
 // believes it has the wrong model of how much slack the process has.
+// net.ListenUDP and not net.ListenPacket (Vol 1 section 3.1). The interface
+// does not carry SetReadBuffer, so udp.readBufferBytes could not be applied
+// through it, and it does not carry ReadFromUDPAddrPort either -- which is the
+// allocation argument, not a style one. poc binds with ListenPacket
+// (poc/gobrdclnt.go:111) and pays for it once per datagram.
 func (g *Graph) bind() error {
 	cfg := g.deps.Cfg
 
-	conn, err := net.ListenPacket("udp", cfg.UDP.Listen)
+	addr, err := net.ResolveUDPAddr("udp", cfg.UDP.Listen)
+	if err != nil {
+		return exitf(ExitStartup, "resolving %s: %w", cfg.UDP.Listen, err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return exitf(ExitStartup, "binding %s: %w", cfg.UDP.Listen, err)
 	}
 	g.setConn(conn)
 	g.mark(&g.acquired, "udp-listener")
 
-	effective := cfg.UDP.ReadBufferBytes
-	if uc, ok := conn.(*net.UDPConn); ok {
-		if err := uc.SetReadBuffer(cfg.UDP.ReadBufferBytes); err != nil {
-			// Not fatal: a kernel that refuses the size still delivers
-			// datagrams, just with less slack. Refusing to start over it would
-			// trade a measurable risk for a certain outage.
-			g.deps.Log.Warnf(obsClassStartup, "SetReadBuffer(%d) refused: %v",
-				cfg.UDP.ReadBufferBytes, err)
-		}
-		if n, err := readBufferSize(uc); err == nil {
-			effective = n
-		}
+	if err := conn.SetReadBuffer(cfg.UDP.ReadBufferBytes); err != nil {
+		// Not fatal: a kernel that refuses the size still delivers datagrams,
+		// just with less slack. Refusing to start over it would trade a
+		// measurable risk for a certain outage.
+		g.deps.Log.Warnf(obsClassStartup, "SetReadBuffer(%d) refused: %v",
+			cfg.UDP.ReadBufferBytes, err)
 	}
+	effective := cfg.UDP.ReadBufferBytes
+	if n, err := readBufferSize(conn); err == nil {
+		effective = n
+	}
+
+	// The allow-list is parsed ONCE, here, because parsing per datagram would
+	// allocate 2,400 times a second to learn the same answer (section 3.5).
+	// It cannot fail on a validated config -- V-SRC1 checks it with the same
+	// parser -- so a failure here means an unvalidated Config reached Run, and
+	// refusing to start is the right answer: the alternative is a source
+	// filter nobody realises is misconfigured.
+	prefixes, err := cfg.UDP.SourcePrefixes()
+	if err != nil {
+		return exitf(ExitStartup, "parsing udp.sourceAllowList: %w", err)
+	}
+	g.srcPrefixes = prefixes
+
 	g.inst().readbufEffective.Store(int64(effective))
-	g.deps.Log.Infof("socket bound listen=%s requested_rcvbuf=%d effective_rcvbuf=%d",
-		cfg.UDP.Listen, cfg.UDP.ReadBufferBytes, effective)
+	// Requested and effective SIDE BY SIDE. If they differ, the kernel capped
+	// us at udp_recvspace and Q0's 0.53 s of slack -- the arithmetic NFR4's
+	// budget is derived from -- is wrong by that ratio. An operator who sees
+	// only the requested number has no way to know (ASM-V1).
+	g.deps.Log.Infof("socket bound listen=%s requested_rcvbuf=%d effective_rcvbuf=%d "+
+		"source_allow_list=%d source_enforce=%v",
+		cfg.UDP.Listen, cfg.UDP.ReadBufferBytes, effective, len(prefixes), cfg.UDP.SourceEnforce)
 	return nil
 }
 
-// startReader runs the receive loop. In P1-09 its whole job is read, copy,
-// publish -- the shape Vol 0 section 9.5.1 describes once QD exists. The
-// envelope split, the source-address check, the oversize rule and the sequence
-// gap detector are Vol 1's and arrive in Phase 2; what is here is the part the
-// LIFECYCLE owns, which is how the loop starts and how it stops.
+// startReader runs the receive loop: Vol 1 section 3.4's steps, in its order.
+//
+// Step 1, the atomic.Pointer[Runtime] snapshot (ADR-L11), is deliberately NOT
+// here. It carries the decode.Registry, which arrives in P2-05; adding the load
+// now would be a snapshot of something nothing reads.
+//
+// The envelope split and the decoders are reached through Deps.Decode on the
+// DECODER goroutine, not from here. What the receiver owns is: read, classify
+// the error, time it, check the source, check the size, publish.
 func (g *Graph) startReader(ctx context.Context) {
 	g.readerStarted = true
 	go func() {
@@ -138,52 +170,170 @@ func (g *Graph) startReader(ctx context.Context) {
 		// first thing that would show up as jitter at market open.
 		buf := make([]byte, readBufferLen)
 		var d model.Datagram
-		consecutive := 0
+		var errs readErrorPolicy
 
 		// Captured once. The listener does not change for the life of the
 		// loop -- rebinding is startup-only (C-2) -- so re-reading it per
 		// datagram would take a lock 2,400 times a second to learn the same
 		// answer.
 		conn := g.getConn()
+		cfg := g.deps.Cfg
+		in := g.inst()
 
 		for {
-			n, _, err := conn.ReadFrom(buf)
+			// Step 2. The only blocking call in the loop that is not bounded
+			// by the stall budget, and it is SUPPOSED to block: this is how
+			// the goroutine parks when the market is quiet.
+			n, src, err := conn.ReadFromUDPAddrPort(buf)
 			if err != nil {
-				// A read error during shutdown IS shutdown, not a fault. poc
-				// logged it as a failure and the resulting ERROR line at every
-				// clean stop trained operators to ignore the level.
-				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				// Step 3, section 3.7.
+				switch errs.classify(err, ctx) {
+				case readShutdown:
 					return
-				}
-				g.inst().udpReadErrors.Add(1)
-				consecutive++
-				if consecutive >= maxConsecutiveReadErrors {
+				case readFatal:
+					in.udpReadErrors.Add(1)
 					g.deps.Log.Errorf(obsClassStartup,
-						"%d consecutive UDP read errors; giving up: %v", consecutive, err)
+						"%d consecutive UDP read errors; giving up: %v", errs.consecutive, err)
+					// RETURNED, not reported through Graph's terminal channel,
+					// because Vol 1 section 3.4 specifies readLoop as
+					// "returns ... a non-nil error on a fatal condition" and
+					// Figure 1.3 draws it as "return err". The terminal
+					// channel exists for goroutines the lifecycle cannot
+					// join and which must report while still running -- the
+					// shards and the writers. This one is joined by teardown,
+					// so its error travels the way any function's does.
+					g.readerErr = err
 					return
+				default:
+					in.udpReadErrors.Add(1)
+					g.deps.Log.Errorf(obsClassStartup, "UDP read error (%d consecutive): %v",
+						errs.consecutive, err)
+					continue
 				}
-				continue
 			}
-			consecutive = 0
+			errs.ok()
 
-			// RecvMono is taken ONCE, immediately after the read, and is the
-			// source of the ordering guard's receipt clock and of the fan-out
-			// budget's start. Monotonic, never a wall-clock reading.
+			// Step 4. Exactly one clock read per datagram, and it is the
+			// origin of the per-iteration stall budget. RecvMono is also the
+			// ordering guard's receipt clock, so it is taken ONCE, here,
+			// immediately after the read -- never a wall-clock reading.
 			d.RecvMono = int64(monotonicNow())
+
+			// Step 5.
+			in.datagramsReceived.Add(1)
+			in.lastDatagramMonoNs.Store(d.RecvMono)
+
+			// Step 6, section 3.5. An empty allow-list skips the check
+			// entirely rather than matching against nothing.
+			if len(g.srcPrefixes) > 0 && !sourceAllowed(g.srcPrefixes, src) {
+				in.datagramsUnexpectedSrc.Add(1)
+				g.deps.Log.Warnf(obs.ClassUnexpectedSource,
+					"datagram from unexpected source %s (allow-list has %d entries, enforce=%v)",
+					src, len(g.srcPrefixes), cfg.UDP.SourceEnforce)
+				if cfg.UDP.SourceEnforce {
+					// THE ONE PLACE FeedValve DISCARDS DATA ON PURPOSE
+					// (section 3.5). Off by default and operator-armed,
+					// because a wrong allow-list silently blinds a feed that
+					// has no retransmission to recover from (bible section 1).
+					continue
+				}
+			}
+
+			// Step 7, section 3.8. Counted and logged HERE, before the copy
+			// below truncates n, because this is the last point at which the
+			// true length exists. Nothing framable is lost by that truncation:
+			// cPackData is a fixed 512-byte field, so framing computes
+			// packedLen = min(n-4, 512) and never reads past payload offset
+			// 516. What is lost is a full hex dump of a datagram over 1 KiB --
+			// and HLD F6's operator action is "escalate to the exchange", for
+			// which the true length in this line is what matters.
+			if n > wire.MaxDatagramLen {
+				in.datagramsOversize.Add(1)
+				g.deps.Log.Warnf(obs.ClassOversizeDatagram,
+					"oversize datagram from %s: %d bytes, over the %d-byte envelope "+
+						"(bible 3.2). Framing it to %d; the envelope assumption has changed -- "+
+						"escalate to the exchange before trusting any decode",
+					src, n, wire.MaxDatagramLen, wire.MaxPackedDataLen)
+			}
+
+			// Step 8. Truncation is a second-order consequence of the ring's
+			// fixed slot, not the oversize policy, which is why it is silent
+			// now that the line above is not.
 			if n > len(d.Buf) {
 				n = len(d.Buf)
 			}
 			d.N = int32(n)
 			copy(d.Buf[:n], buf[:n])
 
-			g.inst().datagramsReceived.Add(1)
 			if !g.qdProducer.TryPublish(&d) {
-				g.inst().qdSendBlocked.Add(1)
+				in.qdSendBlocked.Add(1)
 			}
-			g.inst().qdDepthMax.Observe(uint64(g.qdProducer.Len()))
+			in.qdDepthMax.Observe(uint64(g.qdProducer.Len()))
 		}
 	}()
 }
+
+// sourceAllowed reports whether src matches any configured prefix.
+//
+// A linear scan, because the expected list length is one or two (ASM-12: one
+// exchange host) and netip.Prefix/netip.Addr are pointer-free values, so this
+// is a handful of comparisons and no allocation. Unmap so a v4-mapped-v6
+// source address compares against a v4 prefix the way an operator expects.
+func sourceAllowed(prefixes []netip.Prefix, src netip.AddrPort) bool {
+	addr := src.Addr().Unmap()
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// readOutcome is what the loop does about a read error.
+type readOutcome uint8
+
+const (
+	// readContinue counts the error, logs it, and reads again.
+	readContinue readOutcome = iota
+	// readShutdown means the socket was closed under us on purpose.
+	readShutdown
+	// readFatal means maxConsecutiveReadErrors in a row.
+	readFatal
+)
+
+// readErrorPolicy is Vol 1 section 3.7's rule, as a value so it can be tested
+// without a socket.
+//
+// An interface over the connection would make the loop injectable and would
+// also be an interface with exactly one production implementation and no other
+// caller, which YAGNI overrules. The part worth testing is the POLICY, and the
+// policy is four lines of arithmetic over a counter.
+type readErrorPolicy struct {
+	consecutive int
+}
+
+// classify records an error and says what to do about it.
+//
+// The ctx test comes FIRST and it is load-bearing: a read error while the
+// context is cancelled means "shutting down", not a failure. poc logged it as a
+// failure, and the resulting ERROR line at every clean stop trained operators
+// to ignore the level -- which is a worse outcome than a missing line.
+func (p *readErrorPolicy) classify(err error, ctx context.Context) readOutcome {
+	if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+		return readShutdown
+	}
+	p.consecutive++
+	if p.consecutive >= maxConsecutiveReadErrors {
+		return readFatal
+	}
+	return readContinue
+}
+
+// ok resets the count. A successful read means whatever was wrong is over;
+// without this the bound would be "64 errors ever" rather than "64 in a row",
+// and a session with 64 unrelated transients spread across a day would stop the
+// process at market close for no reason.
+func (p *readErrorPolicy) ok() { p.consecutive = 0 }
 
 // maxConsecutiveReadErrors bounds the spin poc's log-and-continue loop would
 // otherwise become. Vol 1 ASM-V5: 64 is small enough to bound a spin at full
@@ -304,12 +454,43 @@ func (g *Graph) installReloadHandler() func() {
 // point for both, because section 1.3 makes Draining the SAME sequence either
 // way -- only the exit code differs. A Q1 overflow still leaves three healthy
 // shards with dirty rows worth writing.
+//
+// The third case is the receiver stopping on its own, which before P2-04 could
+// not be observed at all: the reader goroutine returned after
+// maxConsecutiveReadErrors and nothing woke this select, so the process sat
+// here with no receiver, no terminal condition and no shutdown -- a silent
+// zombie holding an Oracle pool open. Vol 1 section 3.7 makes persistent read
+// failure terminal, and terminal means the drain runs.
 func (g *Graph) wait(ctx context.Context) (fatalEvent, bool) {
-	select {
-	case <-ctx.Done():
-		return fatalEvent{}, false
-	case ev := <-g.fatal:
-		return ev, true
+	// A local copy so it can be nilled out: a closed channel is always ready,
+	// so selecting on g.readerDone again after observing it would spin. A nil
+	// channel in a select blocks forever, which is exactly "stop asking".
+	readerDone := g.readerDone
+	if !g.readerStarted {
+		readerDone = nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fatalEvent{}, false
+		case ev := <-g.fatal:
+			return ev, true
+		case <-readerDone:
+			// Safe to read without a lock: the reader writes readerErr before
+			// closing readerDone, and observing the close here is the
+			// happens-before.
+			if g.readerErr != nil {
+				return fatalEvent{
+					reason: FatalUDPReadFailure,
+					detail: g.readerErr.Error(),
+				}, true
+			}
+			// The reader stopped without an error, which means the socket was
+			// closed under it -- a shutdown already under way. Keep waiting
+			// for whatever asked for it.
+			readerDone = nil
+		}
 	}
 }
 
