@@ -86,7 +86,15 @@ func touchAll(t *testing.T, r *Reg) {
 	}
 
 	// The two dynamic tables, through the accessors that claim a slot.
+	//
+	// unconfigured_transcode SHARES unknown_transcode's table (ledger.go says
+	// why), so it needs its own touch: claiming a slot for one does not put a
+	// value in the other's array, and G-OBS-3 is precisely the test that an
+	// instrument nobody emitted is an instrument nobody can read.
 	if c, ok := r.UnknownTranscode(9999); ok {
+		c.Add(1)
+	}
+	if c, ok := r.UnconfiguredTranscode(9998); ok {
 		c.Add(1)
 	}
 	r.OracleError(1438).Add(1)

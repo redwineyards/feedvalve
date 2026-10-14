@@ -172,12 +172,28 @@ var ledger = [numInstruments]row{
 	IDDecompressedLenMismatch: {"decompressed_len_mismatch", shapeCounter, "messages", GroupDecode, "decode", dimTranscode},
 	IDSeqRegression:           {"seq_regression", shapeCounter, "datagrams", GroupLoss, "receiver", dimNone},
 	IDSeqResync:               {"seq_resync", shapeCounter, "events", GroupLoss, "receiver", dimNone},
-	IDUnconfiguredTranscode:   {"unconfigured_transcode", shapeCounter, "messages", GroupDecode, "decode", dimTranscode},
-	IDBooktypeSkipped:         {"booktype_skipped", shapeCounter, "messages", GroupDecode, "decode", dimTranscode},
-	IDBlobOverrun:             {"blob_overrun", shapeCounter, "messages", GroupDecode, "decode", dimTranscode},
-	IDShortPayload:            {"short_payload", shapeCounter, "messages", GroupDecode, "decode", dimPayloadStage},
-	IDUDPReadErrors:           {"udp_read_errors", shapeCounter, "errors", GroupIngress, "receiver", dimNone},
-	IDLastDatagramMonoNs:      {"last_datagram_mono_ns", shapeGauge, "ns", GroupLiveness, "receiver", dimNone},
+	// unconfigured_transcode shares the DYNAMIC code table with
+	// unknown_transcode rather than using dimTranscode, and the reason is that
+	// dimTranscode is indexed by the CONFIGURED inventory -- which by
+	// definition cannot contain a code that is catalogued but unconfigured.
+	// Declared as dimTranscode until P2-06, where the first registered decoder
+	// made the branch reachable and the contradiction visible.
+	//
+	// Sharing the table is a feature: one code claims one slot and both
+	// counters index it, so "7320 is unknown" and "7320 is unconfigured" can
+	// never disagree about which slot 7320 owns.
+	//
+	// Worth recording for whoever revisits obs: unlike unknown_transcode, this
+	// label domain IS knowable at startup -- it is Catalogue() minus the
+	// configured inventory -- so a startup-sized dim would be more honest than
+	// a dynamic table. That needs the catalogue in obs.Options, which is a
+	// larger change than this one and buys nothing an operator can see.
+	IDUnconfiguredTranscode: {"unconfigured_transcode", shapeCounter, "messages", GroupDecode, "decode", dimUnknownCode},
+	IDBooktypeSkipped:       {"booktype_skipped", shapeCounter, "messages", GroupDecode, "decode", dimTranscode},
+	IDBlobOverrun:           {"blob_overrun", shapeCounter, "messages", GroupDecode, "decode", dimTranscode},
+	IDShortPayload:          {"short_payload", shapeCounter, "messages", GroupDecode, "decode", dimPayloadStage},
+	IDUDPReadErrors:         {"udp_read_errors", shapeCounter, "errors", GroupIngress, "receiver", dimNone},
+	IDLastDatagramMonoNs:    {"last_datagram_mono_ns", shapeGauge, "ns", GroupLiveness, "receiver", dimNone},
 
 	// ---- Datagram ring and pre-validation (section 8.2a) ----
 	IDQDDepthMax:                      {"qd_depth_max", shapeMax, "datagrams", GroupQueues, "receiver", dimNone},

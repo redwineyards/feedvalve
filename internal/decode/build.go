@@ -105,13 +105,18 @@ func (e *BuildError) Error() string {
 // BuildRegistry resolves the configured inventory against the catalogue and
 // the destination table, assigning each transcode its contributor slot per
 // destination and precomputing its ColSpec.
-func BuildRegistry(specs []TranscodeSpec, dests *destinations.Set) (Registry, error) {
+func BuildRegistry(specs []TranscodeSpec, dests *destinations.Set, cnt Counters) (Registry, error) {
 	var p problems
 	reg := &table{}
 
 	if dests == nil {
 		p.add(ProblemUnknownDestination, "a registry needs a destination table")
 		return nil, p.err()
+	}
+	if cnt == nil {
+		// A nil sink would panic on the first clamp, which is the one moment
+		// the counter matters. Tests that do not care pass NopCounters.
+		cnt = NopCounters{}
 	}
 	if len(specs) > maxRegistered {
 		p.add(ProblemTooManyTranscodes, "%d transcodes are configured, more than the %d the "+
@@ -131,16 +136,24 @@ func BuildRegistry(specs []TranscodeSpec, dests *destinations.Set) (Registry, er
 	for _, spec := range ordered {
 		tc := model.TransCode(spec.Code)
 
-		dec := catalogueLookup(tc)
-		if dec == nil {
+		make := catalogueLookup(tc)
+		if make == nil {
 			p.add(ProblemNoDecoder, "transcode %d is configured but this build has no decoder "+
 				"for it. Registered codes: %v", spec.Code, Catalogue())
 			continue
 		}
 
-		entry := RegistryEntry{Dec: dec, Code: tc, Class: spec.Class}
-		resolveContributions(&p, &entry, spec, dests)
-		reg.add(entry)
+		// The entry goes into its final slot FIRST, then its contributions are
+		// resolved, and only then is the decoder constructed -- with a pointer
+		// to that slot. The order is what makes the pointer stable: a decoder
+		// handed a pointer to a local would read ColSpecs that were copied away
+		// from under it, and the registry is immutable afterwards, so the slot
+		// outlives every caller (Vol 1 section 10.2: the decoder reads the
+		// constants the registry resolved).
+		reg.add(RegistryEntry{Code: tc, Class: spec.Class})
+		e := &reg.entries[reg.n-1]
+		resolveContributions(&p, e, spec, dests)
+		e.Dec = make(cnt, e)
 	}
 
 	if err := p.err(); err != nil {
@@ -192,8 +205,15 @@ func resolveContributions(p *problems, entry *RegistryEntry, spec TranscodeSpec,
 				continue
 			}
 			spec.Mask = spec.Mask.Set(col.Bit)
-			spec.Width += col.Width
+			spec.Len[col.Bit] = col.Width
 		}
+
+		// The packed offsets, in ASCENDING BIT ORDER over the mask that was
+		// actually declared (Vol 0 section 3.4). Computed in a second pass
+		// because the first accepts columns in whatever order the
+		// configuration lists them, while the packing order is the bit order
+		// -- and Width falls out of the same walk, so the two cannot disagree.
+		spec.Width = packOffsets(&spec)
 
 		// V-T6. The mask and the width are accumulated in the same loop from
 		// the same columns, and then checked against an independent sum: a
@@ -212,6 +232,25 @@ func resolveContributions(p *problems, entry *RegistryEntry, spec TranscodeSpec,
 		entry.Slots[dest.ID] = slot
 		entry.Contrib[dest.ID] = spec
 	}
+}
+
+// packOffsets fills spec.Off from spec.Mask and spec.Len, and returns the total
+// packed width.
+//
+// Ascending bit order, no padding: bit b's offset is the sum of the widths of
+// every lower set bit (Vol 0 section 3.4). This is the one place that order is
+// implemented, and the merge on the shard side walks the identical order, which
+// is what makes the blob a shared format rather than a convention.
+func packOffsets(spec *ColSpec) uint16 {
+	var off uint16
+	for bit := range uint8(model.MaxColumns) {
+		if !spec.Mask.Has(bit) {
+			continue
+		}
+		spec.Off[bit] = off
+		off += spec.Len[bit]
+	}
+	return off
 }
 
 // columnByName finds a declared column by its field name.

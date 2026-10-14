@@ -358,7 +358,10 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 	// where "every configured transcode has a decoder" and "every ColSpec
 	// width matches its mask" are answered -- the two rules
 	// config.Unchecked() listed from P1-06 until P2-05.
-	reg, err := decode.BuildRegistry(transcodeSpecs(cfg), dests)
+	// NopCounters: -selfcheck builds the registry to VALIDATE it and never
+	// decodes a message, so there is nothing to count and no instrument
+	// registry resolved at this point.
+	reg, err := decode.BuildRegistry(transcodeSpecs(cfg), dests, decode.NopCounters{})
 	if err != nil {
 		return exitf(ExitSelfCheckFailed, "%w", registryError(err))
 	}

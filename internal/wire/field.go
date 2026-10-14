@@ -47,6 +47,51 @@ const (
 	FieldTimestamp
 	FieldTimeStamp1
 
+	// Alignment padding. ONE identifier for every decoder's pad bytes,
+	// because the trace line says "(alignment padding, ignored)" and the
+	// offset says which structure it was in -- a per-decoder pad name would
+	// add nothing a reader does not already have.
+	FieldAlignmentPad
+
+	// The message body fields, in the wire order of the structure that
+	// introduces each one. Names keep the bible's spelling (Vol 0 section
+	// 10.5), including its capitalisation, so a grep for a field in the spec
+	// finds it in the decoder.
+	//
+	// Shared where the field is shared: 7208 and 7200 carry the same
+	// ST_INTERACTIVE/INTERACTIVE_ONLY prefix up to the auction fields, and
+	// 7305/7340 and the 6511 family share SEC_INFO. One identifier per
+	// distinct FIELD, not per structure that mentions it.
+	FieldNoOfRecords
+	FieldToken
+	FieldBookType
+	FieldTradingStatus
+	FieldVolumeTradedToday
+	FieldLastTradedPrice
+	FieldNetChangeIndicator
+	FieldNetPriceChange
+	FieldLastTradeQuantity
+	FieldLastTradeTime
+	FieldAverageTradePrice
+	FieldAuctionNumber
+	FieldAuctionStatus
+	FieldInitiatorType
+	FieldInitiatorPrice
+	FieldInitiatorQuantity
+	FieldAuctionPrice
+	FieldAuctionQuantity
+	FieldMBPInformation
+	FieldMBOInformation
+	FieldBbTotalBuyFlag
+	FieldBbTotalSellFlag
+	FieldTotalBuyQuantity
+	FieldTotalSellQuantity
+	FieldSTIndicator
+	FieldClosingPrice
+	FieldOpenPrice
+	FieldHighPrice
+	FieldLowPrice
+
 	numFieldIDs
 )
 
@@ -73,6 +118,38 @@ var fieldNames = [numFieldIDs]string{
 	FieldTraderId:   "TraderId",
 	FieldTimestamp:  "Timestamp",
 	FieldTimeStamp1: "TimeStamp1",
+
+	FieldAlignmentPad: "pad",
+
+	FieldNoOfRecords:        "NoOfRecords",
+	FieldToken:              "Token",
+	FieldBookType:           "BookType",
+	FieldTradingStatus:      "TradingStatus",
+	FieldVolumeTradedToday:  "VolumeTradedToday",
+	FieldLastTradedPrice:    "LastTradedPrice",
+	FieldNetChangeIndicator: "NetChangeIndicator",
+	FieldNetPriceChange:     "NetPriceChangeFromClosingPrice",
+	FieldLastTradeQuantity:  "LastTradeQuantity",
+	FieldLastTradeTime:      "LastTradeTime",
+	FieldAverageTradePrice:  "AverageTradePrice",
+	FieldAuctionNumber:      "AuctionNumber",
+	FieldAuctionStatus:      "AuctionStatus",
+	FieldInitiatorType:      "InitiatorType",
+	FieldInitiatorPrice:     "InitiatorPrice",
+	FieldInitiatorQuantity:  "InitiatorQuantity",
+	FieldAuctionPrice:       "AuctionPrice",
+	FieldAuctionQuantity:    "AuctionQuantity",
+	FieldMBPInformation:     "MBP_INFORMATION",
+	FieldMBOInformation:     "ST_MBO_INFO",
+	FieldBbTotalBuyFlag:     "BbTotalBuyFlag",
+	FieldBbTotalSellFlag:    "BbTotalSellFlag",
+	FieldTotalBuyQuantity:   "TotalBuyQuantity",
+	FieldTotalSellQuantity:  "TotalSellQuantity",
+	FieldSTIndicator:        "ST_INDICATOR",
+	FieldClosingPrice:       "ClosingPrice",
+	FieldOpenPrice:          "OpenPrice",
+	FieldHighPrice:          "HighPrice",
+	FieldLowPrice:           "LowPrice",
 }
 
 // String resolves the name. Only a trace sink calls it, so the bounds check

@@ -298,9 +298,17 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 // decoder is registered.
 func (r *receiver) countUnresolved(code model.TransCode) {
 	if decode.CanDecode(code) {
+		// We CAN decode this and nobody told us where to put it: a
+		// configuration mistake an operator fixes in a minute, as against the
+		// protocol change below. P2-05 could only log this, because the
+		// counter's declared label was indexed by the configured inventory and
+		// an unconfigured code has no slot in it; P2-06 moved the instrument
+		// onto the shared dynamic table, so it counts properly now.
+		c, ok := r.in.unconfiguredTranscode(int(code))
+		c.Add(1)
 		r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
 			"transcode %d has a decoder in this build but is not configured, so nothing says "+
-				"which destination its fields belong to (ADR-011)", code)
+				"which destination its fields belong to (ADR-011)%s", code, fullTable(ok))
 		return
 	}
 	c, ok := r.in.unknownTranscode(int(code))
@@ -310,6 +318,17 @@ func (r *receiver) countUnresolved(code model.TransCode) {
 			"transcode %d is not in this build's catalogue, and the unknown-code table is "+
 				"full, so it is counted under unknown_transcode_other", code)
 	}
+}
+
+// fullTable names the one case where a dynamic counter cannot be labelled: the
+// 64-slot table is full, so the count landed in the shared overflow bucket.
+// Said in the line rather than dropped, because a saturated table otherwise
+// looks exactly like an absence of events.
+func fullTable(ok bool) string {
+	if ok {
+		return ""
+	}
+	return " (the dynamic code table is full; counted under the overflow bucket)"
 }
 
 // trace returns the field-trace sink for the transcode being decoded, or nil.

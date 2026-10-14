@@ -107,6 +107,19 @@ var mutations = []mutation{
 			"the wire layout depends on without changing a single byte count.",
 	},
 	{
+		gate: "G-LAY-1", name: "7208-record-stride",
+		pkg: "./internal/decode", file: "internal/decode/mbp_only_7208.go",
+		from: "mbpRecordSize  = 214", to: "mbpRecordSize  = 213",
+		wantErr: "overflows",
+		why: "THE regression this project's gates exist for. 213 is the length the bible " +
+			"DECLARES for INTERACTIVE_ONLY_MBP_DATA and 214 is its true stride: " +
+			"NetChangeIndicator is the record's only odd-sized member, at even offset 16, so " +
+			"pack(2) puts one pad byte at 17. At 213 the message totals 468 and the spec's " +
+			"own 470 is unreachable -- and the symptom is not a crash: every field before " +
+			"offset 17 still decodes correctly while the prices turn to noise and records[1] " +
+			"starts a byte early. poc carried it for months.",
+	},
+	{
 		gate: "G-LAY-1", name: "registry-headroom",
 		pkg: "./internal/decode", file: "internal/decode/registry.go",
 		from: "maxRegistered = 32", to: "maxRegistered = 24",

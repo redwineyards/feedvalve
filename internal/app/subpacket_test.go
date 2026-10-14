@@ -198,18 +198,48 @@ func TestG_FRM_8_ADecoderPanicIsContained(t *testing.T) {
 // but nobody told us what to do with it" must be distinguishable from "we have
 // never seen this code". The first is a configuration mistake an operator fixes
 // in a minute; the second needs the exchange.
+//
+// BOTH BRANCHES ARE REACHABLE AS OF P2-06, which is what makes this test mean
+// something: until the first decoder was registered, every code was unknown and
+// the distinction was theoretical. 7208 is now catalogued, so an empty registry
+// makes it UNCONFIGURED; 7320 is catalogued by nobody, so it stays unknown.
 func TestUnresolvedCodesAreSeparated(t *testing.T) {
 	f := newSubPacketFixture(t, &fakeRegistry{}, nil)
 
-	// 7208 is not in this build's catalogue yet (P2-06 registers the
-	// decoders), so it is genuinely unknown.
-	if n := f.r.decodeSubPacket(bcastPayload(7208, 470, 478), false, 0, 1); n != 0 {
-		t.Errorf("an unknown code produced %d units", n)
-	}
-	c, _ := f.in.unknownTranscode(7208)
-	if got := c.Load(); got != 1 {
-		t.Errorf("unknown_transcode{7208} = %d, want 1", got)
-	}
+	t.Run("catalogued but not configured", func(t *testing.T) {
+		if n := f.r.decodeSubPacket(bcastPayload(7208, 470, 478), false, 0, 1); n != 0 {
+			t.Errorf("an unconfigured code produced %d units", n)
+		}
+		c, _ := f.in.unconfiguredTranscode(7208)
+		if got := c.Load(); got != 1 {
+			t.Errorf("unconfigured_transcode{7208} = %d, want 1", got)
+		}
+		// And NOT as unknown: conflating the two would hide a one-minute
+		// configuration fix inside a protocol-change investigation.
+		u, _ := f.in.unknownTranscode(7208)
+		if got := u.Load(); got != 0 {
+			t.Errorf("unknown_transcode{7208} = %d; 7208 has a decoder in this build", got)
+		}
+		if log := f.buf.String(); !strings.Contains(log, "not configured") {
+			t.Errorf("the unconfigured WARN is missing:\n%s", log)
+		}
+	})
+
+	t.Run("catalogued by nobody", func(t *testing.T) {
+		// 7320 is out of the Phase 1 inventory on purpose (Vol 1 section 9.1):
+		// it would emit up to 35 units with nowhere to put them.
+		if n := f.r.decodeSubPacket(bcastPayload(7320, 470, 478), false, 0, 1); n != 0 {
+			t.Errorf("an unknown code produced %d units", n)
+		}
+		c, _ := f.in.unknownTranscode(7320)
+		if got := c.Load(); got != 1 {
+			t.Errorf("unknown_transcode{7320} = %d, want 1", got)
+		}
+		u, _ := f.in.unconfiguredTranscode(7320)
+		if got := u.Load(); got != 0 {
+			t.Errorf("unconfigured_transcode{7320} = %d; nothing in this build decodes it", got)
+		}
+	})
 }
 
 // TestHeaderOnlyCodesEmitNothing is Vol 1 section 9.6: 6541 and 6503 are

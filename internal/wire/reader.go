@@ -155,6 +155,31 @@ func (r *FieldReader) Copy(f FieldID, dst []byte) {
 	}
 }
 
+// Raw returns the next n bytes and advances, without decoding them.
+//
+// The counterpart to Copy: Copy writes into a destination the caller owns,
+// while Raw hands back the bytes so the caller can place them somewhere it
+// computes -- which is what a decoder does when it writes a field at its
+// precomputed blob offset.
+//
+// THE RESULT ALIASES THE CALLER'S DATA and is valid only until the next read.
+// It exists to be copied out immediately; retaining it would hand a shard a
+// window onto the decompression buffer (Vol 1 section 5.2).
+//
+// Raw also keeps the cursor honest where a stored field is NARROWER than its
+// wire field: the cursor advances by n, the wire width, whatever the caller
+// chooses to keep. Copying through a short destination instead would advance
+// the cursor by the destination's length and silently desynchronise every
+// field after it -- which is the 6511 message-text case, where 239 wire bytes
+// yield 128 stored ones.
+func (r *FieldReader) Raw(f FieldID, n int) []byte {
+	raw := r.take(n)
+	if r.trace != nil {
+		r.emit(f, raw, raw)
+	}
+	return raw
+}
+
 // Pad advances over ALIGNMENT padding.
 //
 // Semantically distinct from Skip even though the bytes move the same way, and

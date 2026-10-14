@@ -24,6 +24,11 @@ type fakeDecoder struct {
 	bodyLen  int
 	maxUnits int
 	decode   func(model.MsgHeader, []byte, []model.UpdateUnit) (int, error)
+
+	// What the factory was handed, so a test can assert the construction
+	// seam passes them through.
+	cnt   Counters
+	entry *RegistryEntry
 }
 
 func (f fakeDecoder) Code() model.TransCode { return f.code }
@@ -41,13 +46,29 @@ func fake(code model.TransCode) fakeDecoder {
 	return fakeDecoder{code: code, bodyLen: 0, maxUnits: 1}
 }
 
+// factory returns the constructor the catalogue holds. The closure captures a
+// copy, so each registry gets its own instance -- which is the lifetime the
+// real decoders have.
+func (f fakeDecoder) factory() func(Counters, *RegistryEntry) Decoder {
+	return func(c Counters, e *RegistryEntry) Decoder {
+		inst := f
+		inst.cnt = c
+		inst.entry = e
+		return inst
+	}
+}
+
 // withCatalogue replaces the compile-time catalogue for one test.
-func withCatalogue(t *testing.T, decs ...Decoder) {
+//
+// It registers FACTORIES, like the real per-code files do, so a test exercises
+// the same construction path production uses rather than a shortcut that
+// bypasses it.
+func withCatalogue(t *testing.T, decs ...fakeDecoder) {
 	t.Helper()
 	saved := catalogue
 	catalogue = nil
 	for _, d := range decs {
-		register(d)
+		register(d.code, d.factory())
 	}
 	t.Cleanup(func() { catalogue = saved })
 }
@@ -103,7 +124,8 @@ func TestRegisterPanicsOnADuplicate(t *testing.T) {
 			}
 		}
 	}()
-	register(fake(7208))
+	dup := fake(7208)
+	register(dup.code, dup.factory())
 }
 
 func TestLookupResolvesAndMisses(t *testing.T) {
@@ -164,7 +186,7 @@ func TestLookupSlotMatchesTheCounterIndex(t *testing.T) {
 func TestRegistryHoldsItsBound(t *testing.T) {
 	// maxRegistered codes, which is the compile-time bound, and one more than
 	// that must be refused rather than overrun the array.
-	decs := make([]Decoder, 0, maxRegistered+1)
+	decs := make([]fakeDecoder, 0, maxRegistered+1)
 	codes := make([]int, 0, maxRegistered+1)
 	for i := range maxRegistered + 1 {
 		code := model.TransCode(7000 + i)
@@ -173,11 +195,11 @@ func TestRegistryHoldsItsBound(t *testing.T) {
 	}
 	withCatalogue(t, decs...)
 
-	if _, err := BuildRegistry(specsFor(codes[:maxRegistered]...), testDests(t)); err != nil {
+	if _, err := BuildRegistry(specsFor(codes[:maxRegistered]...), testDests(t), NopCounters{}); err != nil {
 		t.Fatalf("exactly maxRegistered (%d) transcodes was rejected: %v", maxRegistered, err)
 	}
 
-	_, err := BuildRegistry(specsFor(codes...), testDests(t))
+	_, err := BuildRegistry(specsFor(codes...), testDests(t), NopCounters{})
 	if err == nil {
 		t.Fatalf("%d transcodes was accepted; the registry holds %d", len(codes), maxRegistered)
 	}

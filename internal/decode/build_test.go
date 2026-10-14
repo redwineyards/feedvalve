@@ -53,7 +53,7 @@ func specsWithContribution(t *testing.T, code int, dest string, columns ...strin
 
 func buildForTest(t *testing.T, codes ...int) Registry {
 	t.Helper()
-	reg, err := BuildRegistry(specsFor(codes...), testDests(t))
+	reg, err := BuildRegistry(specsFor(codes...), testDests(t), NopCounters{})
 	if err != nil {
 		t.Fatalf("BuildRegistry(%v): %v", codes, err)
 	}
@@ -83,11 +83,11 @@ func hasKind(err error, kind ProblemKind) bool {
 func TestG_SC_2_EveryConfiguredTranscodeResolves(t *testing.T) {
 	withCatalogue(t, fake(7208))
 
-	if _, err := BuildRegistry(specsFor(7208), testDests(t)); err != nil {
+	if _, err := BuildRegistry(specsFor(7208), testDests(t), NopCounters{}); err != nil {
 		t.Fatalf("a configured code WITH a decoder was rejected: %v", err)
 	}
 
-	_, err := BuildRegistry(specsFor(7208, 7305), testDests(t))
+	_, err := BuildRegistry(specsFor(7208, 7305), testDests(t), NopCounters{})
 	if err == nil {
 		t.Fatal("7305 was configured with no decoder registered, and the registry accepted it")
 	}
@@ -112,7 +112,7 @@ func TestG_SC_2_EveryConfiguredTranscodeResolves(t *testing.T) {
 func TestG_SC_2_BothMBPCodesAreAccepted(t *testing.T) {
 	withCatalogue(t, fake(7200), fake(7208))
 
-	reg, err := BuildRegistry(specsFor(7200, 7208), testDests(t))
+	reg, err := BuildRegistry(specsFor(7200, 7208), testDests(t), NopCounters{})
 	if err != nil {
 		t.Fatalf("a configuration declaring both 7200 and 7208 was rejected: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestV_T6_ColSpecWidthMatchesItsMask(t *testing.T) {
 
 	first := q.Columns[0].Name()
 	second := q.Columns[1].Name()
-	reg, err := BuildRegistry(specsWithContribution(t, 7208, "MD_TOKEN_QUOTE", first, second), dests)
+	reg, err := BuildRegistry(specsWithContribution(t, 7208, "MD_TOKEN_QUOTE", first, second), dests, NopCounters{})
 	if err != nil {
 		t.Fatalf("BuildRegistry: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestBuildRegistryReportsEveryProblem(t *testing.T) {
 		}},
 	}
 
-	_, err := BuildRegistry(specs, testDests(t))
+	_, err := BuildRegistry(specs, testDests(t), NopCounters{})
 	if err == nil {
 		t.Fatal("an inventory with four distinct problems was accepted")
 	}
@@ -230,7 +230,7 @@ func TestBuildRegistryRejectsADuplicateColumn(t *testing.T) {
 	dests := testDests(t)
 	name := dests.ByName("MD_TOKEN_QUOTE").Columns[0].Name()
 
-	_, err := BuildRegistry(specsWithContribution(t, 7208, "MD_TOKEN_QUOTE", name, name), dests)
+	_, err := BuildRegistry(specsWithContribution(t, 7208, "MD_TOKEN_QUOTE", name, name), dests, NopCounters{})
 	if err == nil {
 		t.Fatal("the same column contributed twice was accepted")
 	}
@@ -245,7 +245,7 @@ func TestBuildRegistryAcceptsAnEmptyInventory(t *testing.T) {
 	// frames, resolves and counts -- which is exactly what P2-05 delivers.
 	withCatalogue(t)
 
-	reg, err := BuildRegistry(nil, testDests(t))
+	reg, err := BuildRegistry(nil, testDests(t), NopCounters{})
 	if err != nil {
 		t.Fatalf("an empty inventory was rejected: %v", err)
 	}

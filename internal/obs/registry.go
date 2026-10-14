@@ -294,6 +294,24 @@ func (r *Reg) UnknownTranscode(code int) (*Counter, bool) {
 	return &r.counters[r.base[IDUnknownTranscode]+slot], true
 }
 
+// UnconfiguredTranscode resolves the counter for a code this build CAN decode
+// but the configuration did not ask for (ADR-011). Same dynamic table as
+// UnknownTranscode, so a code occupies one slot across both.
+//
+// Legal after Freeze for the same reason: which codes are catalogued but
+// unconfigured is a fact about one deployment, and resolving it through a CAS
+// allocates nothing. On a full table the count lands in the shared overflow
+// bucket and ok is false, so the caller can say so in the log -- the
+// alternative, dropping the count, would make a saturated table look like an
+// absence of events.
+func (r *Reg) UnconfiguredTranscode(code int) (*Counter, bool) {
+	slot, ok := r.unknownCodes.slot(int32(code))
+	if !ok {
+		return &r.counters[r.base[IDUnknownTranscodeOther]], false
+	}
+	return &r.counters[r.base[IDUnconfiguredTranscode]+slot], true
+}
+
 // OracleError resolves the counter for one ORA code, claiming a slot. On a
 // full table it returns the reserved overflow slot, which renders
 // oracle_error{other} -- so unlike unknown_transcode there is no separate

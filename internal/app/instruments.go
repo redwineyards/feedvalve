@@ -70,6 +70,18 @@ type instruments struct {
 	packetsByTranscode      []*obs.Counter
 	bodyLenMismatch         []*obs.Counter
 	decompressedLenMismatch []*obs.Counter
+	recordCountClamped      []*obs.Counter
+	booktypeSkipped         []*obs.Counter
+	blobOverrun             []*obs.Counter
+
+	// The decoders' own reports (P2-06), reached through decodeCounters.
+	unitsEmitted     *obs.Counter
+	unitsPerPacket   *obs.Max
+	messageTruncated func(dest, col int) *obs.Counter
+
+	// log is how a counter that needs a line gets one. Held here rather than
+	// passed, because decodeCounters is constructed before the graph.
+	log *obs.AppLogger
 
 	// unknownTranscode is a FUNCTION, not a handle, because it is the one
 	// dynamic label in the ledger: the code is by definition not knowable at
@@ -77,6 +89,11 @@ type instruments struct {
 	// documented exception to G-OBS-1, which is why it is reached through the
 	// registry rather than resolved here.
 	unknownTranscode func(code int) (*obs.Counter, bool)
+
+	// unconfiguredTranscode is the sibling branch of ADR-011's distinction,
+	// and it shares the same dynamic table -- so a code claims one slot and
+	// both counters index it.
+	unconfiguredTranscode func(code int) (*obs.Counter, bool)
 
 	// stats-owned
 	clockStepDetected *obs.Counter
@@ -129,7 +146,11 @@ func resolveInstruments(reg obs.Registry) instruments {
 			obs.HeaderAssetRate: reg.CounterAt(obs.IDMessageHeaderSeen, int(obs.HeaderAssetRate)),
 		},
 
-		unknownTranscode: unknownTranscodeFunc(reg),
+		unknownTranscode:      unknownTranscodeFunc(reg),
+		unconfiguredTranscode: unconfiguredTranscodeFunc(reg),
+		unitsEmitted:          reg.Counter(obs.IDUnitsEmitted),
+		unitsPerPacket:        reg.Max(obs.IDUnitsPerPacketMax),
+		messageTruncated:      messageTruncatedFunc(reg),
 	}
 }
 
@@ -153,10 +174,41 @@ func (in *instruments) resolveTranscodeInstruments(reg obs.Registry, n int) {
 	in.packetsByTranscode = make([]*obs.Counter, n)
 	in.bodyLenMismatch = make([]*obs.Counter, n)
 	in.decompressedLenMismatch = make([]*obs.Counter, n)
+	in.recordCountClamped = make([]*obs.Counter, n)
+	in.booktypeSkipped = make([]*obs.Counter, n)
+	in.blobOverrun = make([]*obs.Counter, n)
 	for i := range n {
 		in.packetsByTranscode[i] = reg.CounterAt(obs.IDPacketsByTranscode, i)
 		in.bodyLenMismatch[i] = reg.CounterAt(obs.IDBodyLenMismatch, i)
 		in.decompressedLenMismatch[i] = reg.CounterAt(obs.IDDecompressedLenMismatch, i)
+		in.recordCountClamped[i] = reg.CounterAt(obs.IDRecordCountClamped, i)
+		in.booktypeSkipped[i] = reg.CounterAt(obs.IDBooktypeSkipped, i)
+		in.blobOverrun[i] = reg.CounterAt(obs.IDBlobOverrun, i)
+	}
+}
+
+// unconfiguredTranscodeFunc adapts obs's second dynamic accessor, the sibling
+// of unknownTranscodeFunc below and for the same reason.
+func unconfiguredTranscodeFunc(reg obs.Registry) func(int) (*obs.Counter, bool) {
+	type unconfiguredResolver interface {
+		UnconfiguredTranscode(code int) (*obs.Counter, bool)
+	}
+	if r, ok := reg.(unconfiguredResolver); ok {
+		return r.UnconfiguredTranscode
+	}
+	var sink obs.Counter
+	return func(int) (*obs.Counter, bool) { return &sink, true }
+}
+
+// messageTruncatedFunc resolves message_truncated{destination,column} lazily.
+//
+// A function rather than a pre-resolved array because the label is TWO
+// dimensional and the column arity differs per destination (16, 9 and 6), so a
+// rectangular array would either waste slots or need its own index arithmetic.
+// It is called only when a value was actually cut, which is not the hot path.
+func messageTruncatedFunc(reg obs.Registry) func(dest, col int) *obs.Counter {
+	return func(dest, col int) *obs.Counter {
+		return reg.CounterAt2(obs.IDMessageTruncated, dest, col)
 	}
 }
 

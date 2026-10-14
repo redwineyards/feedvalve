@@ -74,7 +74,8 @@ var (
 )
 
 // ColSpec is one transcode's declared contribution to one destination: the mask
-// of fields it supplies and the total packed width of their values.
+// of fields it supplies, the total packed width of their values, and where each
+// field sits inside that packed run.
 //
 // Width is PRECOMPUTED, so a decoder bound-checks its blob write in one
 // comparison rather than walking the mask per message. Keeping the sum next to
@@ -83,7 +84,71 @@ var (
 type ColSpec struct {
 	Mask  model.ColMask
 	Width uint16 // sum of the declared widths of Mask's set bits; 0 means no contribution
+
+	// Off is each mask bit's byte offset within the packed run, and Len its
+	// declared width. Vol 0 section 3.4 packs values in ASCENDING BIT ORDER
+	// with no padding, so bit b's offset is the sum of the widths of every
+	// LOWER set bit.
+	//
+	// Resolved at config load (Vol 1 section 10.2's "per-(transcode,
+	// destination) blobOffset[bit] array") and NOT as decoder constants, which
+	// is the subtle part: the run is packed over the CONFIGURED mask, so a
+	// configuration that declares a subset of a transcode's columns shifts
+	// every offset above the one it dropped. A decoder with hardcoded offsets
+	// would keep writing to the full-mask layout and silently mis-place every
+	// field after the gap.
+	//
+	// Indexed by bit, so a decoder writes at Off[bit] with no arithmetic on
+	// the hot path. Entries for unset bits are zero and must not be read; the
+	// mask is the authority on which are live.
+	Off [model.MaxColumns]uint16
+	Len [model.MaxColumns]uint16
 }
+
+// Counters is what a decoder reports that is neither a unit nor an error.
+//
+// Four events, each rare and each already in the instrument ledger. They are
+// counted INSIDE the decoder because that is where the information exists: only
+// the decoder sees the unclamped record count, the gating BookType, the
+// unclamped message length (Vol 1 section 9.5, addition A-07 moving
+// message_truncated's owner from shard to decode) and its own blob arithmetic.
+//
+// An interface defined HERE, by the consumer, and implemented by app over its
+// resolved obs handles. decode therefore does not import obs, and the
+// alternative -- a package-level counter variable set at startup -- would be
+// global mutable state on the one path that must stay testable in isolation.
+//
+// Every method is called at most once per message, so the interface dispatch is
+// free next to the decode itself.
+type Counters interface {
+	// RecordCountClamped is a declared record count outside [0, max]: bible
+	// section 4.8's NoOfRecords, clamped rather than trusted.
+	RecordCountClamped(code model.TransCode)
+
+	// BooktypeSkipped is 7200's BookType outside {1,2} (bible section 4.7), a
+	// PROCESSING decision rather than a parse failure: the message framed and
+	// parsed correctly and we are choosing not to store it.
+	BooktypeSkipped(code model.TransCode)
+
+	// BlobOverrun is a decoder whose writes exceeded its declared
+	// ColSpec.Width -- a code defect, not bad input. The decoder emits ZERO
+	// units for that message rather than a partial one.
+	BlobOverrun(code model.TransCode)
+
+	// MessageTruncated is a stored value cut at its declared width, by
+	// destination and column bit (Vol 0 section 4.5's 128-byte cap).
+	MessageTruncated(dest model.DestID, bit uint8)
+}
+
+// NopCounters discards every report. For tests that are not asserting on
+// counters, and for nothing else: a production path that reached this would
+// lose the only signal that a clamp happened.
+type NopCounters struct{}
+
+func (NopCounters) RecordCountClamped(model.TransCode)   {}
+func (NopCounters) BooktypeSkipped(model.TransCode)      {}
+func (NopCounters) BlobOverrun(model.TransCode)          {}
+func (NopCounters) MessageTruncated(model.DestID, uint8) {}
 
 // RegistryEntry is what the registry stores per code: the decoder, its class,
 // and the per-destination contribution descriptors resolved at config load so

@@ -25,9 +25,30 @@ import (
 // an edit to a decoder that already works. That is the open/closed property
 // NFR11 and ADR-012 ask for, and it is why this is a package-level slice
 // rather than a constructor argument threaded through app.
-var catalogue []Decoder
+//
+// # Constructors, not values
+//
+// The catalogue holds a FACTORY per code rather than a ready decoder, which is
+// what section 8.2's heading ("Registration and construction") separates.
+// P2-05 registered values; P2-06 needed decoders to carry their Counters, and
+// those are not knowable at init -- they are resolved from the instrument
+// registry at startup step 9, after every init has run. The alternatives were a
+// package-level counter variable (global mutable state on the one path that
+// must stay testable in isolation) or a wider Decode signature, which Vol 0
+// section 3.9 fixes.
+//
+// One consequence worth stating: a decoder instance belongs to ONE registry. A
+// reload builds a new registry and therefore new decoder instances, which is
+// the same lifetime the ColSpecs already have.
+var catalogue []entry
 
-// register adds d to the compile-time catalogue.
+// entry is one catalogued code and the constructor that makes its decoder.
+type entry struct {
+	code model.TransCode
+	make func(Counters, *RegistryEntry) Decoder
+}
+
+// register adds a code and its constructor to the compile-time catalogue.
 //
 // Panics on a duplicate code, and that is deliberate: every register call runs
 // from an init before main, so a duplicate is a programming error discovered at
@@ -35,15 +56,18 @@ var catalogue []Decoder
 // two would mean the binary decodes a transcode with whichever decoder happened
 // to link first -- a difference invisible in the source and dependent on file
 // order.
-func register(d Decoder) {
-	code := d.Code()
+//
+// The code is passed explicitly rather than read from a constructed decoder, so
+// registration needs no Counters and the catalogue can be listed without
+// building anything.
+func register(code model.TransCode, make func(Counters, *RegistryEntry) Decoder) {
 	for _, existing := range catalogue {
-		if existing.Code() == code {
+		if existing.code == code {
 			panic("decode: transaction code " + strconv.Itoa(int(code)) +
 				" is registered twice; each code has exactly one decoder")
 		}
 	}
-	catalogue = append(catalogue, d)
+	catalogue = append(catalogue, entry{code: code, make: make})
 }
 
 // Catalogue returns every code this binary can decode, sorted ascending.
@@ -55,8 +79,8 @@ func register(d Decoder) {
 // which is what makes a diff of them meaningful.
 func Catalogue() []model.TransCode {
 	out := make([]model.TransCode, 0, len(catalogue))
-	for _, d := range catalogue {
-		out = append(out, d.Code())
+	for _, e := range catalogue {
+		out = append(out, e.code)
 	}
 	slices.Sort(out)
 	return out
@@ -66,10 +90,10 @@ func Catalogue() []model.TransCode {
 //
 // A linear scan over at most a few dozen entries, called at config load and by
 // -selfcheck, never per message -- the per-message lookup is Registry.Lookup.
-func catalogueLookup(code model.TransCode) Decoder {
-	for _, d := range catalogue {
-		if d.Code() == code {
-			return d
+func catalogueLookup(code model.TransCode) func(Counters, *RegistryEntry) Decoder {
+	for _, e := range catalogue {
+		if e.code == code {
+			return e.make
 		}
 	}
 	return nil

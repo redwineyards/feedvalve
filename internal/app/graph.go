@@ -266,7 +266,13 @@ func Build(d Deps) (*Graph, error) {
 	// registry since P1-06 -- so a configuration naming a transcode this build
 	// cannot decode fails HERE, at startup, rather than by storing nothing for
 	// it in production.
-	reg, err := decode.BuildRegistry(transcodeSpecs(d.Cfg), d.Dests)
+	// The decoders' counter sink, constructed BEFORE the registry because
+	// BuildRegistry needs it to construct the decoders, and given the registry
+	// immediately after -- which is the only order that works and the reason
+	// setRegistry exists.
+	d.Inst.log = d.Log
+	cnt := newDecodeCounters(&d.Inst)
+	reg, err := decode.BuildRegistry(transcodeSpecs(d.Cfg), d.Dests, cnt)
 	if err != nil {
 		return nil, exitf(ExitStartup, "building the decoder registry: %w", registryError(err))
 	}
@@ -283,6 +289,7 @@ func Build(d Deps) (*Graph, error) {
 			reg.Len(), len(d.Cfg.Transcodes))
 	}
 	d.Inst.resolveTranscodeInstruments(d.Reg, len(d.Cfg.Transcodes))
+	cnt.setRegistry(reg)
 	g.deps = d
 
 	// Published BEFORE any goroutine exists, which is what makes the decoder's
