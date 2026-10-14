@@ -49,15 +49,32 @@ func TestSelfCheckNeedsNeitherPasswordNorNetwork(t *testing.T) {
 		"MD_TOKEN_QUOTE", "181/256",
 		"MD_SECURITY_MASTER", "37/256",
 		"MD_MARKET_STATUS", "142/256",
-		// The rules that cannot run yet are named by identifier, so a
-		// reader can look them up in Vol 4 section 2.2 rather than guess
-		// what "some checks were skipped" means.
-		"NOT checked -- V-T1",
-		"NOT checked -- V-T6",
+		// The rules that cannot run are named by identifier, so a reader can
+		// look them up in Vol 4 section 2.2 rather than guess what "some
+		// checks were skipped" means. V-X7 is the only one left: the Oracle
+		// profile's IDLE_TIME is un-checkable from here by nature.
 		"NOT checked -- V-X7",
+
+		// What this build can decode, and what it is configured to decode --
+		// Vol 1 section 8.2 wants both answerable from a log.
+		"decoder catalogue",
+		"transcode inventory",
+		"(V-T1)",
+		"(V-T6)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("selfcheck output omits %q:\n%s", want, out)
+		}
+	}
+
+	// V-T1 and V-T6 are EVALUATED as of P2-05, so -selfcheck must no longer
+	// disclaim them. A stale disclaimer is worse than none: it tells an
+	// operator a check did not run when it did, and the next person to read
+	// the output trusts it less than they should.
+	for _, gone := range []string{"NOT checked -- V-T1", "NOT checked -- V-T6"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("selfcheck still disclaims %q, but decode.BuildRegistry evaluates it:\n%s",
+				gone, out)
 		}
 	}
 }

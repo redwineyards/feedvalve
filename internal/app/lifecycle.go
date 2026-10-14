@@ -341,23 +341,26 @@ func (p *readErrorPolicy) ok() { p.consecutive = 0 }
 // should be exactly zero over a session; any non-zero value is an incident.
 const maxConsecutiveReadErrors = 64
 
-// startDecoder drains QD. In P1-09 the callback does nothing with the datagram:
-// framing and decode are Phase 2, and what the lifecycle owns is that the
-// consumer exists, that it is the ONLY consumer, and that it drains to empty on
-// close rather than abandoning (Vol 0 section 9.5.7).
+// startDecoder drains QD, framing and dispatching each datagram.
+//
+// Deps.Decode overrides the pipeline, and that seam is for tests only: it is
+// how the lifecycle suite drives the drain with a callback that blocks or
+// counts. In production it is nil and the real path below runs, which from
+// P2-05 is framing.Split over the receiver's sub-packet boundary.
+//
+// The receiver's buffers are allocated HERE, once, before the loop -- 2 KiB of
+// decompression buffer and 14 KiB of fan-out units -- rather than per datagram.
 func (g *Graph) startDecoder() {
 	g.decoderStarted = true
 	g.mark(&g.acquired, "decoder")
 	go func() {
 		defer close(g.decoderDone)
-		decode := g.deps.Decode
-		if decode == nil {
-			// Drain and discard. The datagram still has to be TAKEN, or
-			// shutdown would abandon a ring with items in it.
-			decode = func(*model.Datagram) error { return nil }
+
+		consume := g.deps.Decode
+		if consume == nil {
+			consume = newReceiver(g).decodeDatagram
 		}
-		err := g.qdConsumer.Drain(decode)
-		if err != nil {
+		if err := g.qdConsumer.Drain(consume); err != nil {
 			g.deps.Log.Errorf(obsClassStartup, "decoder stopped: %v", err)
 		}
 	}()

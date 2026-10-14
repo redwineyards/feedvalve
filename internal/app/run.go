@@ -10,6 +10,7 @@ import (
 	"runtime"
 
 	"feedvalve/internal/config"
+	"feedvalve/internal/decode"
 	"feedvalve/internal/destinations"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
@@ -344,9 +345,31 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 		fmt.Fprintln(out, "selfcheck: no database configured")
 	}
 
+	// The catalogue, printed because Vol 1 section 8.2 asks for it: "which
+	// codes does this build know?" should be answerable from a log rather than
+	// from the source tree. Empty until P2-06 registers the first decoder, and
+	// printing an empty list is the point -- it says so rather than leaving a
+	// reader to assume otherwise.
+	cat := decode.Catalogue()
+	fmt.Fprintf(out, "selfcheck: decoder catalogue (%d codes): %v\n", len(cat), cat)
+
+	// V-T1 and V-T6, evaluated rather than deferred. BuildRegistry is the only
+	// place the catalogue and the resolved ColSpecs both exist, so this is
+	// where "every configured transcode has a decoder" and "every ColSpec
+	// width matches its mask" are answered -- the two rules
+	// config.Unchecked() listed from P1-06 until P2-05.
+	reg, err := decode.BuildRegistry(transcodeSpecs(cfg), dests)
+	if err != nil {
+		return exitf(ExitSelfCheckFailed, "%w", registryError(err))
+	}
+	fmt.Fprintf(out, "selfcheck: transcode inventory (%d configured): %v -- every code resolves "+
+		"to a decoder (V-T1) and every ColSpec width matches its mask (V-T6)\n",
+		reg.Len(), reg.Codes())
+
 	// Stated rather than implied, so nobody reads a pass as more than it
 	// is. The list comes from the validator itself rather than from a
-	// string here, so it shrinks automatically as rules become checkable.
+	// string here, so it shrinks automatically as rules become checkable --
+	// and as of P2-05 it is empty, which is why nothing is printed from it.
 	for rule, why := range config.Unchecked() {
 		fmt.Fprintf(out, "selfcheck: NOT checked -- %s: %s\n", rule, why)
 	}

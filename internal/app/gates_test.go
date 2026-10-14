@@ -107,6 +107,29 @@ var mutations = []mutation{
 			"the wire layout depends on without changing a single byte count.",
 	},
 	{
+		gate: "G-LAY-1", name: "registry-headroom",
+		pkg: "./internal/decode", file: "internal/decode/registry.go",
+		from: "maxRegistered = 32", to: "maxRegistered = 24",
+		wantErr: "overflows",
+		why: "The first G-LAY-1 row, and the one that proves the IDIOM rather than a " +
+			"decoder: internal/decode/layout.go holds the two-sided form and the rule for " +
+			"choosing it over the one-sided one, and each decoder's own constant joins the " +
+			"table in P2-06. 32 is sized from the bible's catalogue of 21 broadcast codes, " +
+			"so shrinking it must break the build rather than silently bound the inventory " +
+			"below what the protocol defines.",
+	},
+	{
+		gate: "G-LAY-1", name: "fanout-buffer-overrun",
+		pkg: "./internal/decode", file: "internal/decode/decoder.go",
+		from: "maxDecoderUnits = 35", to: "maxDecoderUnits = 48",
+		wantErr: "overflows",
+		why: "The ONE-SIDED form, which is correct here because the rule is 'at most': a " +
+			"decoder's declared fan-out must fit fanoutBuf's 40 units. A decoder claiming " +
+			"more would write past the buffer on its first message, and 35 (7320/7210) is " +
+			"the largest the bible catalogues -- so raising it past 40 has to be a build " +
+			"failure rather than a buffer overrun at market open.",
+	},
+	{
 		gate: "G-LAY-3", name: "destination-image-overruns",
 		pkg: "./internal/destinations", file: "internal/destinations/layout.go",
 		from: "quoteImageLen  = 181", to: "quoteImageLen  = 300",

@@ -57,15 +57,23 @@ func ValidateAll(c *Config, dests *destinations.Set, prev *Config, mode Mode) er
 	return p.err()
 }
 
-// Unchecked lists the rule identifiers ValidateAll cannot evaluate yet, with
-// the reason. A pass should never be read as more than it is.
+// Unchecked lists the rule identifiers ValidateAll cannot evaluate, with the
+// reason. A pass should never be read as more than it is.
+//
+// EMPTY since P2-05. V-T1 and V-T6 were the two entries, and both are now
+// evaluated -- by decode.BuildRegistry, which is where the catalogue and the
+// resolved ColSpecs exist. They report through this package's own taxonomy
+// (config.Problem, config.ValidationError, the same V- identifiers), so
+// -selfcheck prints them exactly as it prints every other rule and nothing had
+// to learn a second error vocabulary.
+//
+// Kept rather than deleted, and the empty map is the point: the function is the
+// contract that a caller may ask "what did you NOT check?", and the answer
+// being "nothing" is worth stating explicitly. A future rule that cannot be
+// evaluated at load time belongs here on the day it is written, not in a
+// comment.
 func Unchecked() map[string]string {
-	return map[string]string{
-		RuleDecoderExists: "every configured transcode resolves to a registered decoder " +
-			"-- needs the decoder registry (Phase 2)",
-		RuleColSpecWidth: "each ColSpec.Width equals the sum of its mask's declared widths " +
-			"-- needs the decoder registry (Phase 2)",
-	}
+	return map[string]string{}
 }
 
 func validateSchema(p *problems, c *Config, dests *destinations.Set) {

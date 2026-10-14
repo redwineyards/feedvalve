@@ -6,9 +6,11 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"feedvalve/internal/config"
+	"feedvalve/internal/decode"
 	"feedvalve/internal/destinations"
 	"feedvalve/internal/framing"
 	"feedvalve/internal/model"
@@ -149,6 +151,11 @@ type Graph struct {
 	// allocation-free.
 	conn *net.UDPConn
 
+	// runtime is the published configuration-and-registry snapshot (ADR-L11),
+	// loaded once per datagram by the decoder goroutine. Written by Build
+	// before anything starts, and from Phase 5 by the SIGHUP path.
+	runtime atomic.Pointer[Runtime]
+
 	// readerErr is the receiver's terminal error, if it had one: written by
 	// the reader goroutine immediately before it closes readerDone, read by
 	// wait and by nothing else. The channel close is the happens-before, which
@@ -252,6 +259,35 @@ func Build(d Deps) (*Graph, error) {
 	if d.Dests == nil || d.Dests.Len() == 0 {
 		return nil, exitf(ExitStartup, "internal: Build with no destination table")
 	}
+
+	// The decoder registry: level 2 of Vol 1 section 8.1, resolved against the
+	// catalogue and the destination table. This is where rules V-T1 and V-T6
+	// are evaluated -- the two config.Unchecked() named as needing the
+	// registry since P1-06 -- so a configuration naming a transcode this build
+	// cannot decode fails HERE, at startup, rather than by storing nothing for
+	// it in production.
+	reg, err := decode.BuildRegistry(transcodeSpecs(d.Cfg), d.Dests)
+	if err != nil {
+		return nil, exitf(ExitStartup, "building the decoder registry: %w", registryError(err))
+	}
+
+	// Sized from the CONFIGURED inventory, which is what obs sized its {code}
+	// dimension from (obsOptions) -- not from reg.Len(), even though a
+	// successful build makes them equal. They must be the same number or a
+	// per-transcode counter would be resolved at an index obs never allocated,
+	// and the two are derived from the same configuration by different paths,
+	// so the agreement is asserted rather than assumed.
+	if reg.Len() != len(d.Cfg.Transcodes) {
+		return nil, exitf(ExitStartup, "internal: the registry resolved %d of %d configured "+
+			"transcodes; every per-transcode counter is indexed by that position",
+			reg.Len(), len(d.Cfg.Transcodes))
+	}
+	d.Inst.resolveTranscodeInstruments(d.Reg, len(d.Cfg.Transcodes))
+	g.deps = d
+
+	// Published BEFORE any goroutine exists, which is what makes the decoder's
+	// load unconditional rather than a nil check it has to repeat (ADR-L11).
+	g.setRuntime(&Runtime{Cfg: d.Cfg, Reg: reg, Dests: d.Dests})
 	g.mark(&g.acquired, "derived-state")
 
 	// Step 12: pre-allocation, BEFORE any socket exists. A

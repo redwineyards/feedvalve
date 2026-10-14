@@ -1,6 +1,9 @@
 package wire
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // FieldReader is a sequential big-endian cursor over a byte slice. Every read
 // advances the cursor by exactly the bytes consumed, so field order in the
@@ -106,6 +109,74 @@ func (r *FieldReader) I64(f FieldID) int64 {
 	}
 	return v
 }
+
+// F64 reads a DOUBLE: BigEndian.Uint64 then Float64frombits.
+//
+// Not math.Float64frombits(uint64(I64(...))) at the call site, because that
+// reads the field twice in the trace and because a sign-extended intermediate
+// is exactly the kind of conversion that turns a negative price into a
+// different negative price.
+func (r *FieldReader) F64(f FieldID) float64 {
+	raw := r.take(8)
+	v := math.Float64frombits(binary.BigEndian.Uint64(raw))
+	if r.trace != nil {
+		r.emit(f, raw, v)
+	}
+	return v
+}
+
+// Byte reads a CHAR.
+func (r *FieldReader) Byte(f FieldID) byte {
+	raw := r.take(1)
+	if r.trace != nil {
+		r.emit(f, raw, raw[0])
+	}
+	return raw[0]
+}
+
+// Copy copies len(dst) bytes at the cursor into dst and advances.
+//
+// This is the workhorse for stored fields, and the copy is the point: a stored
+// field keeps its WIRE FORM (Vol 0 section 4.1 R1), so it is copied rather than
+// decoded and re-encoded. Decoding a blank-padded CHAR array to a string and
+// re-encoding it would allocate, lose the padding the exchange sent, and make
+// two representations of one field that can disagree.
+//
+// A nil or empty dst advances nothing, which keeps the compile-time shape
+// assertions in decode harmless.
+func (r *FieldReader) Copy(f FieldID, dst []byte) {
+	if len(dst) == 0 {
+		return
+	}
+	raw := r.take(len(dst))
+	copy(dst, raw)
+	if r.trace != nil {
+		r.emit(f, raw, raw)
+	}
+}
+
+// Pad advances over ALIGNMENT padding.
+//
+// Semantically distinct from Skip even though the bytes move the same way, and
+// the distinction is for the human reading a trace: a pad byte is a
+// consequence of pack(2) arithmetic, while a skipped field is something the
+// exchange sent and we chose not to keep. Telling them apart in the trace is
+// how an offset bug gets diagnosed in minutes instead of hours
+// (poc/reader.go:43-53, CLAUDE.md invariant 3).
+func (r *FieldReader) Pad(f FieldID, n int) {
+	if n == 0 {
+		return
+	}
+	raw := r.take(n)
+	if r.trace != nil {
+		r.trace.Field(f.String(), r.base+r.pos-n, r.base+r.pos, raw, padValue)
+	}
+}
+
+// padValue is what a pad read reports instead of a number, carried verbatim
+// from poc/reader.go:52 so the trace a human reads is the trace they are used
+// to -- and so the differential harness of gate G-DIFF-1 sees the same token.
+const padValue = "(alignment padding, ignored)"
 
 // Skip advances over a field that is read but not kept -- Reserved, Filler,
 // AlphaChar, TraderId.
