@@ -154,6 +154,12 @@ func BuildRegistry(specs []TranscodeSpec, dests *destinations.Set, cnt Counters)
 		e := &reg.entries[reg.n-1]
 		resolveContributions(&p, e, spec, dests)
 		e.Dec = make(cnt, e)
+
+		// The trace capability, resolved once here so the dispatcher never
+		// asserts on the receive path (see RegistryEntry.Trace).
+		if tr, ok := e.Dec.(Traceable); ok {
+			e.Trace = tr
+		}
 	}
 
 	if err := p.err(); err != nil {

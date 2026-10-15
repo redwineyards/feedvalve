@@ -378,6 +378,40 @@ recorder `poc/lzo_record_test.go1`. Nothing but that rename reintroduces the dep
 Note that real envelopes cap packed data at 512 bytes (`cPackData[512]`), so fixtures with several
 full-size messages in one buffer are not representative and will be rejected.
 
+## `poc` is a test fixture now — two things about it are frozen
+
+`poc` is no longer only a proof of concept. It is the **oracle** for gate G-DIFF-1, the Phase 2 exit
+criterion: `internal/app`'s differential harness builds `poc`, runs it as a subprocess with
+`-debug`, feeds it a fabricated datagram over UDP, and diffs its field trace against the new
+decoder's field-for-field. That is how the design satisfies req §7, which both *mandates* validating
+the new decoder against `poc` and *forbids* reusing its code — the oracle is its **output**, so no
+`poc` code is linked, imported or copied (ADR-012).
+
+Two consequences, which ADR-012 accepted explicitly and HLD risk R11 tracks:
+
+1. **`poc` must stay buildable.** `TestThePocOracleIsStillBuildable` asserts it directly, because
+   G-DIFF-1 itself *skips* where there is no toolchain — correct on the AIX target, but it would
+   also hide `poc` having been broken on the build host.
+2. **The `-debug` line format is a compatibility contract, not a preference.** `poc/reader.go`'s
+   `logField` and `internal/obs/debug.go`'s `fieldFormat` are byte-identical by intent:
+
+   ```
+   DEBUG field=%-30s offset=%d-%d hex=%x value=%v
+   ```
+
+   A changed column, a changed width or a dropped token breaks the one test that can prove the new
+   decoder agrees with the one it replaces. `internal/obs/debug_test.go` pins our side against a
+   re-declared copy of `poc`'s; nothing can pin `poc`'s side, so **do not reformat that line.** The
+   same goes for the `(alignment padding, ignored)` token and for offsets staying absolute within
+   the broadcast data, prefix included.
+
+What is *not* frozen is `poc`'s behaviour beyond those two points, and the harness deliberately
+models `poc`'s quirks rather than fixing them: it re-parses the broadcast header 2–3 times per
+sub-packet, logs the 8-byte prefix as a field of its own, emits `record[0]..recordBuffer[0].x` with a
+double dot, and has no `MESSAGE_HEADER` concept at all — so for 6541 and 6503 it reads the BCAST
+layout and is simply wrong, which is why those two have no `poc` oracle. Vol 1 §8.6 requires the
+harness not to need `poc` modified, and it does not.
+
 ## Disabled files
 
 `*.go1` files are excluded from the build by their extension. They are the previous cgo

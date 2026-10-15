@@ -335,6 +335,85 @@ func goList(t *testing.T, pattern string) []string {
 	return goListArgs(t, pattern)
 }
 
+// pocPkg is the proof-of-concept relay, which is in the module and must stay
+// there -- as a test fixture, not as a dependency.
+const pocPkg = module + "/poc"
+
+// TestNothingUnderInternalImportsPoc is ADR-012's prohibition, finally
+// machine-checked.
+//
+// req section 7: "No code is reused from poc/." poc remains a normative
+// reference for protocol BEHAVIOUR and the new decoder is validated against
+// its OUTPUT (gate G-DIFF-1 runs it as a subprocess and diffs text), but no
+// poc code may be linked, imported or copied. The Phase 2 exit checklist
+// asserts "poc still builds and its tests still pass; nothing under internal/
+// imports it".
+//
+// Nothing enforced it. The rule table above names feedvalve/poc nowhere, only
+// model and lzo are stdlibOnly, and goListDeps deliberately omits test imports
+// -- so a test-only import would have been invisible to every gate in this
+// file. That gap matters most exactly now: P2-10 is the card that makes poc a
+// fixture, and "we run it as a subprocess" is one careless import away from
+// "we linked it".
+//
+// WHERE THE TEETH ACTUALLY ARE, stated so nobody over-reads this. poc itself is
+// package main, and Go refuses to import a main package, so feedvalve/poc is
+// unimportable today whatever this test says. What it really guards is the two
+// ways that stops being true: a non-main subpackage appearing under poc/, and
+// poc being refactored into a library because something wanted a piece of it.
+// Both are the reasonable-looking first step toward reusing the code req
+// section 7 forbids, and the prefix match covers both. Verified by adding a
+// poc/probe package and importing it from a test here: this fails, and the
+// pre-existing gates do not notice.
+//
+// -test is included HERE and nowhere else, which is the point of a separate
+// check rather than widening goListDeps: that function's exclusion of test
+// imports is load-bearing for gate G-DEP-3, which proves the reference LZO
+// compressor reaches the test binaries and never the shipped one.
+func TestNothingUnderInternalImportsPoc(t *testing.T) {
+	for _, pattern := range []string{"./internal/...", "./cmd/..."} {
+		deps := goListArgs(t, "-deps", "-test", pattern)
+		if len(deps) == 0 {
+			t.Fatalf("go list -deps -test %s returned nothing; this check would pass vacuously", pattern)
+		}
+		for _, dep := range deps {
+			if dep == pocPkg || strings.HasPrefix(dep, pocPkg+"/") {
+				t.Errorf("%s reaches %s.\n"+
+					"req section 7 forbids reusing poc's code; ADR-012 makes the oracle its "+
+					"OUTPUT, which gate G-DIFF-1 obtains by running the built binary as a "+
+					"subprocess and diffing text. Executing is not importing -- importing is "+
+					"what this forbids.", pattern, dep)
+			}
+		}
+	}
+}
+
+// TestThePocOracleIsStillBuildable is the other half of the obligation ADR-012
+// accepted when it made poc a test fixture.
+//
+// "Worse -- the harness needs poc to remain buildable and its -debug output
+// format to remain stable, so poc becomes a test fixture with a compatibility
+// obligation." Gate G-DIFF-1 skips when there is no toolchain, which is correct
+// on the LPAR and would also hide poc having been broken on the build host. So
+// buildability is asserted separately and cheaply, and the failure says why it
+// matters. HLD risk R11 is this risk.
+func TestThePocOracleIsStillBuildable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("shells the toolchain; slow")
+	}
+	requireGoToolchain(t)
+	root := requireSourceTree(t)
+
+	cmd := exec.Command("go", "build", "-o", devNull(), "./poc")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build ./poc failed: %v\n%s\n"+
+			"poc is the oracle for gate G-DIFF-1 -- the only test that can prove this "+
+			"decoder agrees field-for-field with the one it replaces (HLD R1). Nothing in "+
+			"Phase 2 may break it.", err, out)
+	}
+}
+
 func goListArgs(t *testing.T, args ...string) []string {
 	t.Helper()
 	requireGoToolchain(t)

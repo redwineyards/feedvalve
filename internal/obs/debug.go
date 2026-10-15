@@ -87,6 +87,15 @@ func (d *DebugLogger) Enabled(code int) bool {
 	return false
 }
 
+// Any reports whether ANY transcode is being traced.
+//
+// The cheap pre-check for a caller that must do work just to learn which code
+// it is holding. Resolving a transaction code out of a payload is not free, and
+// in normal operation debug.traceTranscodes is empty -- so a caller asks this
+// first and skips the resolution entirely, which is what keeps the receive path
+// the same cost traced or not.
+func (d *DebugLogger) Any() bool { return len(d.codes) > 0 }
+
 // HexDumpEnabled reports whether debug.hexDump is set, so a caller can skip
 // building a dump nobody will print.
 func (d *DebugLogger) HexDumpEnabled() bool { return d.hexDump }

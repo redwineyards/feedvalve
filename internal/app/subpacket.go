@@ -326,7 +326,12 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		}
 	}
 
-	switch rej := decode.ReadHeader(&r.reader, payload, len(payload), r.trace(), &r.hdr); rej {
+	// Resolved ONCE for this sub-packet and used twice -- for the header read
+	// here and for the body decoder below. Deciding it twice would let the two
+	// halves of one message's trace disagree about whether it is being traced.
+	sink := r.trace(payload, len(payload))
+
+	switch rej := decode.ReadHeader(&r.reader, payload, len(payload), sink, &r.hdr); rej {
 	case model.RejectNone:
 	case model.RejectShortPayload:
 		r.in.shortPayload[obs.PayloadHeader].Add(1)
@@ -427,6 +432,21 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		}
 	}
 
+	// The body's field trace (Vol 1 section 8.6). Set UNCONDITIONALLY, including
+	// to nil: a decoder holds its sink across calls, so skipping the nil case
+	// would leave the last traced message's sink attached and start tracing
+	// traffic nobody asked to trace -- at one boxed value per field.
+	//
+	// Until this line existed, SetTrace had no caller anywhere and
+	// debug.traceTranscodes produced the 40-byte header and not one body field,
+	// which is also what made runbook question Q6a ("are the bytes wrong, or
+	// are the right bytes in the wrong field?") unanswerable by the tool it
+	// names. Entry.Trace is resolved at registry build, so this costs one
+	// interface store and no type assertion.
+	if entry.Trace != nil {
+		entry.Trace.SetTrace(sink)
+	}
+
 	units := entry.Dec.MaxUnits()
 	if units > len(r.fanoutBuf) {
 		units = len(r.fanoutBuf)
@@ -506,15 +526,31 @@ func fullTable(ok bool) string {
 	return " (the dynamic code table is full; counted under the overflow bucket)"
 }
 
-// trace returns the field-trace sink for the transcode being decoded, or nil.
+// trace returns the field-trace sink for the sub-packet in payload, or nil.
 //
 // NIL IS THE NORMAL ANSWER and it is an allocation decision: the value a sink
 // receives is an any, so the caller boxes it, and boxing allocates for anything
 // but a very small integer. Deciding here -- before the reader is handed the
 // sink -- is what keeps a traced build and an untraced one the same cost on
 // every field.
-func (r *receiver) trace() wire.TraceSink {
-	if r.g.deps.Debug == nil || !r.g.deps.Debug.Enabled(int(r.hdr.Code)) {
+//
+// THE CODE COMES FROM THE PAYLOAD, NOT FROM r.hdr, and that is a fix rather
+// than a preference. This used to read r.hdr.Code while being evaluated as an
+// argument to ReadHeader -- which zeroes r.hdr on entry. So the code deciding
+// whether to trace was the PREVIOUS sub-packet's, and configuring
+// debug.traceTranscodes for one code traced whatever happened to follow it.
+// Silent in both directions: the operator diagnosing 7208 sees fields from
+// another message and believes them.
+//
+// Any() first, so the normal path is one length check. Resolve runs a second
+// time (ReadHeader calls it too) only when an operator has actually asked for a
+// trace, and skipping Enabled's scan as well makes the untraced path cheaper
+// than it was before.
+func (r *receiver) trace(payload []byte, payloadLen int) wire.TraceSink {
+	if r.g.deps.Debug == nil || !r.g.deps.Debug.Any() {
+		return nil
+	}
+	if _, code, _ := decode.Resolve(payload, payloadLen); !r.g.deps.Debug.Enabled(int(code)) {
 		return nil
 	}
 	return r.g.deps.Debug

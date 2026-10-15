@@ -159,10 +159,31 @@ func (NopCounters) MessageTruncated(model.DestID, uint8) {}
 // LastRecv, so a reload that added or reordered a contributor would silently
 // reassign every stored ordering value to the wrong transcode -- which is why
 // the transcode set is startup-only configuration.
+// Traceable is the optional half of Decoder: a decoder whose body can emit a
+// field trace.
+//
+// Separate from Decoder, for two reasons. The two recognised-but-not-decoded
+// codes have no body to trace and no Decoder at all, and a one-method interface
+// defined at the point of use is the shape this tree uses rather than widening
+// an interface every implementation must then satisfy.
+//
+// The sink is stored on the decoder rather than passed to Decode because Decode
+// is the hot path and its signature is fixed (section 8.2): a fifth parameter
+// that is nil in all normal operation would be paid for on every message.
+type Traceable interface{ SetTrace(wire.TraceSink) }
+
 type RegistryEntry struct {
 	Dec   Decoder
 	Code  model.TransCode
 	Class model.Class
+
+	// Trace is Dec asserted to Traceable, or nil when Dec cannot trace.
+	//
+	// RESOLVED AT BUILD TIME, deliberately. Asserting at the call site would
+	// put a type assertion on the receive path for every sub-packet, and
+	// gate G-ALLOC-1 measures that path -- the same reason messageTruncated
+	// stopped being resolved lazily in P2-09.
+	Trace Traceable
 
 	// Slots is the contributor slot of Code within each destination, and
 	// Contrib which columns of that destination Code supplies. Both indexed by
