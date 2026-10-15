@@ -98,9 +98,32 @@ type instruments struct {
 	gapAuditDisagree [numGapHypotheses]*obs.Counter
 
 	// The decoders' own reports (P2-06), reached through decodeCounters.
-	unitsEmitted     *obs.Counter
-	unitsPerPacket   *obs.Max
-	messageTruncated func(dest, col int) *obs.Counter
+	unitsEmitted   *obs.Counter
+	unitsPerPacket *obs.Max
+
+	// activeTokens1sMax closes req section 12.4: the distinct tokens seen in
+	// one second, which is the figure the requirement asks to be DERIVED and
+	// this measures directly. Declared in the ledger since P1-07 and resolved
+	// by nothing until P2-09 -- an allocated slab slot that could never carry a
+	// number.
+	activeTokens1sMax *obs.Max
+
+	// messageTruncated is message_truncated{destination,column}, RAGGED: one
+	// row per destination, each as long as that destination's own column list
+	// (16, 9 and 6). Ragged rather than rectangular because the arity differs,
+	// and rectangular would either waste slots or need index arithmetic of its
+	// own -- but resolved at STARTUP either way.
+	//
+	// It used to be a func that called reg.CounterAt2 at the moment of use, on
+	// the reasoning that a two-dimensional label is awkward to pre-resolve and
+	// that truncation is not the hot path. Both true, and both beside the
+	// point: resolution panics once the registry is frozen (gate G-OBS-1), and
+	// the call site sits inside the decode recover boundary -- so the first
+	// truncated value in production would have panicked, been swallowed as
+	// panics_recovered{decode}, cost that message its units, and never
+	// incremented the counter an operator was reading to find out which column
+	// is being cut. Vol 0 section 8.4's MUST is not a performance note.
+	messageTruncated [][]*obs.Counter
 
 	// log is how a counter that needs a line gets one. Held here rather than
 	// passed, because decodeCounters is constructed before the graph.
@@ -143,11 +166,31 @@ type instruments struct {
 // panicked at startup. The agreement Build was protecting is still asserted
 // there, where the decoder registry exists; only the resolution moved to the
 // one place that is allowed to resolve.
-func resolveInstruments(reg obs.Registry, cfg *config.Config) instruments {
+// It takes the destination set for the same reason it takes the config: the
+// {destination,column} label's arity is the destination table's own shape, and
+// it is the same shape obsOptions gave the registry, so the resolution cannot
+// ask for an index obs never allocated.
+func resolveInstruments(reg obs.Registry, cfg *config.Config, dests *destinations.Set) instruments {
 	in := resolveStaticInstruments(reg)
 	in.resolveTranscodeInstruments(reg, len(cfg.Transcodes))
 	in.resolveShardInstruments(reg, cfg.Runtime.Shards)
+	in.resolveDestinationInstruments(reg, dests)
 	return in
+}
+
+// resolveDestinationInstruments resolves the {destination,column} family, whose
+// arity is ragged: each destination has its own column count.
+func (in *instruments) resolveDestinationInstruments(reg obs.Registry, dests *destinations.Set) {
+	all := dests.All()
+	in.messageTruncated = make([][]*obs.Counter, len(all))
+	for d := range all {
+		cols := all[d].Columns
+		row := make([]*obs.Counter, len(cols))
+		for c := range cols {
+			row[c] = reg.CounterAt2(obs.IDMessageTruncated, d, c)
+		}
+		in.messageTruncated[d] = row
+	}
 }
 
 // resolveStaticInstruments resolves everything whose arity is a vocabulary obs
@@ -216,9 +259,9 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 			obs.HypothesisPerTranscode: reg.CounterAt(obs.IDGapAuditDisagree,
 				int(obs.HypothesisPerTranscode)),
 		},
-		unitsEmitted:     reg.Counter(obs.IDUnitsEmitted),
-		unitsPerPacket:   reg.Max(obs.IDUnitsPerPacketMax),
-		messageTruncated: messageTruncatedFunc(reg),
+		unitsEmitted:      reg.Counter(obs.IDUnitsEmitted),
+		unitsPerPacket:    reg.Max(obs.IDUnitsPerPacketMax),
+		activeTokens1sMax: reg.Max(obs.IDActiveTokens1sMax),
 
 		stallBudgetUsedMaxNs: reg.Max(obs.IDStallBudgetUsedMaxNs),
 	}
@@ -277,18 +320,6 @@ func unconfiguredTranscodeFunc(reg obs.Registry) func(int) (*obs.Counter, bool) 
 	}
 	var sink obs.Counter
 	return func(int) (*obs.Counter, bool) { return &sink, true }
-}
-
-// messageTruncatedFunc resolves message_truncated{destination,column} lazily.
-//
-// A function rather than a pre-resolved array because the label is TWO
-// dimensional and the column arity differs per destination (16, 9 and 6), so a
-// rectangular array would either waste slots or need its own index arithmetic.
-// It is called only when a value was actually cut, which is not the hot path.
-func messageTruncatedFunc(reg obs.Registry) func(dest, col int) *obs.Counter {
-	return func(dest, col int) *obs.Counter {
-		return reg.CounterAt2(obs.IDMessageTruncated, dest, col)
-	}
 }
 
 // unknownTranscodeFunc adapts the one dynamic accessor obs exposes. A closure

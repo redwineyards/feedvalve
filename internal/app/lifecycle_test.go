@@ -52,7 +52,7 @@ func testGraphWith(t *testing.T, listen string, tune func(*config.Config),
 
 	buf := &syncBuf{}
 	reg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(reg, cfg)
+	inst := resolveInstruments(reg, cfg, dests)
 	reg.SetIntervalSec(cfg.Stats.IntervalSec)
 	reg.Freeze()
 
@@ -428,7 +428,7 @@ func TestBuildRejectsABadCapacityWithoutPanicking(t *testing.T) {
 	}
 	buf := &syncBuf{}
 	reg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(reg, cfg)
+	inst := resolveInstruments(reg, cfg, dests)
 	reg.Freeze()
 
 	g, err := Build(Deps{

@@ -55,6 +55,15 @@ type receiver struct {
 	// plain memory, no atomics, no locks (Vol 0 section 9.1).
 	gap *decode.GapDetector
 
+	// activeTokens is req section 12.4's per-second distinct-token set, owned
+	// by this goroutine under the same rule as gap (Vol 1 section 11.3).
+	activeTokens *tokenSet
+
+	// activeSecond is the second activeTokens is currently accumulating,
+	// derived from RecvMono. See decodeDatagram for why the boundary is crossed
+	// here rather than by a ticker.
+	activeSecond int64
+
 	// The per-datagram fan-out state, reset at the top of decodeDatagram.
 	//
 	// t0 is the origin of the FAN-OUT budget and it is taken HERE, at dequeue,
@@ -107,6 +116,10 @@ func newReceiver(g *Graph) *receiver {
 		g:          g,
 		in:         g.inst(),
 		stallTimer: t,
+		// 4 MiB at the default expectedRows, allocated HERE rather than on the
+		// first datagram: a first-datagram allocation of this would land on
+		// packet one at market open, the one moment with no slack.
+		activeTokens: newTokenSet(cfg.Runtime.ExpectedRows),
 		gap: decode.NewGapDetector(
 			decode.ParseGapScope(cfg.Ordering.GapScope),
 			cfg.Ordering.GapAuditPackets,
@@ -153,6 +166,25 @@ func (r *receiver) decodeDatagram(d *model.Datagram) error {
 	r.unitsInDatagram = 0
 	r.fatalErr = nil
 
+	// The active-token set's one-second boundary (Vol 1 section 11.3).
+	//
+	// Crossed HERE, on this goroutine, and deliberately not by a ticker. The
+	// set is plain memory with no atomics and no locks because one goroutine
+	// owns it; a second goroutine rolling the generation would need
+	// synchronisation on the structure the receive path touches per unit, which
+	// is the cost the whole design avoids. Derived from RecvMono, which was
+	// read once at the socket, so this reads NO CLOCK and costs one integer
+	// compare per datagram.
+	//
+	// CONSEQUENCE, stated because it is a real one: with no traffic the
+	// boundary never rolls and the instrument holds its last value. That is
+	// correct for a _max over the stats interval -- no traffic means no active
+	// tokens, and the alternative is a goroutine and a lock to publish a zero.
+	if sec := d.RecvMono / 1_000_000_000; sec != r.activeSecond {
+		r.activeSecond = sec
+		r.in.activeTokens1sMax.Observe(uint64(r.activeTokens.Roll()))
+	}
+
 	// Step 1 of Vol 1 section 3.4, in the place this topology puts it: ONE
 	// snapshot load, held for every sub-packet below (see loadRuntime).
 	r.rt = r.g.loadRuntime()
@@ -168,9 +200,15 @@ func (r *receiver) decodeDatagram(d *model.Datagram) error {
 	if n := d.Bytes(); len(n) >= 2 {
 		if !wire.EnvelopeNetIDMatches(n[0:2], r.rt.Cfg.UDP.ExpectedNetID) {
 			r.in.netidMismatch.Add(1)
-			r.g.deps.Log.Warnf(obs.ClassNetidMismatch,
-				"envelope net_id mismatch expected=%d observed=%x -- wrong segment, or cNetId "+
-					"is encoded differently than assumed", r.rt.Cfg.UDP.ExpectedNetID, n[0:2])
+			// Allow first: the observed bytes go in as a SLICE, which boxes
+			// into the variadic and allocates -- once per datagram, on a feed
+			// pointed at the wrong segment, where every datagram trips this
+			// (Vol 1 section 11.5).
+			if r.g.deps.Log.Allow(obs.ClassNetidMismatch) {
+				r.g.deps.Log.Warnf(obs.ClassNetidMismatch,
+					"envelope net_id mismatch expected=%d observed=%x -- wrong segment, or cNetId "+
+						"is encoded differently than assumed", r.rt.Cfg.UDP.ExpectedNetID, n[0:2])
+			}
 		}
 	}
 
@@ -180,9 +218,11 @@ func (r *receiver) decodeDatagram(d *model.Datagram) error {
 		// Index and offset, because framing_abandoned cannot distinguish nine
 		// rules and the operator needs to know which one fired and where
 		// (Vol 1 section 4.2).
-		r.g.deps.Log.Errorf(obs.ClassFramingAbandoned,
-			"framing abandoned after %d of %d sub-packets: %v at offset %d",
-			res.SubPackets, res.NoPackets, res.Rule, res.Offset)
+		if r.g.deps.Log.Allow(obs.ClassFramingAbandoned) {
+			r.g.deps.Log.Errorf(obs.ClassFramingAbandoned,
+				"framing abandoned after %d of %d sub-packets: %v at offset %d",
+				res.SubPackets, res.NoPackets, res.Rule, res.Offset)
+		}
 	}
 
 	// The only error this function returns, and it stops the drain. A framing
@@ -241,9 +281,11 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		if rec := recover(); rec != nil {
 			n = 0
 			r.in.panicsRecovered.Add(1)
-			r.g.deps.Log.Errorf(obs.ClassPanicRecovered,
-				"recovered from a panic decoding sub-packet %d/%d (%d bytes, compressed=%v): %v",
-				idx+1, count, len(payload), compressed, rec)
+			if r.g.deps.Log.Allow(obs.ClassPanicRecovered) {
+				r.g.deps.Log.Errorf(obs.ClassPanicRecovered,
+					"recovered from a panic decoding sub-packet %d/%d (%d bytes, compressed=%v): %v",
+					idx+1, count, len(payload), compressed, rec)
+			}
 		}
 	}()
 
@@ -267,14 +309,21 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 	// means the PREVIOUS sub-packet's length was computed wrongly.
 	if len(payload) > 0 && !wire.NetIDMatches(payload[0], r.rt.Cfg.UDP.ExpectedNetID) {
 		r.in.netidMismatch.Add(1)
-		hint := "wrong segment, or the netId prefix is encoded differently than assumed"
-		if idx > 0 {
-			hint = "likely frame misalignment: the previous sub-packet's length was probably " +
-				"computed wrongly"
+		// Allow before the hint is chosen and the five arguments are boxed.
+		// This is F5, a PER-SUB-PACKET warning on a misframed feed, so the
+		// suppressed case is the overwhelmingly common one -- and a datagram
+		// whose first sub-packet misframed produces one of these for every
+		// sub-packet after it (Vol 1 section 11.5).
+		if r.g.deps.Log.Allow(obs.ClassNetidMismatch) {
+			hint := "wrong segment, or the netId prefix is encoded differently than assumed"
+			if idx > 0 {
+				hint = "likely frame misalignment: the previous sub-packet's length was probably " +
+					"computed wrongly"
+			}
+			r.g.deps.Log.Warnf(obs.ClassNetidMismatch,
+				"broadcast data net_id mismatch sub-packet=%d/%d expected=%d observed=%d -- %s",
+				idx+1, count, r.rt.Cfg.UDP.ExpectedNetID, payload[0], hint)
 		}
-		r.g.deps.Log.Warnf(obs.ClassNetidMismatch,
-			"broadcast data net_id mismatch sub-packet=%d/%d expected=%d observed=%d -- %s",
-			idx+1, count, r.rt.Cfg.UDP.ExpectedNetID, payload[0], hint)
 	}
 
 	switch rej := decode.ReadHeader(&r.reader, payload, len(payload), r.trace(), &r.hdr); rej {
@@ -286,10 +335,18 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		// bible section 2.10: the payload is MS_ERROR_RESPONSE, 182 bytes,
 		// regardless of the transaction code. No decoder runs.
 		r.in.errorResponse.Add(1)
-		r.g.deps.Log.Warnf(obs.ClassErrorResponse,
-			"error response: ErrorCode=%d in a %d-byte payload. Which header an error response "+
-				"carries on the broadcast circuit is unstated (ASM-V3); first 64 bytes:\n%s",
-			r.hdr.ErrorCode, len(payload), obs.HexDump(payload[:min(64, len(payload))]))
+		// Allow FIRST: obs.HexDump builds a multi-line string through a
+		// strings.Builder and ~80 Fprintf calls, and it was being built for
+		// every error-response sub-packet whether or not the line survived the
+		// bucket. At wire rate on a feed that is producing error responses --
+		// exactly when the budget has no slack -- that is the single most
+		// expensive thing on this path (Vol 1 section 11.5).
+		if r.g.deps.Log.Allow(obs.ClassErrorResponse) {
+			r.g.deps.Log.Warnf(obs.ClassErrorResponse,
+				"error response: ErrorCode=%d in a %d-byte payload. Which header an error response "+
+					"carries on the broadcast circuit is unstated (ASM-V3); first 64 bytes:\n%s",
+				r.hdr.ErrorCode, len(payload), obs.HexDump(payload[:min(64, len(payload))]))
+		}
 		return 0
 	default:
 		r.in.shortPayload[obs.PayloadHeader].Add(1)
@@ -338,9 +395,11 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		want := int(wire.BroadcastDataPrefixLen) + int(r.hdr.MsgLen)
 		if m := len(payload); m != want {
 			r.in.decompressedLenMismatch[slot].Add(1)
-			r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
-				"decompressed length %d against 8+MessageLength %d for code %d",
-				m, want, r.hdr.Code)
+			if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
+				r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+					"decompressed length %d against 8+MessageLength %d for code %d",
+					m, want, r.hdr.Code)
+			}
 			if m < want {
 				// The declared body is not all there; parsing it would read
 				// past the decompressed data (HLD section 9.5 layer 3).
@@ -374,18 +433,23 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 	}
 	n, err := entry.Dec.Decode(r.hdr, payload, r.fanoutBuf[:units])
 	if err != nil {
-		// A decoder returns package-level sentinels only, so this allocates
-		// nothing. Which sentinel it was goes in the log, not in a counter
-		// label: the counters that matter here already fired above.
-		r.g.deps.Log.Errorf(obs.ClassSessionAnomaly, "decoding code %d: %v", r.hdr.Code, err)
+		// A decoder returns package-level sentinels only, so the error itself
+		// allocates nothing. Which sentinel it was goes in the log, not in a
+		// counter label: the counters that matter here already fired above.
+		// Boxing it into the variadic does allocate, hence the Allow.
+		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
+			r.g.deps.Log.Errorf(obs.ClassSessionAnomaly, "decoding code %d: %v", r.hdr.Code, err)
+		}
 		return 0
 	}
 	if n > units {
 		// A decoder that wrote more than it declared would have written past
 		// fanoutBuf already; this is the assertion that says so rather than
 		// letting the overflow travel downstream.
-		r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
-			"code %d reported %d units with MaxUnits %d", r.hdr.Code, n, units)
+		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
+			r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
+				"code %d reported %d units with MaxUnits %d", r.hdr.Code, n, units)
+		}
 		return 0
 	}
 	return n
@@ -415,14 +479,16 @@ func (r *receiver) countUnresolved(code model.TransCode) {
 		// onto the shared dynamic table, so it counts properly now.
 		c, ok := r.in.unconfiguredTranscode(int(code))
 		c.Add(1)
-		r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
-			"transcode %d has a decoder in this build but is not configured, so nothing says "+
-				"which destination its fields belong to (ADR-011)%s", code, fullTable(ok))
+		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
+			r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+				"transcode %d has a decoder in this build but is not configured, so nothing says "+
+					"which destination its fields belong to (ADR-011)%s", code, fullTable(ok))
+		}
 		return
 	}
 	c, ok := r.in.unknownTranscode(int(code))
 	c.Add(1)
-	if !ok {
+	if !ok && r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
 		r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
 			"transcode %d is not in this build's catalogue, and the unknown-code table is "+
 				"full, so it is counted under unknown_transcode_other", code)

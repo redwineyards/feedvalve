@@ -109,7 +109,7 @@ func newSubPacketFixture(t *testing.T, reg decode.Registry, tune func(*config.Co
 
 	buf := &syncBuf{}
 	obsReg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(obsReg, cfg)
+	inst := resolveInstruments(obsReg, cfg, dests)
 	obsReg.Freeze()
 
 	g := &Graph{

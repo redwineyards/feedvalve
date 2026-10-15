@@ -57,11 +57,14 @@ func (c *decodeCounters) RecordCountClamped(code model.TransCode) {
 		c.in.recordCountClamped[s].Add(1)
 		// Rate-limited by class, because a feed that clamps is likely to
 		// clamp on every message: the token bucket keeps the first few and
-		// counts the rest (obs.AppLogger).
-		c.in.log.Warnf(obs.ClassRecordCountClamped,
-			"transcode %d declared a record count outside its array bound; clamped. "+
-				"Parsing the unused slots would decode the message's trailing padding "+
-				"into a fabricated security", code)
+		// counts the rest (obs.AppLogger). Allow first, so the suppressed
+		// majority does not box its argument (Vol 1 section 11.5).
+		if c.in.log.Allow(obs.ClassRecordCountClamped) {
+			c.in.log.Warnf(obs.ClassRecordCountClamped,
+				"transcode %d declared a record count outside its array bound; clamped. "+
+					"Parsing the unused slots would decode the message's trailing padding "+
+					"into a fabricated security", code)
+		}
 	}
 }
 
@@ -77,9 +80,11 @@ func (c *decodeCounters) BlobOverrun(code model.TransCode) {
 		// A code defect rather than bad input, so it is an ERROR and not a
 		// WARN: the decoder's declared ColSpec.Width and its actual writes
 		// have diverged, and Phase 1's worst case is 181 of 256.
-		c.in.log.Errorf(obs.ClassSessionAnomaly,
-			"transcode %d wrote past its declared blob width; no units emitted for this "+
-				"message. This is a decoder defect, not bad input", code)
+		if c.in.log.Allow(obs.ClassSessionAnomaly) {
+			c.in.log.Errorf(obs.ClassSessionAnomaly,
+				"transcode %d wrote past its declared blob width; no units emitted for this "+
+					"message. This is a decoder defect, not bad input", code)
+		}
 	}
 }
 
@@ -88,8 +93,21 @@ func (c *decodeCounters) BlobOverrun(code model.TransCode) {
 // being cut?" -- and A-07 moved this counter's owner from the shard to decode
 // precisely because the decoder is the only component that ever sees the
 // unclamped length.
+//
+// Bounds-checked rather than trusted, because both indices come from a
+// DECODER: a ColSpec whose bit has drifted past its destination's column list
+// would otherwise index a slot the registry never allocated, inside the recover
+// boundary, where the panic costs the message its units and says nothing useful
+// about why.
 func (c *decodeCounters) MessageTruncated(dest model.DestID, bit uint8) {
-	c.in.messageTruncated(int(dest), int(bit)).Add(1)
+	if int(dest) >= len(c.in.messageTruncated) {
+		return
+	}
+	row := c.in.messageTruncated[dest]
+	if int(bit) >= len(row) {
+		return
+	}
+	row[bit].Add(1)
 }
 
 // decodeCounters also implements decode.Reports, the gap detector's sink
@@ -109,8 +127,12 @@ func (c *decodeCounters) SeqGap(scope decode.GapScope, code model.TransCode,
 
 	c.in.seqGapEvents.Add(1)
 	c.in.seqGapMessages.Add(uint64(missing))
-	c.in.log.Warnf(obs.ClassSeqGap, "seq_gap scope=%s from=%d to=%d missing=%d",
-		gapScopeLabel(scope, code), from, to, missing)
+	// Allow FIRST, because gapScopeLabel builds a string under per-transcode
+	// scope and the four arguments box into the variadic (Vol 1 section 11.5).
+	if c.in.log.Allow(obs.ClassSeqGap) {
+		c.in.log.Warnf(obs.ClassSeqGap, "seq_gap scope=%s from=%d to=%d missing=%d",
+			gapScopeLabel(scope, code), from, to, missing)
+	}
 }
 
 // SeqRegression is a duplicate or a reordered message. NOT a gap -- nothing is
@@ -132,10 +154,12 @@ func (c *decodeCounters) SeqResync(scope decode.GapScope, code model.TransCode,
 
 	c.in.seqResync.Add(1)
 	c.in.seqGapEvents.Add(1)
-	c.in.log.Errorf(obs.ClassSeqGap,
-		"seq_resync scope=%s from=%d to=%d delta=%d -- the sequence source appears to have "+
-			"restarted; the event is counted but the magnitude is NOT added to seq_gap_messages",
-		gapScopeLabel(scope, code), from, to, delta)
+	if c.in.log.Allow(obs.ClassSeqGap) {
+		c.in.log.Errorf(obs.ClassSeqGap,
+			"seq_resync scope=%s from=%d to=%d delta=%d -- the sequence source appears to have "+
+				"restarted; the event is counted but the magnitude is NOT added to seq_gap_messages",
+			gapScopeLabel(scope, code), from, to, delta)
+	}
 }
 
 // GapAudit records one hypothesis's verdict on one message while the audit is
@@ -155,8 +179,14 @@ func (c *decodeCounters) GapAudit(hypothesis int, agree bool) {
 //
 // Formatting happens HERE and not in the detector, which is why Reports takes
 // a scope and a code rather than a string: the detector stays allocation-free
-// on every path including the reporting ones, and this runs only when a line is
-// actually being written.
+// on every path including the reporting ones.
+//
+// This allocates under per-transcode scope, so EVERY caller must sit inside an
+// AppLogger.Allow check. It used to say it "runs only when a line is actually
+// being written", which was false: Warnf takes the bucket after its arguments
+// have already been built, so a suppressed gap line paid for this string
+// anyway -- and a misframed feed suppresses almost all of them. That belief is
+// precisely what Vol 1 section 11.5 exists to correct.
 //
 // A per-transcode report with code 0 is the aggregate bucket -- the dynamic
 // table was full, so there is no code to name and the line says so rather than

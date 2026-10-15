@@ -240,9 +240,15 @@ func (g *Graph) startReader(ctx context.Context) {
 			// entirely rather than matching against nothing.
 			if len(g.srcPrefixes) > 0 && !sourceAllowed(g.srcPrefixes, src) {
 				in.datagramsUnexpectedSrc.Add(1)
-				g.deps.Log.Warnf(obs.ClassUnexpectedSource,
-					"datagram from unexpected source %s (allow-list has %d entries, enforce=%v)",
-					src, len(g.srcPrefixes), cfg.UDP.SourceEnforce)
+				// Allow first: src is a netip.AddrPort and boxing it into the
+				// variadic allocates, per datagram, on the receive goroutine --
+				// and a misconfigured allow-list rejects EVERY datagram, so
+				// this is a wire-rate line (Vol 1 section 11.5).
+				if g.deps.Log.Allow(obs.ClassUnexpectedSource) {
+					g.deps.Log.Warnf(obs.ClassUnexpectedSource,
+						"datagram from unexpected source %s (allow-list has %d entries, enforce=%v)",
+						src, len(g.srcPrefixes), cfg.UDP.SourceEnforce)
+				}
 				if cfg.UDP.SourceEnforce {
 					// THE ONE PLACE FeedValve DISCARDS DATA ON PURPOSE
 					// (section 3.5). Off by default and operator-armed,
@@ -262,11 +268,13 @@ func (g *Graph) startReader(ctx context.Context) {
 			// which the true length in this line is what matters.
 			if n > wire.MaxDatagramLen {
 				in.datagramsOversize.Add(1)
-				g.deps.Log.Warnf(obs.ClassOversizeDatagram,
-					"oversize datagram from %s: %d bytes, over the %d-byte envelope "+
-						"(bible 3.2). Framing it to %d; the envelope assumption has changed -- "+
-						"escalate to the exchange before trusting any decode",
-					src, n, wire.MaxDatagramLen, wire.MaxPackedDataLen)
+				if g.deps.Log.Allow(obs.ClassOversizeDatagram) {
+					g.deps.Log.Warnf(obs.ClassOversizeDatagram,
+						"oversize datagram from %s: %d bytes, over the %d-byte envelope "+
+							"(bible 3.2). Framing it to %d; the envelope assumption has changed -- "+
+							"escalate to the exchange before trusting any decode",
+						src, n, wire.MaxDatagramLen, wire.MaxPackedDataLen)
+				}
 			}
 
 			// Step 8. Truncation is a second-order consequence of the ring's

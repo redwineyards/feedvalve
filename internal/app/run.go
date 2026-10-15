@@ -176,7 +176,7 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 	// AppLogger for the life of the process instead of an unattached one
 	// replaced moments later.
 	reg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(reg, cfg)
+	inst := resolveInstruments(reg, cfg, dests)
 	reg.SetIntervalSec(cfg.Stats.IntervalSec)
 	// Freeze ends resolution. Every accessor panics afterwards (gate G-OBS-1),
 	// which is what enforces Vol 0 section 8.4's MUST that instruments are

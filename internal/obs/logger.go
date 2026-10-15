@@ -64,22 +64,7 @@ type bucket struct {
 // otherwise make elapsed negative and either stall the refill until the clock
 // caught up or, as an unsigned quantity, grant a colossal number of tokens.
 func (b *bucket) take(nowNs, ratePerMin int64) (ok bool, suppressed uint64) {
-	const perMinute = int64(time.Minute)
-
-	last := b.lastRefill.Load()
-	if elapsed := nowNs - last; elapsed > 0 && ratePerMin > 0 {
-		if gain := elapsed * ratePerMin / perMinute; gain > 0 {
-			// Advance lastRefill only by the time actually converted into
-			// tokens, so the remainder is not discarded -- otherwise a class
-			// checked more often than once per token would never refill.
-			consumed := gain * perMinute / ratePerMin
-			if b.lastRefill.CompareAndSwap(last, last+consumed) {
-				if b.tokens.Add(gain) > ratePerMin {
-					b.tokens.Store(ratePerMin)
-				}
-			}
-		}
-	}
+	b.refill(nowNs, ratePerMin)
 
 	if b.tokens.Add(-1) >= 0 {
 		return true, b.suppressed.Swap(0)
@@ -91,6 +76,45 @@ func (b *bucket) take(nowNs, ratePerMin int64) (ok bool, suppressed uint64) {
 	b.tokens.Add(1)
 	b.suppressed.Add(1)
 	return false, 0
+}
+
+// refill converts elapsed monotonic time into tokens. Shared by take and peek
+// so the two cannot drift: a peek computing the refill differently from the
+// take that follows it would report a token the take then refused, which is the
+// one way an advisory gate can lie.
+func (b *bucket) refill(nowNs, ratePerMin int64) {
+	const perMinute = int64(time.Minute)
+
+	last := b.lastRefill.Load()
+	elapsed := nowNs - last
+	if elapsed <= 0 || ratePerMin <= 0 {
+		return
+	}
+	gain := elapsed * ratePerMin / perMinute
+	if gain <= 0 {
+		return
+	}
+	// Advance lastRefill only by the time actually converted into tokens, so
+	// the remainder is not discarded -- otherwise a class checked more often
+	// than once per token would never refill.
+	consumed := gain * perMinute / ratePerMin
+	if b.lastRefill.CompareAndSwap(last, last+consumed) {
+		if b.tokens.Add(gain) > ratePerMin {
+			b.tokens.Store(ratePerMin)
+		}
+	}
+}
+
+// peek reports whether a token is available WITHOUT consuming one.
+//
+// It refills, and that is not optional: the refill is the only thing that ever
+// adds a token, so a peek that skipped it would report "empty" forever once the
+// bucket drained, and a caller gating its take behind it would silence the class
+// permanently. Refilling here and consuming in take is the same two-step take
+// has always done; peek simply stops before the second step.
+func (b *bucket) peek(nowNs, ratePerMin int64) bool {
+	b.refill(nowNs, ratePerMin)
+	return b.tokens.Load() > 0
 }
 
 // AppLogger is the operational logger: startup, errors, transitions, and the
@@ -185,6 +209,49 @@ func (l *AppLogger) Infof(format string, a ...any) {
 		return
 	}
 	l.write("INFO ", format, a...)
+}
+
+// Allow reports whether class may emit now, and is the ONLY thing on the packet
+// path that may be called before building a log line. Call it first; build the
+// message inside the if:
+//
+//	if r.log.Allow(obs.ClassSeqGap) {
+//	    r.log.Warnf(obs.ClassSeqGap, "seq_gap from=%d to=%d missing=%d", last, cur, n)
+//	}
+//
+// Vol 1 section 11.5 is a MUST and this is the only way to satisfy it. Warnf
+// takes the bucket before it formats, but the CALLER's arguments are evaluated
+// and boxed into the variadic at the call site -- which allocates for anything
+// but a very small integer, whether or not the line is emitted. A suppressed
+// line that still allocates gives back exactly the cost the bucket was
+// installed to remove, under precisely the condition (a misframed feed at wire
+// rate) where it matters most.
+//
+// ADVISORY: it does NOT consume a token, so a call site must still go through
+// Warnf or Errorf, which remain the only emitters and keep all the suppression
+// accounting. The alternative -- having Allow take the token and pairing it
+// with a writer that does not -- would put a second, unlimited write path in
+// the package, and a path that exists is a path a future call site reaches
+// without the gate.
+//
+// Two consequences of being advisory, both harmless and both deliberate. A
+// concurrent emitter can take the last token between the Allow and the Warnf,
+// so the arguments are occasionally built for a line that is then suppressed;
+// the accounting stays exact either way, and the receive path is one goroutine.
+// And an Allow that is never followed by a Warnf costs nothing and leaves no
+// trace, because nothing was consumed.
+func (l *AppLogger) Allow(class Class) bool {
+	if class >= numClasses {
+		class = 0
+	}
+	// The level check mirrors the emitter the class belongs to: Warnf is gated
+	// at LevelWarn and Errorf is gated at no level at all. Without this, a
+	// deployment running at ERROR would still pay to build every WARN's
+	// arguments -- the exact cost this method exists to remove.
+	if class < firstErrorClass && l.level > LevelWarn {
+		return false
+	}
+	return l.buckets[class].peek(int64(time.Since(l.start)), l.rate.Load())
 }
 
 // Warnf logs a rate-limited warning.

@@ -82,6 +82,18 @@ func (r *receiver) route(units []model.UpdateUnit, idx, count int) error {
 			u.Flags |= model.FlagOrderingUnusable
 		}
 
+		// req section 12.4's active-token sample. Token-scoped units only: a
+		// general unit is market-wide and carries no token, so it has nothing
+		// distinct to contribute.
+		//
+		// Here rather than in the decoder because this is the one place every
+		// unit of every message passes exactly once -- and it is inside the
+		// iteration gate G-ALLOC-1 measures, which is the whole point of HLD
+		// section 10.4's correction.
+		if !u.General() {
+			r.activeTokens.Insert(uint32(u.Token))
+		}
+
 		k := ShardOf(u, shards, general)
 		if err := r.send(k, u, i, n, idx, count, budget); err != nil {
 			return err
@@ -200,6 +212,14 @@ func (r *receiver) stallFatal(k model.ShardID, u *model.UpdateUnit,
 	// shedding the oldest unit: Q1 carries heterogeneous units for every token
 	// and every transcode routed to that shard, so the oldest queued unit may
 	// be the only carrier of a different destination's columns.
+	//
+	// DELIBERATELY NOT behind an AppLogger.Allow, unlike every other
+	// rate-limited site on this path. Vol 1 section 11.5's argument is that a
+	// suppressed line must not pay for arguments it throws away; this line runs
+	// ONCE, on the way out, and is the single most important line in the log --
+	// the operator's only account of why the process stopped. Guarding it would
+	// let a bucket drained by an unrelated class suppress exactly that. Leave
+	// it, and do not "fix" it to match the others.
 	r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
 		"shard queue stall budget expired; nothing is discarded, the process stops: %s", detail)
 

@@ -45,6 +45,17 @@ const (
 	numClasses
 )
 
+// firstErrorClass is the boundary between the two runs above: classes below it
+// are logged through Warnf, classes from it onward through Errorf.
+//
+// It exists so AppLogger.Allow can apply the same level check as the emitter
+// the class belongs to, without a per-class severity table. The enum's order IS
+// that boundary, which is exactly why TestClassSeverityBoundary pins it --
+// inserting a WARN class after this point would silently mis-gate it, and the
+// symptom (a WARN suppressed at ERROR level, or an ERROR built and thrown away)
+// is invisible in anything but an allocation count.
+const firstErrorClass = ClassDecompressFailed
+
 // logClasses are the {class} label values, in Class order. The order IS the
 // slot order, so reordering this list silently re-labels live counters -- which
 // is what TestClassTableMatchesEnum exists to prevent.
