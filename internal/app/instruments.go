@@ -74,6 +74,16 @@ type instruments struct {
 	booktypeSkipped         []*obs.Counter
 	blobOverrun             []*obs.Counter
 
+	// The gap detector's counters (P2-07). seq_gap_messages is the number to
+	// trend: it is the only loss figure this system can produce, because
+	// everything after the socket is lossless by construction.
+	seqGapEvents     *obs.Counter
+	seqGapMessages   *obs.Counter
+	seqRegression    *obs.Counter
+	seqResync        *obs.Counter
+	gapAuditAgree    [numGapHypotheses]*obs.Counter
+	gapAuditDisagree [numGapHypotheses]*obs.Counter
+
 	// The decoders' own reports (P2-06), reached through decodeCounters.
 	unitsEmitted     *obs.Counter
 	unitsPerPacket   *obs.Max
@@ -148,9 +158,26 @@ func resolveInstruments(reg obs.Registry) instruments {
 
 		unknownTranscode:      unknownTranscodeFunc(reg),
 		unconfiguredTranscode: unconfiguredTranscodeFunc(reg),
-		unitsEmitted:          reg.Counter(obs.IDUnitsEmitted),
-		unitsPerPacket:        reg.Max(obs.IDUnitsPerPacketMax),
-		messageTruncated:      messageTruncatedFunc(reg),
+
+		seqGapEvents:   reg.Counter(obs.IDSeqGapEvents),
+		seqGapMessages: reg.Counter(obs.IDSeqGapMessages),
+		seqRegression:  reg.Counter(obs.IDSeqRegression),
+		seqResync:      reg.Counter(obs.IDSeqResync),
+		gapAuditAgree: [numGapHypotheses]*obs.Counter{
+			obs.HypothesisGlobal: reg.CounterAt(obs.IDGapAuditAgree,
+				int(obs.HypothesisGlobal)),
+			obs.HypothesisPerTranscode: reg.CounterAt(obs.IDGapAuditAgree,
+				int(obs.HypothesisPerTranscode)),
+		},
+		gapAuditDisagree: [numGapHypotheses]*obs.Counter{
+			obs.HypothesisGlobal: reg.CounterAt(obs.IDGapAuditDisagree,
+				int(obs.HypothesisGlobal)),
+			obs.HypothesisPerTranscode: reg.CounterAt(obs.IDGapAuditDisagree,
+				int(obs.HypothesisPerTranscode)),
+		},
+		unitsEmitted:     reg.Counter(obs.IDUnitsEmitted),
+		unitsPerPacket:   reg.Max(obs.IDUnitsPerPacketMax),
+		messageTruncated: messageTruncatedFunc(reg),
 	}
 }
 
@@ -161,6 +188,7 @@ const (
 	numDecompressReasons  = 4 // input | output | lookbehind | not-consumed
 	numPayloadStages      = 2 // header | body
 	numMessageHeaderCodes = 2 // 6541 | 6503
+	numGapHypotheses      = 2 // global | per-transcode
 )
 
 // resolveTranscodeInstruments resolves the per-transcode counters once the

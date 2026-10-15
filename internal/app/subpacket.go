@@ -50,6 +50,10 @@ type receiver struct {
 	// top of decodeDatagram and held for all of its sub-packets.
 	rt *Runtime
 
+	// gap is the BCSeqNo continuity detector, owned by this goroutine alone:
+	// plain memory, no atomics, no locks (Vol 0 section 9.1).
+	gap *decode.GapDetector
+
 	in *instruments
 }
 
@@ -57,7 +61,39 @@ type receiver struct {
 // runs. A first-datagram-triggered allocation of these would land on packet one
 // at market open, which is the one moment the budget has no slack.
 func newReceiver(g *Graph) *receiver {
-	return &receiver{g: g, in: g.inst()}
+	cfg := g.deps.Cfg
+	return &receiver{
+		g:  g,
+		in: g.inst(),
+		gap: decode.NewGapDetector(
+			decode.ParseGapScope(cfg.Ordering.GapScope),
+			cfg.Ordering.GapAuditPackets,
+			g.gapReports(),
+		),
+	}
+}
+
+// gapSlot is the index the gap detector uses for per-transcode scope.
+//
+// It is THE SAME index the counter layer already computed for this code (Vol 1
+// section 7.7), which is what keeps that scope off a map on the receive path:
+// Registry.Slot for a configured code, and obs's dynamic table for one that is
+// catalogued or unknown. A full dynamic table yields -1, which the detector
+// routes to its aggregate bucket.
+//
+// Only consulted under per-transcode scope and during an audit; global scope
+// ignores it, so the lookup is paid for only where it is used.
+func (r *receiver) gapSlot(code model.TransCode) int {
+	if s := r.rt.Reg.Slot(code); s >= 0 {
+		return s
+	}
+	slot, ok := r.g.unknownSlot(int(code))
+	if !ok {
+		return -1
+	}
+	// Offset past the configured inventory's index space, so a configured
+	// transcode and a dynamic-table code can never collide on one slot.
+	return decode.ConfiguredSlots + slot
 }
 
 // decodeDatagram is the decoder goroutine's per-datagram entry point: it is
@@ -198,9 +234,20 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		return 0
 	}
 
-	// P2-07's gap detector runs HERE: after resolution, because BCSeqNo exists
-	// only in a BCAST_HEADER, and before the registry, because an
-	// unconfigured transcode still carries a perfectly good sequence number.
+	// THE GAP DETECTOR, and this position is not interchangeable (Vol 1
+	// section 6.5).
+	//
+	// AFTER resolution, because BCSeqNo exists only in a BCAST_HEADER: at a
+	// MESSAGE_HEADER's offset 14 sits the top half of a nanosecond Timestamp,
+	// which read as a sequence number fabricates a gap of hundreds of millions
+	// on every nine-second heartbeat.
+	//
+	// BEFORE the registry, because an unconfigured transcode still carries a
+	// perfectly good sequence number and occupies a real place in the sequence
+	// space. Skipping those would make global scope under-count by exactly the
+	// traffic we cannot decode, turning every unconfigured code into a
+	// permanent phantom gap (section 7.6).
+	r.gap.Observe(r.hdr, r.gapSlot(r.hdr.Code))
 
 	if r.hdr.Kind == model.HeaderMessage {
 		// Recognised, not decoded (Vol 1 section 9.6): no units, no registry

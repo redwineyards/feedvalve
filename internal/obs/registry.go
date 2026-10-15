@@ -312,6 +312,27 @@ func (r *Reg) UnconfiguredTranscode(code int) (*Counter, bool) {
 	return &r.counters[r.base[IDUnconfiguredTranscode]+slot], true
 }
 
+// UnknownTranscodeSlot returns the dynamic table's INDEX for a code, claiming
+// a slot if the code is new.
+//
+// The index, not the counter, because the gap detector's per-transcode state
+// is indexed by it: Vol 1 section 7.7 requires that scope to reuse "the index
+// the counter layer already computed for this code -- no second lookup, no
+// map", and a detector-local table would be a second answer to a question
+// this one already answers.
+//
+// ok is false when the table is full, in which case the caller shares one
+// aggregate slot and says so -- the same contract as UnknownTranscode above,
+// and legal after Freeze for the same reason: a CAS, no allocation, and a code
+// that is by definition not knowable at startup.
+func (r *Reg) UnknownTranscodeSlot(code int) (int, bool) {
+	slot, ok := r.unknownCodes.slot(int32(code))
+	if !ok {
+		return -1, false
+	}
+	return int(slot), true
+}
+
 // OracleError resolves the counter for one ORA code, claiming a slot. On a
 // full table it returns the reserved overflow slot, which renders
 // oracle_error{other} -- so unlike unknown_transcode there is no separate

@@ -604,3 +604,50 @@ func TestSubPacketPathAllocatesNothing(t *testing.T) {
 		t.Fatalf("the sub-packet path allocates %v times, want 0", allocs)
 	}
 }
+
+// TestGapSlotSpacesCannotCollide pins the composition decode cannot check for
+// itself: the detector's index space is the configured inventory followed by
+// obs's dynamic table, and app is the package that can see both halves.
+//
+// Without the offset, configured transcode 3 and dynamic-table slot 3 would
+// share one sequence space -- two unrelated counters interleaved into a storm
+// of phantom gaps, under the one scope whose whole purpose is to separate them.
+func TestGapSlotSpacesCannotCollide(t *testing.T) {
+	if decode.ConfiguredSlots < 1 {
+		t.Fatalf("ConfiguredSlots = %d", decode.ConfiguredSlots)
+	}
+
+	// obs's dynamic table is 64 entries (Vol 0 section 8.1). decode declares
+	// its own copy of that number because it may not import obs, so the two
+	// are pinned equal HERE.
+	dests, err := destinations.Default()
+	if err != nil {
+		t.Fatalf("destinations.Default: %v", err)
+	}
+	reg := obs.New(obsOptions(config.Defaults(), dests))
+	seen := map[int]bool{}
+	for code := 9000; code < 9000+64; code++ {
+		slot, ok := reg.UnknownTranscodeSlot(code)
+		if !ok {
+			t.Fatalf("the dynamic table refused code %d before 64 were claimed", code)
+		}
+		if slot < 0 || slot >= 64 {
+			t.Fatalf("code %d claimed slot %d, outside the 64 decode reserves for the "+
+				"dynamic table", code, slot)
+		}
+		if seen[slot] {
+			t.Fatalf("slot %d was claimed twice", slot)
+		}
+		seen[slot] = true
+	}
+	if len(seen) != 64 {
+		t.Errorf("the dynamic table yielded %d distinct slots, want 64 -- decode reserves "+
+			"exactly that many past ConfiguredSlots", len(seen))
+	}
+
+	// A 65th code overflows, which the detector routes to its aggregate
+	// bucket rather than indexing out of range.
+	if _, ok := reg.UnknownTranscodeSlot(9999); ok {
+		t.Error("the dynamic table accepted a 65th code")
+	}
+}

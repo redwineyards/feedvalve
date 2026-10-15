@@ -383,6 +383,25 @@ func (g *Graph) getConn() *net.UDPConn {
 	return g.conn
 }
 
+// gapReports is the gap detector's sink. decodeCounters implements both it and
+// decode.Counters, because app holds every handle either needs.
+func (g *Graph) gapReports() decode.Reports {
+	g.deps.Inst.log = g.deps.Log
+	return newDecodeCounters(&g.deps.Inst)
+}
+
+// unknownSlot is obs's dynamic code table, reached through the one accessor
+// that returns an INDEX rather than a counter (Vol 1 section 7.7).
+func (g *Graph) unknownSlot(code int) (int, bool) {
+	type slotResolver interface {
+		UnknownTranscodeSlot(code int) (int, bool)
+	}
+	if r, ok := g.deps.Reg.(slotResolver); ok {
+		return r.UnknownTranscodeSlot(code)
+	}
+	return -1, false
+}
+
 // Len is the number of datagrams currently queued in QD. For diagnostics and
 // for the drain assertion; the ring's own Len is exact only from the producer
 // or the consumer goroutine.

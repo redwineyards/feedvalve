@@ -1,6 +1,8 @@
 package app
 
 import (
+	"strconv"
+
 	"feedvalve/internal/decode"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
@@ -88,4 +90,84 @@ func (c *decodeCounters) BlobOverrun(code model.TransCode) {
 // unclamped length.
 func (c *decodeCounters) MessageTruncated(dest model.DestID, bit uint8) {
 	c.in.messageTruncated(int(dest), int(bit)).Add(1)
+}
+
+// decodeCounters also implements decode.Reports, the gap detector's sink
+// (P2-07). The two interfaces are separate in decode because they have no
+// caller in common -- five decoders implement nothing of Reports -- but one
+// type can satisfy both here, since app holds every handle either needs.
+
+// SeqGap is Vol 1 section 7.4's line and its two counters.
+//
+// The LINE is rate-limited by the per-class token bucket; the COUNTERS are
+// not. A suppressed line still increments both, which is the whole reason the
+// design carries counters as well as logs: seq_gap_messages is the number to
+// trend, and it is the only loss figure this system can produce, because
+// everything after the socket is lossless by construction.
+func (c *decodeCounters) SeqGap(scope decode.GapScope, code model.TransCode,
+	from, to int32, missing int64) {
+
+	c.in.seqGapEvents.Add(1)
+	c.in.seqGapMessages.Add(uint64(missing))
+	c.in.log.Warnf(obs.ClassSeqGap, "seq_gap scope=%s from=%d to=%d missing=%d",
+		gapScopeLabel(scope, code), from, to, missing)
+}
+
+// SeqRegression is a duplicate or a reordered message. NOT a gap -- nothing is
+// missing -- and folding it into seq_gap_events would corrupt the loss figure
+// above.
+//
+// It is also the receiver-side evidence for whether the ordering guard has
+// anything to defend against at all, which is currently unknown (A-03).
+func (c *decodeCounters) SeqRegression() { c.in.seqRegression.Add(1) }
+
+// SeqResync is ADR-L12. The event is counted twice over -- once as a resync and
+// once as a gap event, because something discontinuous really did happen -- but
+// the MAGNITUDE never reaches seq_gap_messages.
+//
+// ERROR rather than WARN: a sequence source restarting mid-session is not
+// routine, and ASM-V4 expects this to fire approximately never.
+func (c *decodeCounters) SeqResync(scope decode.GapScope, code model.TransCode,
+	from, to int32, delta int64) {
+
+	c.in.seqResync.Add(1)
+	c.in.seqGapEvents.Add(1)
+	c.in.log.Errorf(obs.ClassSeqGap,
+		"seq_resync scope=%s from=%d to=%d delta=%d -- the sequence source appears to have "+
+			"restarted; the event is counted but the magnitude is NOT added to seq_gap_messages",
+		gapScopeLabel(scope, code), from, to, delta)
+}
+
+// GapAudit records one hypothesis's verdict on one message while the audit is
+// running (Vol 0 section 8.3 gap G4).
+func (c *decodeCounters) GapAudit(hypothesis int, agree bool) {
+	if hypothesis < 0 || hypothesis >= numGapHypotheses {
+		return
+	}
+	if agree {
+		c.in.gapAuditAgree[hypothesis].Add(1)
+		return
+	}
+	c.in.gapAuditDisagree[hypothesis].Add(1)
+}
+
+// gapScopeLabel renders section 7.4's scope=<global|transcode:NNNN>.
+//
+// Formatting happens HERE and not in the detector, which is why Reports takes
+// a scope and a code rather than a string: the detector stays allocation-free
+// on every path including the reporting ones, and this runs only when a line is
+// actually being written.
+//
+// A per-transcode report with code 0 is the aggregate bucket -- the dynamic
+// table was full, so there is no code to name and the line says so rather than
+// naming one it cannot.
+func gapScopeLabel(scope decode.GapScope, code model.TransCode) string {
+	switch {
+	case scope != decode.GapPerTranscode:
+		return "global"
+	case code == 0:
+		return "transcode:other"
+	default:
+		return "transcode:" + strconv.Itoa(int(code))
+	}
 }
