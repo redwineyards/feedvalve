@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"time"
 
 	"feedvalve/internal/decode"
 	"feedvalve/internal/framing"
@@ -54,6 +55,38 @@ type receiver struct {
 	// plain memory, no atomics, no locks (Vol 0 section 9.1).
 	gap *decode.GapDetector
 
+	// The per-datagram fan-out state, reset at the top of decodeDatagram.
+	//
+	// t0 is the origin of the FAN-OUT budget and it is taken HERE, at dequeue,
+	// not carried over from the receiver's read. Vol 0 section 9.5.6 splits one
+	// budget into two owned by two goroutines, and section 9.2 says the
+	// fan-out's is "started once per dequeued datagram": reusing the receiver's
+	// t0 would charge this budget for however long the datagram sat in QD, so a
+	// momentary queue would make every subsequent fan-out start already
+	// expired.
+	//
+	// ONE budget per datagram, shared by every unit of every sub-packet it
+	// produces (section 10.5 property 1). A per-unit deadline would let a
+	// single datagram stall for 35 x 50 ms and satisfy its own rule the whole
+	// way down.
+	t0              time.Time
+	recvMono        int64
+	datagramBytes   int
+	unitsInDatagram int
+
+	// stallTimer is section 10.5 property 4: ONE reusable timer, allocated
+	// once, owned by this goroutine. Allocating a timer per blocked send would
+	// allocate on the one path that is already in trouble.
+	stallTimer *time.Timer
+
+	// fatalErr is sticky. framing.SubPacketHandler.SubPacket returns nothing --
+	// framing's single job is splitting the envelope, and giving the callback a
+	// return value would change the interface and its layout gate for a
+	// condition that stops the process anyway -- so a stall-budget expiry is
+	// recorded here, short-circuits the remaining sub-packets of this datagram,
+	// and is returned by decodeDatagram once Split has unwound.
+	fatalErr error
+
 	in *instruments
 }
 
@@ -62,9 +95,18 @@ type receiver struct {
 // at market open, which is the one moment the budget has no slack.
 func newReceiver(g *Graph) *receiver {
 	cfg := g.deps.Cfg
+
+	// Created already stopped and drained, so the first Reset arms a clean
+	// timer. NewTimer is the only constructor that gives a *time.Timer with a
+	// channel; the immediate Stop is what keeps it from firing before anything
+	// has blocked.
+	t := time.NewTimer(time.Hour)
+	t.Stop()
+
 	return &receiver{
-		g:  g,
-		in: g.inst(),
+		g:          g,
+		in:         g.inst(),
+		stallTimer: t,
 		gap: decode.NewGapDetector(
 			decode.ParseGapScope(cfg.Ordering.GapScope),
 			cfg.Ordering.GapAuditPackets,
@@ -102,6 +144,15 @@ func (r *receiver) gapSlot(code model.TransCode) int {
 // Returns an error only for a condition that must stop the process. A framing
 // rejection is not one: it costs the rest of one datagram and is counted.
 func (r *receiver) decodeDatagram(d *model.Datagram) error {
+	// The fan-out budget's origin and the per-datagram fan-out state, reset
+	// together at the top so nothing of the previous datagram survives into
+	// this one's budget, counters or fatal line.
+	r.t0 = time.Now()
+	r.recvMono = d.RecvMono
+	r.datagramBytes = int(d.N)
+	r.unitsInDatagram = 0
+	r.fatalErr = nil
+
 	// Step 1 of Vol 1 section 3.4, in the place this topology puts it: ONE
 	// snapshot load, held for every sub-packet below (see loadRuntime).
 	r.rt = r.g.loadRuntime()
@@ -133,20 +184,31 @@ func (r *receiver) decodeDatagram(d *model.Datagram) error {
 			"framing abandoned after %d of %d sub-packets: %v at offset %d",
 			res.SubPackets, res.NoPackets, res.Rule, res.Offset)
 	}
-	return nil
+
+	// The only error this function returns, and it stops the drain. A framing
+	// rejection does not: it costs the rest of one datagram and is counted.
+	return r.fatalErr
 }
 
 // SubPacket implements framing.SubPacketHandler. It is the sub-packet boundary
 // of Vol 1 section 5.5.
 //
 // THE RECOVER IS IN decodeSubPacket, NOT HERE, and the split is ADR-L10. The
-// routing of fanoutBuf -- which arrives in P2-08 and can return
-// ErrStallBudgetExpired -- must sit OUTSIDE the recover boundary, because
-// stall-budget expiry is the one condition the design says must stop the
-// process, and a recover() between it and the lifecycle would eat it. The
-// process would then keep running with a saturated queue, silently, which is
-// the exact outcome the requirement forbids.
+// routing of fanoutBuf can return ErrStallBudgetExpired, and it must sit
+// OUTSIDE the recover boundary, because stall-budget expiry is the one
+// condition the design says must stop the process and a recover() between it
+// and the lifecycle would eat it. The process would then keep running with a
+// saturated queue, silently, which is the exact outcome the requirement
+// forbids.
 func (r *receiver) SubPacket(payload []byte, compressed bool, idx, count int) {
+	if r.fatalErr != nil {
+		// An earlier sub-packet of this datagram exhausted the budget. Split
+		// cannot be told to stop -- its handler returns nothing -- so the
+		// remaining sub-packets are skipped here rather than decoded into
+		// units that have nowhere to go.
+		return
+	}
+
 	r.in.subpacketsTotal.Add(1)
 	if compressed {
 		r.in.subpacketsCompressed.Add(1)
@@ -156,10 +218,10 @@ func (r *receiver) SubPacket(payload []byte, compressed bool, idx, count int) {
 
 	n := r.decodeSubPacket(payload, compressed, idx, count)
 
-	// P2-08 routes fanoutBuf[:n] to shardCh[k] HERE: outside the boundary, so
-	// the fatal path is a plain return that no recover can see. P2-07's gap
-	// detector goes inside, between the header parse and the registry lookup.
-	_ = n
+	// Outside the boundary, so the fatal path is a plain return that no
+	// recover can see. P2-07's gap detector goes inside, between the header
+	// parse and the registry lookup.
+	r.fatalErr = r.route(r.fanoutBuf[:n], idx, count)
 }
 
 // decodeSubPacket is the protected region: decompress, resolve, dispatch.

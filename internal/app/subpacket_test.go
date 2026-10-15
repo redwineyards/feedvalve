@@ -109,16 +109,28 @@ func newSubPacketFixture(t *testing.T, reg decode.Registry, tune func(*config.Co
 
 	buf := &syncBuf{}
 	obsReg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(obsReg)
-	inst.resolveTranscodeInstruments(obsReg, len(cfg.Transcodes))
+	inst := resolveInstruments(obsReg, cfg)
 	obsReg.Freeze()
 
-	g := &Graph{deps: Deps{
-		Cfg: cfg, Reg: obsReg, Dests: dests, Stderr: buf, Inst: inst,
-		Log:   obs.NewAppLogger(buf, obs.ParseLevel("info"), 10000, obsReg),
-		Debug: obs.NewDebugLogger(buf, nil, false),
-	}}
+	g := &Graph{
+		deps: Deps{
+			Cfg: cfg, Reg: obsReg, Dests: dests, Stderr: buf, Inst: inst,
+			Log:   obs.NewAppLogger(buf, obs.ParseLevel("info"), 10000, obsReg),
+			Debug: obs.NewDebugLogger(buf, nil, false),
+		},
+		// Buffered to 1, exactly as Build makes it, so Graph.Fatal can report a
+		// stall-budget expiry without a lifecycle goroutine to receive it. A
+		// nil channel here would block the fan-out forever instead of failing.
+		fatal: make(chan fatalEvent, 1),
+	}
 	g.setRuntime(&Runtime{Cfg: cfg, Reg: reg, Dests: dests})
+
+	// Q1, which these tests fan out into. Allocated through the same method
+	// Build uses, and left WITHOUT a consumer on purpose: at the default
+	// capacity of 4096 no test here emits enough units to fill one, so every
+	// send takes the fast path and the units stay readable afterwards. A test
+	// that wants the blocked path shrinks the capacity instead.
+	g.allocShardQueues(cfg.Runtime.Shards, cfg.Runtime.ShardQueueCapacity)
 
 	rcv := newReceiver(g)
 	rcv.rt = g.loadRuntime()

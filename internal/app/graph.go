@@ -111,11 +111,13 @@ type Deps struct {
 	// Decode is called by the decoder goroutine for every datagram drained
 	// from QD, in arrival order, on that one goroutine.
 	//
-	// This is the seam Phase 2 fills: framing's envelope split, the decoder
+	// This is the seam Phase 2 filled: framing's envelope split, the decoder
 	// registry, and the fan-out onto shardCh[k] under the fan-out budget all
-	// hang off it. nil means "drain and discard", which is what P1-09 ships --
-	// the lifecycle owns that the consumer exists, is the only one, and drains
-	// to empty on close; it does not own what the bytes mean.
+	// hang off it, and in production it is nil so receiver.decodeDatagram
+	// runs. A non-nil value is the TEST seam -- it is how the lifecycle suite
+	// drives the drain with a callback that blocks or counts -- and the
+	// lifecycle owns only that the consumer exists, is the only one, and
+	// drains to empty on close; it does not own what the bytes mean.
 	//
 	// Returning a non-nil error stops the drain and fails Run, which is the
 	// right shape for a decode path whose errors are either per-packet (and so
@@ -135,6 +137,26 @@ type Graph struct {
 	// QD, allocated at startup step 12 and drained at shutdown step 5a.
 	qdProducer *framing.Producer
 	qdConsumer *framing.Consumer
+
+	// Q1: one channel per shard, allocated at startup step 12 and closed at
+	// shutdown step 6. Vol 0 section 9.2 -- model.UpdateUnit BY VALUE, 360
+	// bytes, capacity runtime.shardQueueCapacity.
+	//
+	// By value and not by pointer, and that is ADR-006 rather than a
+	// micro-optimisation: a pointer here would hand a shard a window onto
+	// fanoutBuf, which the decoder overwrites on the very next sub-packet.
+	// model.UpdateUnit is pointer-free and slice-free precisely so this copy is
+	// the whole transfer.
+	//
+	// The producer is the decoder goroutine, sole; the consumer is shard k,
+	// sole -- which is what makes INV-ORDER (Vol 1 section 10.7) hold
+	// structurally, with no sequence number involved.
+	shardCh []chan model.UpdateUnit
+
+	// shardDrainDone is closed by each shard consumer when its channel is
+	// drained and closed, so teardown can join them rather than assume.
+	shardDrainDone        []chan struct{}
+	shardConsumersStarted bool
 
 	// conn is the UDP listener, bound by Run as the LAST resource.
 	//
@@ -277,18 +299,22 @@ func Build(d Deps) (*Graph, error) {
 		return nil, exitf(ExitStartup, "building the decoder registry: %w", registryError(err))
 	}
 
-	// Sized from the CONFIGURED inventory, which is what obs sized its {code}
-	// dimension from (obsOptions) -- not from reg.Len(), even though a
-	// successful build makes them equal. They must be the same number or a
-	// per-transcode counter would be resolved at an index obs never allocated,
-	// and the two are derived from the same configuration by different paths,
-	// so the agreement is asserted rather than assumed.
+	// The per-transcode counters were sized from the CONFIGURED inventory at
+	// step 9, which is what obs sized its {code} dimension from (obsOptions) --
+	// not from reg.Len(), even though a successful build makes them equal.
+	// They must be the same number or a per-transcode counter would index a
+	// slot obs never allocated, and the two are derived from the same
+	// configuration by different paths, so the agreement is asserted here,
+	// where the decoder registry finally exists.
+	//
+	// ASSERTED, NOT RESOLVED. Resolving here is what this check used to sit
+	// beside, and it could not work: Build runs after reg.Freeze(), so the
+	// accessor panics by gate G-OBS-1's design (see resolveInstruments).
 	if reg.Len() != len(d.Cfg.Transcodes) {
 		return nil, exitf(ExitStartup, "internal: the registry resolved %d of %d configured "+
 			"transcodes; every per-transcode counter is indexed by that position",
 			reg.Len(), len(d.Cfg.Transcodes))
 	}
-	d.Inst.resolveTranscodeInstruments(d.Reg, len(d.Cfg.Transcodes))
 	cnt.setRegistry(reg)
 	g.deps = d
 
@@ -312,6 +338,19 @@ func Build(d Deps) (*Graph, error) {
 	}
 	g.qdProducer, g.qdConsumer = p, c
 	g.mark(&g.acquired, "qd-ring")
+
+	// Q1, the other half of step 12: shards x shardQueueCapacity x 360 bytes,
+	// 5.6 MB at the defaults. Allocated HERE, before any socket exists, for the
+	// reason the step exists at all -- a first-datagram-triggered allocation of
+	// megabytes would blow the stall budget on packet one at market open, and
+	// an out-of-memory condition must be a startup failure rather than a
+	// 10:00:00 one.
+	//
+	// config has already validated both numbers (V-RANGE over 1..64 shards,
+	// and V-X4 that generalShard indexes one of them), so there is no bound
+	// check here that would duplicate one the configuration cannot get past.
+	g.allocShardQueues(d.Cfg.Runtime.Shards, d.Cfg.Runtime.ShardQueueCapacity)
+	g.mark(&g.acquired, "shard-channels")
 
 	return g, nil
 }

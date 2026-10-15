@@ -22,7 +22,11 @@ const obsClassStartup = obs.ClassStartupFailed
 // Subtracting wall-clock readings across an NTP step can produce a negative
 // duration, which as an unsigned counter argument is catastrophic and as a
 // remaining-budget computation hands a timer a value near 2^64.
+//
+// The receive loop reads the clock ONCE per datagram and derives both values
+// it needs from that one reading -- t0 for the enqueue budget and
+// t0.Sub(processStart) for RecvMono (Vol 1 section 10.5 property 3). There was
+// a monotonicNow() helper here until P2-08; it went when the budget arrived,
+// because a second time.Now() for the second value would have been the clock
+// read that section is written against.
 var processStart = time.Now()
-
-// monotonicNow returns nanoseconds since the process's monotonic origin.
-func monotonicNow() int64 { return int64(time.Since(processStart)) }

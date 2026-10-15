@@ -52,7 +52,7 @@ func testGraphWith(t *testing.T, listen string, tune func(*config.Config),
 
 	buf := &syncBuf{}
 	reg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(reg)
+	inst := resolveInstruments(reg, cfg)
 	reg.SetIntervalSec(cfg.Stats.IntervalSec)
 	reg.Freeze()
 
@@ -124,7 +124,8 @@ func TestG_LIFE_1_TheSocketIsBoundLast(t *testing.T) {
 	if listener < 0 {
 		t.Fatalf("the listener was never acquired: %v", got)
 	}
-	for _, earlier := range []string{"derived-state", "qd-ring", "decoder", "stats-goroutine"} {
+	for _, earlier := range []string{"derived-state", "qd-ring", "shard-channels",
+		"shard-consumers", "decoder", "stats-goroutine"} {
 		at := idx(earlier)
 		if at < 0 {
 			t.Errorf("%q was never acquired: %v", earlier, got)
@@ -156,7 +157,8 @@ func TestEveryAcquiredResourceIsReleased(t *testing.T) {
 	}
 
 	released := g.Released()
-	for _, want := range []string{"udp-listener", "qd-ring", "decoder", "stats-goroutine"} {
+	for _, want := range []string{"udp-listener", "qd-ring", "decoder",
+		"shard-channels", "shard-consumers", "stats-goroutine"} {
 		if !slices.Contains(released, want) {
 			t.Errorf("%q was acquired but never released (released: %v)", want, released)
 		}
@@ -164,14 +166,22 @@ func TestEveryAcquiredResourceIsReleased(t *testing.T) {
 
 	// And in the order the drain specifies: the listener first, because closing
 	// it is the only way to unblock the receiver; then QD, so the decoder can
-	// drain it; then the decoder itself.
+	// drain it; then the decoder itself; and only then Q1, whose sole producer
+	// the decoder is.
 	li, qi, di := slices.Index(released, "udp-listener"),
 		slices.Index(released, "qd-ring"), slices.Index(released, "decoder")
+	si := slices.Index(released, "shard-channels")
 	if !(li < qi && qi < di) {
 		t.Errorf("the drain released resources in the wrong order: %v.\n"+
 			"Vol 0 section 9.5.7 fixes it: close the socket, let the receiver return, "+
 			"THEN close QD and let the decoder drain it. Closing QD while the receiver "+
 			"can still publish would abandon datagrams at shutdown.", released)
+	}
+	if !(di < si) {
+		t.Errorf("shardCh was closed before the decoder was joined: %v.\n"+
+			"The decoder is Q1's only producer, so closing its channels while it is "+
+			"still running is a send on a closed channel -- a panic at shutdown, on "+
+			"the path that is meant to be the orderly one.", released)
 	}
 }
 
@@ -418,7 +428,7 @@ func TestBuildRejectsABadCapacityWithoutPanicking(t *testing.T) {
 	}
 	buf := &syncBuf{}
 	reg := obs.New(obsOptions(cfg, dests))
-	inst := resolveInstruments(reg)
+	inst := resolveInstruments(reg, cfg)
 	reg.Freeze()
 
 	g, err := Build(Deps{
@@ -643,5 +653,97 @@ func TestTheQDDrainStageAbandonsNothing(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "ERROR") {
 		t.Errorf("the drain logged an ERROR:\n%s", buf.String())
+	}
+}
+
+// TestQDBudgetExpiryIsTerminal is the behavioural half of the P2-08 defect
+// fix, and it is a REGRESSION TEST for code that shipped in Phase 1.
+//
+// The receive loop used to read
+//
+//	if !g.qdProducer.TryPublish(&d) { qdSendBlocked.Add(1) }
+//
+// so a full ring silently discarded the datagram, counted it as a stall, and
+// let the process carry on. Under this test that old code passes every
+// liveness assertion and returns nil from Run while losing hundreds of
+// datagrams -- which is exactly why the assertion here is on the RETURN VALUE
+// and the shutdown reason, not on a counter.
+//
+// req section 10.2 permits one response to a critical-path queue overflowing
+// and Vol 0 section 9.2 files QD's overflow under that same rule, in those
+// words: "FATAL on the first expiry ... (req section 10.2, as Q1)". So the
+// reason is F9 and the process stops.
+func TestQDBudgetExpiryIsTerminal(t *testing.T) {
+	// The decoder never finishes its first datagram until the test says so, so
+	// QD fills and stays full. That is the only way to reach the expiry
+	// without waiting for a real stall.
+	release := make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+
+	g, buf := testGraphWith(t, "127.0.0.1:0", func(c *config.Config) {
+		// The smallest LEGAL ring (V-RANGE's floor is 1024) and a short
+		// budget. Both are real configurations -- a test that filled an
+		// illegal 16-slot ring would prove nothing about the shipped one.
+		c.Runtime.DatagramQueueCapacity = 1024
+		c.UDP.StallBudgetMs = 20
+	}, func(*model.Datagram) error {
+		<-release
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- g.Run(ctx) }()
+	waitUntil(t, "the listener to be bound", func() bool { return g.LocalAddr() != nil })
+
+	conn, err := net.Dial("udp", g.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("dialling the listener: %v", err)
+	}
+	defer conn.Close()
+
+	// More than the ring holds. Once it is full the receiver stops reading,
+	// the socket buffer absorbs some and the kernel drops the rest -- which is
+	// Q0's loss, before our boundary, and not what this test is about.
+	for i := range 4000 {
+		if _, err := conn.Write([]byte{byte(i), 0x01, 0x02}); err != nil {
+			t.Fatalf("writing datagram %d: %v", i, err)
+		}
+	}
+
+	// The shutdown line names the condition, and waiting for it is what makes
+	// the rest of this deterministic: the receiver has given up by the time it
+	// appears, so releasing the decoder below cannot race the expiry.
+	waitUntil(t, "the Q1-overflow shutdown line", func() bool {
+		return strings.Contains(buf.String(), "reason="+FatalQ1Overflow.String())
+	})
+	once.Do(func() { close(release) })
+
+	err = <-done
+	if err == nil {
+		t.Fatal("Run returned nil after the QD budget expired.\n" +
+			"This is the Phase 1 behaviour: the datagram was discarded, the process " +
+			"carried on, and the only trace was a counter an operator reads as a " +
+			"stall. req section 10.2 permits exactly one response, and it is to stop.")
+	}
+	var ee *ExitError
+	if !errors.As(err, &ee) || ee.Code != ExitTerminal {
+		t.Errorf("Run = %v, want an ExitError with code %d (terminal)", err, ExitTerminal)
+	}
+
+	// qd_send_blocked counts publishes that had to WAIT. The receiver waited
+	// once and then stopped, so one is the whole story -- under the old code
+	// this counter reached the hundreds and every increment was a loss.
+	if n := g.inst().qdSendBlocked.Load(); n != 1 {
+		t.Errorf("qd_send_blocked = %d, want 1: it counts sends that had to wait, "+
+			"and the first expiry is terminal so there cannot be a second", n)
+	}
+	if !strings.Contains(buf.String(), "the decoder is not draining") {
+		t.Errorf("the terminal line does not say which side is at fault.\n"+
+			"Vol 0 section 9.5.6: a non-zero qd_send_blocked is a signal about the "+
+			"DECODER, not the socket, and that separation is the whole diagnostic "+
+			"value of splitting the budget in two:\n%s", buf.String())
 	}
 }

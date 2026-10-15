@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"feedvalve/internal/framing"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 	"feedvalve/internal/wire"
@@ -54,6 +55,13 @@ func (g *Graph) Run(ctx context.Context) error {
 	// running. That is the runtime half of C-1 and what gate G-LIFE-3 asserts:
 	// a bind failure must return an error with the database closed, not exit.
 	defer g.teardown()
+
+	// Step 14: the Q1 consumers, BEFORE the decoder that feeds them -- the same
+	// consumers-before-producers rule as below, one queue further down. Until
+	// Phase 3 these discard; what matters now is that the channel always has a
+	// reader, so the fan-out's budget measures the design's fast path rather
+	// than the absence of a shard.
+	g.startShardConsumers()
 
 	// Step 14a: the decoder, BEFORE the producer that feeds it. Consumers
 	// before producers is the same rule that puts the writers before the
@@ -213,11 +221,16 @@ func (g *Graph) startReader(ctx context.Context) {
 			}
 			errs.ok()
 
-			// Step 4. Exactly one clock read per datagram, and it is the
-			// origin of the per-iteration stall budget. RecvMono is also the
-			// ordering guard's receipt clock, so it is taken ONCE, here,
-			// immediately after the read -- never a wall-clock reading.
-			d.RecvMono = int64(monotonicNow())
+			// Step 4. Exactly ONE clock read per datagram, serving both
+			// purposes: t0 is the origin of this iteration's enqueue budget,
+			// and RecvMono is the ordering guard's receipt clock.
+			//
+			// Derived from the same reading rather than taken twice, which is
+			// the whole of section 10.5 property 3 applied here -- and both
+			// are monotonic, because t0 carries time.Now's monotonic reading
+			// and Sub uses it. Never a wall-clock difference.
+			t0 := time.Now()
+			d.RecvMono = int64(t0.Sub(processStart))
 
 			// Step 5.
 			in.datagramsReceived.Add(1)
@@ -265,8 +278,42 @@ func (g *Graph) startReader(ctx context.Context) {
 			d.N = int32(n)
 			copy(d.Buf[:n], buf[:n])
 
+			// Step 9: publish, against the ENQUEUE budget (Vol 0 section
+			// 9.5.6). There is no drop path here and there never was one in
+			// the contract -- req section 10.2 is "FeedValve discards no unit
+			// anywhere", which internal/framing/budget_test.go quotes verbatim.
+			//
+			// TryPublish first, and the second attempt inside PublishWithin is
+			// free because that wrapper's own fast path is the same call. The
+			// reason it is written out rather than folded in is
+			// qd_send_blocked's definition: it counts publishes that had to
+			// WAIT, and the wrapper cannot report which arm it took. Counting
+			// at the call site is what makes a non-zero value mean "the
+			// decoder is behind" rather than "a datagram was lost".
 			if !g.qdProducer.TryPublish(&d) {
 				in.qdSendBlocked.Add(1)
+				err := g.qdProducer.PublishWithin(&d, t0, cfg.StallBudget())
+				switch {
+				case err == nil:
+				case errors.Is(err, framing.ErrClosed):
+					// The ring was closed under us, which only teardown does.
+					// Shutting down, not a failure.
+					return
+				default:
+					// QD full for the whole budget means the decoder is wedged
+					// or starved -- the socket is fine, which is precisely the
+					// diagnostic the two-budget split exists to give. Terminal
+					// under req section 10.2's Q1 rule (Vol 0 section 9.2
+					// says so for QD in those words), and RETURNED so Run's
+					// defers get to run.
+					g.deps.Log.Errorf(obsClassStartup,
+						"QD enqueue budget expired after %s with the ring full (%d/%d) -- "+
+							"the decoder is not draining; nothing is discarded, the process "+
+							"stops", cfg.StallBudget(), g.qdProducer.Len(),
+						cfg.Runtime.DatagramQueueCapacity)
+					g.readerErr = err
+					return
+				}
 			}
 			in.qdDepthMax.Observe(uint64(g.qdProducer.Len()))
 		}
@@ -484,10 +531,18 @@ func (g *Graph) wait(ctx context.Context) (fatalEvent, bool) {
 			// closing readerDone, and observing the close here is the
 			// happens-before.
 			if g.readerErr != nil {
-				return fatalEvent{
-					reason: FatalUDPReadFailure,
-					detail: g.readerErr.Error(),
-				}, true
+				// Two different terminal conditions reach this field, and
+				// naming them apart is the point of the enumeration: a read
+				// failure is the socket, an enqueue-budget expiry is the
+				// DECODER -- the receiver was healthy and had nowhere to put
+				// what it read. Vol 0 section 9.2 files the QD case under req
+				// section 10.2's Q1 rule, in those words, so it reuses F9
+				// rather than inventing a reason the contract does not have.
+				reason := FatalUDPReadFailure
+				if errors.Is(g.readerErr, model.ErrStallBudgetExpired) {
+					reason = FatalQ1Overflow
+				}
+				return fatalEvent{reason: reason, detail: g.readerErr.Error()}, true
 			}
 			// The reader stopped without an error, which means the socket was
 			// closed under it -- a shutdown already under way. Keep waiting
@@ -555,10 +610,18 @@ func (g *Graph) teardown() {
 			g.mark(&g.released, "decoder")
 		}
 
-		// Steps 6 to 10 -- close shardCh[k], the shard drain under one shared
-		// deadline, close batchQ, the writers' last batch -- arrive with
-		// Phase 3 and Phase 4. The ordering is what P1-09 fixes; the stages
-		// slot in here.
+		// Step 6: close every shardCh[k] and let its consumer finish what is
+		// already queued (Vol 0 section 9.5.7).
+		//
+		// AFTER the decoder has returned, and the ordering is what makes the
+		// close safe rather than a panic: the decoder is Q1's sole producer,
+		// so once it is joined nothing can send. Same shape as the QD stage
+		// above -- drained, not abandoned.
+		g.stopShardConsumers()
+
+		// Steps 7 to 10 -- the shard drain under one shared deadline, close
+		// batchQ, the writers' last batch -- arrive with Phase 3 and Phase 4.
+		// The ordering is what P1-09 fixes; the stages slot in here.
 
 		if g.statsStarted {
 			close(g.statsStop)

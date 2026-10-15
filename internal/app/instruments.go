@@ -42,6 +42,19 @@ type instruments struct {
 	// decoder-owned, likewise
 	qdWakeParked *obs.Counter
 
+	// The fan-out's two (P2-08). The ledger assigns both to the receiver, which
+	// in this topology is the decoder goroutine -- the same reconciliation
+	// loadRuntime records, and for the same reason: the contract draws read,
+	// decode and route as one goroutine, and QD was inserted between the first
+	// and the second.
+	//
+	// shardSendBlocked is indexed by shard, resolved by resolveShardInstruments
+	// once the arity is known. Against a shard the design computes as 0.08%
+	// busy, ANY non-zero value here is a defect rather than load -- it is the
+	// only early warning before the fatal path (Vol 4 F24, then F9).
+	shardSendBlocked     []*obs.Counter
+	stallBudgetUsedMaxNs *obs.Max
+
 	// The sub-packet path (P2-05). Resolved here, before Freeze, because
 	// gate G-OBS-1's whole point is that an instrument reaches a struct field
 	// and never a map lookup on a path that runs per datagram -- and these run
@@ -111,7 +124,35 @@ type instruments struct {
 
 // resolveInstruments performs the resolution half of startup step 9. The caller
 // freezes the registry afterwards.
-func resolveInstruments(reg obs.Registry) instruments {
+//
+// EVERY instrument this process resolves is resolved here, including the two
+// labelled families whose arity comes from the configuration. It takes the
+// *config.Config for exactly that: len(cfg.Transcodes) and
+// cfg.Runtime.Shards are the arities, and they are the same two numbers
+// obsOptions gave the registry, so the resolution cannot ask for an index obs
+// never allocated.
+//
+// It is ONE function because the alternative was tried and was wrong.
+// resolveTranscodeInstruments used to be called from Build, on the reasoning
+// that the arity belongs with the decoder registry it must agree with -- but
+// Build runs AFTER reg.Freeze() (run.go step 9), so every accessor in it
+// panics by gate G-OBS-1's design. No test caught it: the lifecycle tests
+// build with no transcodes configured, so the loop body never ran, and the
+// sub-packet tests construct a Graph directly and resolve these themselves
+// before freezing. The first configuration to declare a transcode would have
+// panicked at startup. The agreement Build was protecting is still asserted
+// there, where the decoder registry exists; only the resolution moved to the
+// one place that is allowed to resolve.
+func resolveInstruments(reg obs.Registry, cfg *config.Config) instruments {
+	in := resolveStaticInstruments(reg)
+	in.resolveTranscodeInstruments(reg, len(cfg.Transcodes))
+	in.resolveShardInstruments(reg, cfg.Runtime.Shards)
+	return in
+}
+
+// resolveStaticInstruments resolves everything whose arity is a vocabulary obs
+// owns rather than a number the configuration chose.
+func resolveStaticInstruments(reg obs.Registry) instruments {
 	return instruments{
 		configGeneration:     reg.Gauge(obs.IDConfigGeneration),
 		configReloads:        reg.Counter(obs.IDConfigReloads),
@@ -178,6 +219,17 @@ func resolveInstruments(reg obs.Registry) instruments {
 		unitsEmitted:     reg.Counter(obs.IDUnitsEmitted),
 		unitsPerPacket:   reg.Max(obs.IDUnitsPerPacketMax),
 		messageTruncated: messageTruncatedFunc(reg),
+
+		stallBudgetUsedMaxNs: reg.Max(obs.IDStallBudgetUsedMaxNs),
+	}
+}
+
+// resolveShardInstruments resolves the per-shard counters, whose arity is
+// runtime.shards -- the same number obsOptions gave the registry.
+func (in *instruments) resolveShardInstruments(reg obs.Registry, shards int) {
+	in.shardSendBlocked = make([]*obs.Counter, shards)
+	for k := range shards {
+		in.shardSendBlocked[k] = reg.CounterAt(obs.IDShardSendBlocked, k)
 	}
 }
 
@@ -191,13 +243,12 @@ const (
 	numGapHypotheses      = 2 // global | per-transcode
 )
 
-// resolveTranscodeInstruments resolves the per-transcode counters once the
-// registry is known, which is after resolveInstruments but still before Freeze.
+// resolveTranscodeInstruments resolves the per-transcode counters.
 //
-// Separate from resolveInstruments because the arity is the CONFIGURED
-// inventory's size, which the instrument registry learns from obsOptions and
-// the decoder registry learns from the same configuration -- so the two agree
-// by construction rather than by coincidence, and the test asserts it.
+// The arity is the CONFIGURED inventory's size, which the instrument registry
+// learns from obsOptions and the decoder registry learns from the same
+// configuration -- so the two agree by construction rather than by
+// coincidence, and Build asserts it once both exist.
 func (in *instruments) resolveTranscodeInstruments(reg obs.Registry, n int) {
 	in.packetsByTranscode = make([]*obs.Counter, n)
 	in.bodyLenMismatch = make([]*obs.Counter, n)

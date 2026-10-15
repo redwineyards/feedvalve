@@ -401,3 +401,85 @@ func TestDrainLoopDetectorCatchesTheShapeTheContractNames(t *testing.T) {
 		})
 	}
 }
+
+// TestNoBareQDDropPath encodes the P2-08 exit-checklist line: "grep -r
+// TryPublish internal/app shows no bare drop path".
+//
+// THE DEFECT THIS CATCHES ALREADY HAPPENED. Phase 1's receive loop read
+//
+//	if !g.qdProducer.TryPublish(&d) { qdSendBlocked.Add(1) }
+//
+// which silently DISCARDS the datagram -- against req section 10.2's
+// "FeedValve discards no unit anywhere", which internal/framing/budget_test.go
+// quotes verbatim as "There is no drop path". Producer.PublishWithin,
+// Config.StallBudget and Graph.Fatal all existed and had no production caller;
+// the full-ring policy had been reimplemented, worse, at the call site. The
+// behavioural proof is TestQDBudgetExpiryIsTerminal; this is the structural
+// one, and it is cheap.
+//
+// The rule is deliberately about the FUNCTION rather than the statement: a
+// TryPublish used as the fast path of a policy that also calls PublishWithin
+// is correct and is exactly what the receiver does. A TryPublish alone in a
+// function is the drop path coming back.
+func TestNoBareQDDropPath(t *testing.T) {
+	for _, f := range scanTree(t) {
+		// scanTree normalises rel with filepath.ToSlash, so this is a forward
+		// slash on every platform. filepath.Join here would be a backslash on
+		// Windows, match nothing, and make the whole gate vacuous -- which is
+		// exactly what it did until a break check showed the test passing with
+		// the drop path restored.
+		if !strings.HasPrefix(f.rel, "internal/app/") {
+			continue
+		}
+		forEachFuncCalling(f.file, "TryPublish", func(pos token.Pos, fn string, callees map[string]bool) {
+			if callees["PublishWithin"] {
+				return
+			}
+			t.Errorf("%s: %s calls TryPublish without PublishWithin, at %s.\n"+
+				"A failed TryPublish with no budget behind it DISCARDS the datagram, "+
+				"which req section 10.2 forbids outright -- and it misreports "+
+				"qd_send_blocked, the one counter an operator reads for decoder "+
+				"stall, as a drop count rather than a wait count. Use "+
+				"PublishWithin(d, t0, cfg.StallBudget()) and return its error.",
+				f.rel, fn, f.fset.Position(pos))
+		})
+	}
+}
+
+// forEachFuncCalling reports every top-level function whose body contains a
+// call to want, together with the set of every method name that body calls.
+//
+// Lexical again, and for the same reason the Drain scan is: a policy split
+// across two helpers would not be seen. That is acceptable here because the
+// behavioural test is the real guard and this one exists to catch the shape at
+// review time.
+func forEachFuncCalling(file *ast.File, want string,
+	report func(token.Pos, string, map[string]bool)) {
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		callees := make(map[string]bool)
+		var at token.Pos
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			callees[sel.Sel.Name] = true
+			if sel.Sel.Name == want && !at.IsValid() {
+				at = call.Pos()
+			}
+			return true
+		})
+		if at.IsValid() {
+			report(at, fn.Name.Name, callees)
+		}
+	}
+}
