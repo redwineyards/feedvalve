@@ -216,9 +216,22 @@ type Graph struct {
 
 	teardownOnce sync.Once
 
+	// emitMu serialises the two emitters: the stats goroutine's tick and
+	// logShutdownInitiated on the Run goroutine. They overlap because
+	// teardown stops stats LAST, after the shutdown snapshot has been emitted.
+	// Held around sampleGauges and Reg.Emit together (emitStats), because
+	// both halves are unsafe for two callers: Reg.Emit's snapshot writes the
+	// slab its render pass reads, and sampleGauges read-modify-writes
+	// lastParks, which two callers would turn into a doubled qd_wake_parked.
+	//
+	// Here and not inside obs, which owns no goroutine and has exactly one
+	// caller per emission by design; the lifecycle is what has two.
+	emitMu sync.Mutex
+
 	// lastParks converts the ring's cumulative park count into the delta
 	// qd_wake_parked wants. The ring exposes a plain number because the
 	// ledger assigns that instrument to the decoder, not to framing.
+	// Guarded by emitMu.
 	lastParks uint64
 
 	// stages records every resource acquisition and release, in order.

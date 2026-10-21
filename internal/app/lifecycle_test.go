@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -747,3 +749,194 @@ func TestQDBudgetExpiryIsTerminal(t *testing.T) {
 			"value of splitting the budget in two:\n%s", buf.String())
 	}
 }
+
+// TestTheTwoEmittersAreSerialised is the regression test for P3-01: the
+// obs.Emit + lastParks race that kept `go test -race ./internal/app/` from
+// being green through Phase 2. It is not a gate of its own; it is what lets
+// G-RACE-1 (`go test -race ./...` on every commit) pass over this package.
+//
+// The lifecycle has two emitters. The stats goroutine's tick, and
+// logShutdownInitiated on the Run goroutine -- which overlap, because teardown
+// stops stats LAST, after the shutdown snapshot. Both called sampleGauges (a
+// read-modify-write of the plain lastParks field) and Reg.Emit (whose snapshot
+// writes the slab its render pass reads) with nothing between them.
+//
+// SETUP: a running graph with the stats interval at its 1 s minimum, and a
+// sender keeping real datagrams flowing -- paced, so the decoder empties QD
+// and parks between them and the park count that sampleGauges reads keeps
+// moving while it is read.
+//
+// STIMULUS: one goroutine calls emitStats in a loop while another calls
+// logShutdownInitiated in a loop, and the window stays open until the REAL
+// ticker has emitted at least twice inside it -- so the production pairing,
+// the stats goroutine's own tick against a shutdown snapshot, is in the mix,
+// not only the two test goroutines. Then a normal shutdown, and one last
+// emission once the decoder has stopped.
+//
+// ASSERTION: under -race, no report. And the adversarial half, which holds
+// without the race detector: the qd_wake_parked deltas summed across EVERY
+// emitted line equal the ring's Parks(). Two unserialised sampleGauges can
+// both read the same lastParks and both add the same delta (too many); two
+// unserialised snapshots overwrite each other's curC and deltaC between
+// computing and rendering them (too few, which is what the unlocked code
+// actually showed: 159 summed against 396 parks). Either way the sum stops
+// being the parks that happened. Non-vacuity: both test emitters ran
+// repeatedly, parks moved, and the real ticker's emissions inside the window
+// (lines emitted minus the test emitters' own) are at least two.
+//
+// WOULD HAVE CAUGHT: the defect as it stood. With emitMu removed from
+// emitStats, -race reported 292 data races in -count=3 (in obs.Reg.snapshot
+// and Graph.sampleGauges), and without -race the sum check failed on its own.
+// Likewise the stats goroutine's tick calling sampleGauges and Reg.Emit
+// directly rather than through emitStats, now that the real tick is
+// guaranteed to emit inside the window.
+func TestTheTwoEmittersAreSerialised(t *testing.T) {
+	g, buf := testGraph(t, "127.0.0.1:0", func(c *config.Config) {
+		c.Stats.IntervalSec = 1 // the validated minimum, so the real tick fires inside the window
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- g.Run(ctx) }()
+	waitUntil(t, "the listener to be bound", func() bool { return g.LocalAddr() != nil })
+
+	conn, err := net.Dial("udp", g.LocalAddr().String())
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("dialling the listener: %v", err)
+	}
+	defer conn.Close()
+
+	d := datagramOf(t, uncompressedSub(mbp7208Payload(2)))
+	payload := d.Buf[:d.N]
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	// Stops the goroutines and joins Run exactly once: on the normal path
+	// below, or from Cleanup if a t.Fatalf leaves first -- so a failed wait
+	// cannot leak the emitters and the bound graph into later tests.
+	var runErr error
+	shutdown := sync.OnceFunc(func() {
+		stop.Store(true)
+		wg.Wait()
+		cancel()
+		runErr = <-done
+	})
+	t.Cleanup(shutdown)
+
+	// Traffic. Paced rather than flat out: a decoder that never finds the ring
+	// empty never parks, and then the value under contention never changes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			_, _ = conn.Write(payload) // loopback UDP may drop; a loss is harmless here
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+
+	// The two emitters, hammered. The short pause keeps a multi-second
+	// window's captured output to a size the polling below can rescan; the
+	// overlap needs many emissions from each side, not a tight loop.
+	var ticks, snapshots atomic.Int64
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			ticks.Add(1) // before, so the count below can only under-read
+			if err := g.emitStats(); err != nil {
+				t.Errorf("emitStats: %v", err)
+				return
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			snapshots.Add(1)
+			g.logShutdownInitiated(fatalEvent{}, false)
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+
+	// Every emission writes exactly one health line (obs Rule 1); the ones
+	// neither test goroutine accounts for came from the real ticker. Read
+	// under emitMu, so no emission is half-written while the (large) buffer
+	// is counted; and each test emitter counts itself before emitting, so a
+	// poll can only under-read the real ticks, never credit them with a test
+	// emitter's line.
+	realTicksSoFar := func() int64 {
+		g.emitMu.Lock()
+		defer g.emitMu.Unlock()
+		n := int64(strings.Count(buf.String(), " group=health"))
+		return n - ticks.Load() - snapshots.Load()
+	}
+	parksBefore := g.qdConsumer.Parks()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if realTicksSoFar() >= 2 &&
+			g.qdConsumer.Parks() > parksBefore+10 &&
+			g.inst().datagramsReceived.Load() > 10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for two real ticks, parks and traffic in the overlap "+
+				"(real ticks=%d ticks=%d snapshots=%d)", realTicksSoFar(), ticks.Load(), snapshots.Load())
+		}
+	}
+	parksDuring := g.qdConsumer.Parks() - parksBefore
+	stop.Store(true)
+	wg.Wait()
+	// Read before cancel, now exact: no test emitter is left, so every line
+	// beyond their counts is the stats goroutine's. The poll above already
+	// guaranteed at least two of them landed while the test emitters ran.
+	realTicks := realTicksSoFar()
+
+	shutdown()
+	if runErr != nil {
+		t.Fatalf("Run = %v", runErr)
+	}
+
+	// The decoder has returned, so Parks() is final. One more emission moves
+	// whatever is still unreported onto a line.
+	if err := g.emitStats(); err != nil {
+		t.Fatalf("the final emitStats: %v", err)
+	}
+	parks := g.qdConsumer.Parks()
+
+	// Non-vacuity: all three emitters ran, repeatedly, while parks moved.
+	if ticks.Load() < 10 || snapshots.Load() < 10 {
+		t.Fatalf("the emitters ran %d and %d times; the overlap was not exercised",
+			ticks.Load(), snapshots.Load())
+	}
+	if realTicks < 2 {
+		t.Fatalf("the real ticker emitted %d times inside the overlap, want >= 2", realTicks)
+	}
+	t.Logf("ticks=%d snapshots=%d realTicks=%d parks during overlap=%d total=%d",
+		ticks.Load(), snapshots.Load(), realTicks, parksDuring, parks)
+
+	var sum, lines uint64
+	var last uint64
+	for _, m := range qdWakeParkedRE.FindAllStringSubmatch(buf.String(), -1) {
+		cum, _ := strconv.ParseUint(m[1], 10, 64)
+		delta, _ := strconv.ParseUint(m[2], 10, 64)
+		sum += delta
+		last = cum
+		lines++
+	}
+	if lines == 0 {
+		t.Fatal("no qd_wake_parked value was emitted at all; the check below would be vacuous")
+	}
+	if sum != parks {
+		t.Errorf("qd_wake_parked deltas summed across %d lines = %d, but the ring parked %d "+
+			"times -- two emitters were not serialised", lines, sum, parks)
+	}
+	if last != parks {
+		t.Errorf("the last emitted qd_wake_parked total is %d, want Parks() = %d", last, parks)
+	}
+}
+
+// qdWakeParkedRE matches a counter's "name=total(+delta)" rendering.
+var qdWakeParkedRE = regexp.MustCompile(`\bqd_wake_parked=(\d+)\(\+(\d+)\)`)

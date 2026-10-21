@@ -453,8 +453,7 @@ func (g *Graph) startStats() {
 				}
 				last = now
 
-				g.sampleGauges()
-				if err := g.deps.Reg.Emit(g.deps.Stderr); err != nil {
+				if err := g.emitStats(); err != nil {
 					g.deps.Log.Errorf(obsClassStartup, "emitting the stats line: %v", err)
 				}
 			}
@@ -462,8 +461,18 @@ func (g *Graph) startStats() {
 	}()
 }
 
+// emitStats samples the lifecycle-owned gauges and writes one emission, under
+// emitMu. It is the only way either emitter reaches Reg.Emit -- see emitMu for
+// why the two of them overlap.
+func (g *Graph) emitStats() error {
+	g.emitMu.Lock()
+	defer g.emitMu.Unlock()
+	g.sampleGauges()
+	return g.deps.Reg.Emit(g.deps.Stderr)
+}
+
 // sampleGauges stores the values Vol 0 section 8.2 describes as sampled at
-// emission and whose owner is the lifecycle.
+// emission and whose owner is the lifecycle. Caller holds emitMu.
 func (g *Graph) sampleGauges() {
 	in := g.inst()
 	in.configGeneration.Store(int64(g.deps.Store.Gen()))
@@ -570,9 +579,8 @@ func (g *Graph) logShutdownInitiated(ev fatalEvent, terminal bool) {
 	// must carry the counters that led to it, because R12 -- "operators do not
 	// read the 60 s line" -- is mitigated only if the last line is
 	// self-contained.
-	g.sampleGauges()
 	g.deps.Log.Infof("shutdown initiated reason=%s%s", reason, detailSuffix(ev.detail))
-	if err := g.deps.Reg.Emit(g.deps.Stderr); err != nil {
+	if err := g.emitStats(); err != nil {
 		g.deps.Log.Errorf(obsClassStartup, "emitting the shutdown snapshot: %v", err)
 	}
 }
