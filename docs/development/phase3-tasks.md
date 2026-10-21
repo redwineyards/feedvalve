@@ -74,7 +74,7 @@ text as corrected in §6.
 | Gate | What it holds | Card | Status |
 |---|---|---|---|
 | **G-ALLOC-2** | `maphash.Bytes(seed, img[:181])` allocates nothing | P3-05 | full |
-| **G-ORD-3** | `guard_offered == 0` when no key repeats | P3-06 | full |
+| **G-ORD-3** | `guard_offered == 0` when no key repeats | P3-06 | full — at the guard, which the merge calls once per contribution; V4:1625's "Merge all N" stimulus is re-run through `merge` in P3-07 |
 | **G-ORD-1** | 6531→6571→6511 inside one `LogTime` second, applied in arrival order | P3-07 | full — over two setups; V4:1623's "either one alone" note is erratum'd (§6) |
 | **G-DIG-3** | the 128-byte text region is fully rewritten and zero-filled | P3-07 | full |
 | **G-INFL-1** | one outstanding batch per row; a later update sets `ReDirty`, not a second ring entry | P3-08 | full |
@@ -415,7 +415,8 @@ G-CFG-4's intent; Phase 5 points `RegistryEntry.GuardOff` into it.
 
 **Tests.**
 - **G-ORD-3:** N distinct rows, one contribution each: every call Bypasses on `!SlotSeen`;
-  `guard_offered == 0`.
+  `guard_offered == 0`. Held at the guard; the gate's "Merge all N" stimulus (V4:1625, the
+  "entry was created by THIS contribution" path of V2 §5.3 step 4) is re-run through `merge` in P3-07.
 - **G-ORD-4 guard half** (not counted): `LastSeq = 0x7FFFFFFF`, `BCSeqNo = 0x80000000` → `Apply`;
   a `LogTime` pair straddling the sign bit compares **plainly** (V4:1626).
 - Property: serial compare antisymmetric for `|a-b| < 2³¹`; a serial/plain swap mutant fails a row.
@@ -433,7 +434,8 @@ G-CFG-4's intent; Phase 5 points `RegistryEntry.GuardOff` into it.
 
 **Scope.** V2 §4 (V2:837-1153), ten steps (V2:864-1065):
 1. Resolve or create the entry (`rows_created{d}`).
-2. Guard; on Supersede, touch nothing.
+2. Guard; on Supersede, touch nothing and count `units_superseded_out_of_order` — **here, not in
+   the guard** (V2:893-895; V2:1267's footer is erratum'd, §6).
 3. Write `LastSeq`/`LastTime`/`LastRecv` **together**; set `SlotSeen`.
 4. Blob width check — mismatch counts `blob_len_mismatch{code}` and merges **nothing**. Otherwise
    copy masked columns low bit to high, `Column.Width` each, to `Column.Offset`
@@ -470,6 +472,11 @@ INV-MASK (V2:971-973) and INV-STATE (V2:1081-1085) hold after every step.
   test" is therefore true of the pair of setups, not of one (§6 erratum).
 - **G-DIG-3:** `message_text` 200 → 20 bytes: the 128-byte region fully rewritten with a zero tail;
   the short value's digest is independent of the long value's tail (V4:1622).
+- **G-ORD-3 through `merge`** (V4:1625's stimulus; the gate is P3-06's): N distinct rows from one
+  transcode, each entry created by its own contribution at step 1 → `guard_offered == 0`,
+  `rows_created == N`.
+- `units_superseded_out_of_order` +1 on **each** Supersede, and exactly once (the guard does not
+  count it; §6 erratum to V2:1267).
 - **§12.3 P1+P2 together** (V2:2856): one test that a mid-flight merge survives completion (INV-MASK)
   **and** that the committed digest is the batch's, not a recomputation — a fix to one that leaves
   the other must fail it. (Driven through P3-09's completion once it exists; until then the merge
@@ -960,6 +967,10 @@ Applied to the LLD in one doc commit at the end of the phase:
   and the decoder keeps fanning into a Q1 nobody reads, `lifecycle.go:612-628`); fatal mapping per D9.
 - **V2 §4** — pre-validation runs inside step 4 (D12); V2:2148's `row_rejected` belongs to the writer
   (D11).
+- **V2 §5.3** (V2:1267, and the flowchart at V2:1302) — the footer's `units_superseded_out_of_order++`
+  is the merge's, at §4 step 2 (V2:893-895), not the guard's: counting it in both would double it.
+  The guard counts only `guard_superseded{code}`. P3-07 obligation: its tests assert the counter
+  rises by exactly 1 per Supersede.
 - **V2 §1.1** — `tickPending`, `maxBatchSize`, `all`/`sentAt` missing from the struct.
 - **V2 §2.3** — V2:409 omits `tickPending`.
 - **V2 §6.3** — V2:1634, config read at epoch open **and** at each tick (D3); V2:1613's increment point.
