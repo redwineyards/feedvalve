@@ -865,7 +865,15 @@ func TestMergeOnAnExistingRowAllocatesNothing(t *testing.T) {
 			var u model.UpdateUnit
 			var fs []fv
 			for bit := range uint8(16) {
-				fs = append(fs, fv{bit, []byte{bit + 1}})
+				// A small value in the field's LAST byte, and '+' for the
+				// flag, so pre-validation (P3-07b) passes every field and
+				// the whole 181 bytes are copied.
+				val := make([]byte, s.dst.ByID(tokenQuote).Column(bit).Width)
+				val[len(val)-1] = bit + 1
+				if bit == 7 {
+					val[0] = '+'
+				}
+				fs = append(fs, fv{bit, val})
 			}
 			put(t, s, &u, tokenQuote, 99, slot, fs...)
 			if u.BlobLen != 181 {
@@ -889,6 +897,9 @@ func TestMergeOnAnExistingRowAllocatesNothing(t *testing.T) {
 			if got := tc.path(s) - pathBefore; got < 1000 {
 				t.Fatalf("non-vacuity: the path's own counter rose by %d, want >= 1000: "+
 					"the case measured some other path", got)
+			}
+			if got := s.inst.Transcode.PrevalidateRejectedTC[s.guards.index(7208)].Load(); got != 0 {
+				t.Fatalf("pre-validation refused %d fields: the case did not copy the full contribution", got)
 			}
 			if got := s.inst.RowsDirtied.Load() - dirtiedBefore; got != 0 {
 				t.Fatalf("rows_dirtied rose by %d: a measured merge took the clean -> Dirty arm", got)

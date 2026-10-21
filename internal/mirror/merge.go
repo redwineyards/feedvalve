@@ -89,12 +89,21 @@ func (s *Shard) merge(u model.UpdateUnit) {
 		e.LastRecv[c.Slot] = u.RecvMono
 		e.MarkSlotSeen(c.Slot)
 
-		// Step 4 -- copy the masked fields.
-		copyFields(dst, e, c, &u)
+		// Step 4 -- pre-validate each masked field against its DDL facts (Vol
+		// 0 section 5A, ruling D12), then copy the survivors. A refused field
+		// is not copied and its bit leaves this contribution's effective mask,
+		// so step 5's ColMask never claims it; the rest merges normally. A
+		// contribution with nothing left dirties nothing (and so, alone, does
+		// not Trigger). Erratum to V2 section 4: Vol 2 never names the step.
+		eff := s.prevalidate(d, pos, dst, e, c, &u)
+		if eff == 0 {
+			continue
+		}
+		copyFields(dst, e, c, &u, eff)
 		applied++
 
 		// Step 5 -- dirty the columns (INV-MASK: only ever OR-ed here).
-		e.ColMask |= c.Mask
+		e.ColMask |= eff
 
 		// Step 6 -- a quarantined row keeps a current image and mask, but is
 		// not queued: re-offering it would drag its whole batch serial (9.4).
@@ -164,16 +173,21 @@ func fieldsFit(dst *destinations.Destination, c *model.Contribution, u *model.Up
 }
 
 // copyFields is step 4's copy, for a contribution fieldsFit accepted: each
-// field, low bit to high, at its full declared width to its image offset.
+// field of eff (c.Mask less the fields pre-validation refused), low bit to
+// high, at its full declared width to its image offset. The cursor walks all of
+// c.Mask, since a refused field still occupies its place in the packed run.
 // Copying the full width -- never just the valid length -- is what keeps a
 // shorter text value from inheriting a longer one's tail (gate G-DIG-3, Vol 0
 // section 4.1 R5): the decoder packs every field zero-filled to its width.
-func copyFields(dst *destinations.Destination, e *model.Entry, c *model.Contribution, u *model.UpdateUnit) {
+func copyFields(dst *destinations.Destination, e *model.Entry, c *model.Contribution, u *model.UpdateUnit, eff model.ColMask) {
 	cur := int(c.BlobOff)
 	for m := c.Mask; m != 0; m &= m - 1 {
-		col := &dst.Columns[bits.TrailingZeros64(uint64(m))]
+		b := uint8(bits.TrailingZeros64(uint64(m)))
+		col := &dst.Columns[b]
 		w := int(col.Width)
-		copy(e.Image[col.Offset:int(col.Offset)+w], u.Blob[cur:cur+w])
+		if eff.Has(b) {
+			copy(e.Image[col.Offset:int(col.Offset)+w], u.Blob[cur:cur+w])
+		}
 		cur += w
 	}
 }
