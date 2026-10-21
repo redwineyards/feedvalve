@@ -550,6 +550,8 @@ row stays writable** (V0:1679-1682). The DDL facts are already on the column:
 5. Swap `Accum[d]`/`Cohort[d]`.
 6. Set the epoch fields.
 7. **Load `Params` once** (D3); `Gen` changed → `releaseQuarantine` (stub here; P3-10 fills it).
+   Refresh `s.guard` from the same load: P3-07's merge reads `ordering.guard` from that field, which
+   `NewShard` sets and nothing else does yet.
 8. `epoch_opened`; publish the depth gauges.
 9. `pump()`.
 
@@ -671,7 +673,7 @@ after every case: `!EpochOpen && (draining || tickPending || req[k])` → `maybe
 quiescence check (V2:481 is right; V2:409 omits `tickPending`).
 
 `onTick` (V2:461-471): epoch open → `TickMissed`, `tick_skipped_epoch_open`, and the stall check
-against `Params.EpochStallWarn` loaded at the tick (D3) — WARN once per epoch (P3-04's class),
+against `Params.EpochStallWarn` loaded at the tick (D3), which also refreshes `s.guard` (P3-07) — WARN once per epoch (P3-04's class),
 `epoch_stalled`++, **never** clear `req`. Otherwise set `tickPending`. `flush_on_tick{k}` is counted
 where `maybeOpenEpoch` opens with `tickPending` set. The stall check reads an **injectable monotonic
 clock** on `Shard`, because config forbids `epochStallWarnMs` below 1 s (`validate.go:69`).
@@ -967,6 +969,15 @@ Applied to the LLD in one doc commit at the end of the phase:
   and the decoder keeps fanning into a Q1 nobody reads, `lifecycle.go:612-628`); fatal mapping per D9.
 - **V2 §4** — pre-validation runs inside step 4 (D12); V2:2148's `row_rejected` belongs to the writer
   (D11).
+- **V0 §5.3 / V2 §4 step 7** — the suppression predicate also requires `!e.InFlight` (P3-07
+  review). `Digest` describes the last commit, not the batch in flight, so a value that returns to
+  the committed one mid-flight (A committed, B pumped, A merged) matches it and would be dropped,
+  leaving Oracle at B and the mirror at A with nothing to requeue the row. Figure 2.4 already has no
+  suppression arc out of `InFlight`; the step 7 text is brought into line with it. Accepted.
+- **V2 §4 steps 2-4** — step 4's width validation runs **before** step 3 (P3-07 review). A
+  contribution with a wrong packed width is rejected whole, advancing no ordering slot, which is
+  what step 2's "no partial application" requires; otherwise a corrupt unit could make later valid
+  ones look out of order. The copy itself stays at step 4.
 - **V2 §5.3** (V2:1267, and the flowchart at V2:1302) — the footer's `units_superseded_out_of_order++`
   is the merge's, at §4 step 2 (V2:893-895), not the guard's: counting it in both would double it.
   The guard counts only `guard_superseded{code}`. P3-07 obligation: its tests assert the counter

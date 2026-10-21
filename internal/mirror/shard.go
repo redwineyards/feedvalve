@@ -2,16 +2,19 @@ package mirror
 
 import (
 	"hash/maphash"
+	"strconv"
 
 	"feedvalve/internal/destinations"
 	"feedvalve/internal/model"
+	"feedvalve/internal/obs"
 )
 
 // Shard owns one partition of all three destination mirrors (Vol 2 section
 // 1.1). Exactly one goroutine -- the one that will run Shard.Run -- reads or
-// writes every field below except the wiring (params, dst, inst, bus, seed and
-// the channels), which NewShard sets once and nothing changes afterwards. The
-// one cross-shard signal lives in FlushBus, which the shard only reads.
+// writes every field below except the wiring (params, dst, guards, inst, log,
+// bus, seed and the channels), which NewShard sets once and nothing changes
+// afterwards. The one cross-shard signal lives in FlushBus, which the shard
+// only reads.
 //
 // Allocated once at startup, never copied. Construction is the only thing that
 // allocates; nothing in a normal session grows (section 1.3).
@@ -78,6 +81,13 @@ type Shard struct {
 	// Params, so the first epoch does not release an empty set.
 	cfgGen uint64
 
+	// guard is ordering.guard as last loaded from params, so the merge reads a
+	// field rather than loading the published Params per unit. Set at
+	// construction only, today; it MUST be refreshed wherever Params is
+	// loaded -- P3-08's epoch open (step 7) and P3-11's tick (ruling D3) --
+	// or a reload of ordering.guard never reaches the merge.
+	guard GuardMode
+
 	chunkRows int32 // Sizing.ArenaChunkRows
 
 	// ---- wiring: set by NewShard, read-only thereafter ----
@@ -90,7 +100,9 @@ type Shard struct {
 	params  func() *Params // the published reloadable configuration (ruling D1)
 	bus     *FlushBus      // the only cross-shard surface
 	dst     *destinations.Set
+	guards  *GuardTable // per-transcode guard state, shared by every shard (ruling D2)
 	inst    *ShardInstruments
+	log     *obs.AppLogger
 	busInst busInstruments // inst's two flush-bus handles, in the form Trigger takes
 	seed    maphash.Seed
 }
@@ -121,9 +133,23 @@ type Edges struct {
 // m batches with their Rows at the ceiling, and the failed-row scratch.
 //
 // params is called once here, so cfgGen starts at the first published
-// generation. It starts no goroutine.
+// generation. guards is the one GuardTable every shard shares, and its
+// configured positions are the ones inst.Transcode is indexed by. It starts no
+// goroutine.
 func NewShard(k model.ShardID, sz Sizing, params func() *Params, dst *destinations.Set,
-	bus *FlushBus, inst *ShardInstruments, e Edges) *Shard {
+	guards *GuardTable, bus *FlushBus, inst *ShardInstruments, log *obs.AppLogger, e Edges) *Shard {
+	// Wiring defects panic here rather than on the first unit: merge indexes
+	// inst.Transcode by the GuardTable's configured positions and logs
+	// through log.
+	if guards == nil || log == nil {
+		panic("mirror: NewShard given a nil GuardTable or AppLogger")
+	}
+	if len(inst.Transcode.BlobLenMismatch) != len(guards.entries) {
+		panic("mirror: NewShard given " + strconv.Itoa(len(inst.Transcode.BlobLenMismatch)) +
+			" blob_len_mismatch counters for " + strconv.Itoa(len(guards.entries)) +
+			" configured transcodes; both are indexed by configured position")
+	}
+	p := params()
 	s := &Shard{
 		ID:         k,
 		chunkRows:  int32(sz.ArenaChunkRows),
@@ -135,10 +161,13 @@ func NewShard(k model.ShardID, sz Sizing, params func() *Params, dst *destinatio
 		params:     params,
 		bus:        bus,
 		dst:        dst,
+		guards:     guards,
 		inst:       inst,
+		log:        log,
 		busInst:    busInstruments{coalesced: inst.FlushCoalesced, wakeDropped: inst.FlushWakeDropped},
 		seed:       sz.Seed,
-		cfgGen:     params().Gen,
+		cfgGen:     p.Gen,
+		guard:      p.Guard,
 	}
 
 	perShard := sz.ExpectedRows / sz.Shards

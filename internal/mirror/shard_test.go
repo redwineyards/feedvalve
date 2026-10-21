@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"hash/maphash"
+	"io"
 	"math"
 	"math/rand"
 	"runtime"
@@ -49,8 +50,25 @@ func newTestShard(t testing.TB, sz Sizing, gen uint64) *Shard {
 		t.Fatalf("destinations.Default: %v", err)
 	}
 	p := &Params{Gen: gen, MaxBatchSize: sz.MaxBatchSizeCeiling}
-	return NewShard(0, sz, func() *Params { return p }, dst, NewFlushBus(sz.Shards),
-		testInstruments(sz.Shards), Edges{})
+	inst := testInstruments(sz.Shards)
+	guards, log := testWiring(dst, inst)
+	return NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards),
+		inst, log, Edges{})
+}
+
+// testWiring is the GuardTable and AppLogger NewShard requires, built the way
+// app builds them: one fresh guard and blob_len_mismatch counter per
+// configured code, set on inst, and a logger that discards.
+func testWiring(dst *destinations.Set, inst *ShardInstruments) (*GuardTable, *obs.AppLogger) {
+	codes := configuredCodes(dst)
+	tr := &inst.Transcode
+	tr.GuardOffered = make([]*obs.Counter, len(codes))
+	tr.GuardSuperseded = make([]*obs.Counter, len(codes))
+	tr.BlobLenMismatch = make([]*obs.Counter, len(codes))
+	for i := range codes {
+		tr.GuardOffered[i], tr.GuardSuperseded[i], tr.BlobLenMismatch[i] = &obs.Counter{}, &obs.Counter{}, &obs.Counter{}
+	}
+	return NewGuardTable(codes, tr.GuardOffered, tr.GuardSuperseded), obs.NewAppLogger(io.Discard, obs.LevelInfo, 1000, nil)
 }
 
 // smallSizing is a sizing with tiny chunks, so chunk growth is cheap to reach.
@@ -330,12 +348,13 @@ func TestNewShardAllocatesTheDerivedFigure(t *testing.T) {
 	}
 	p := &Params{Gen: 1}
 	bus, inst := NewFlushBus(sz.Shards), testInstruments(sz.Shards)
+	guards, log := testWiring(dst, inst)
 
 	got := uint64(math.MaxUint64)
 	for range samples {
 		var a, b runtime.MemStats
 		runtime.ReadMemStats(&a)
-		s := NewShard(0, sz, func() *Params { return p }, dst, bus, inst, Edges{})
+		s := NewShard(0, sz, func() *Params { return p }, dst, guards, bus, inst, log, Edges{})
 		runtime.ReadMemStats(&b)
 		runtime.KeepAlive(s)
 		got = min(got, b.TotalAlloc-a.TotalAlloc)
@@ -395,5 +414,41 @@ func TestBatchIndexFindsEachBatchsOwnSentAt(t *testing.T) {
 	}
 	if s.batchIndex(&model.Batch{}) != -1 {
 		t.Error("a batch this shard does not own resolved to an index")
+	}
+}
+
+// TestNewShardRejectsMiswiring: a nil GuardTable or AppLogger, or a
+// blob_len_mismatch slice not indexed like the GuardTable, panics at
+// construction -- not on the shard goroutine at its first unit, where merge
+// would dereference or index them.
+func TestNewShardRejectsMiswiring(t *testing.T) {
+	sz := smallSizing(256)
+	dst, err := destinations.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Params{Gen: 1, MaxBatchSize: sz.MaxBatchSizeCeiling}
+	build := func(mutate func(g **GuardTable, l **obs.AppLogger, in *ShardInstruments)) (panicked bool) {
+		defer func() { panicked = recover() != nil }()
+		inst := testInstruments(sz.Shards)
+		guards, log := testWiring(dst, inst)
+		mutate(&guards, &log, inst)
+		NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards), inst, log, Edges{})
+		return false
+	}
+	cases := map[string]func(**GuardTable, **obs.AppLogger, *ShardInstruments){
+		"nil GuardTable": func(g **GuardTable, _ **obs.AppLogger, _ *ShardInstruments) { *g = nil },
+		"nil AppLogger":  func(_ **GuardTable, l **obs.AppLogger, _ *ShardInstruments) { *l = nil },
+		"short blob_len_mismatch": func(_ **GuardTable, _ **obs.AppLogger, in *ShardInstruments) {
+			in.Transcode.BlobLenMismatch = in.Transcode.BlobLenMismatch[1:]
+		},
+	}
+	for name, mutate := range cases {
+		if !build(mutate) {
+			t.Errorf("%s: NewShard did not panic", name)
+		}
+	}
+	if build(func(**GuardTable, **obs.AppLogger, *ShardInstruments) {}) {
+		t.Fatal("non-vacuity: NewShard panicked on correct wiring")
 	}
 }
