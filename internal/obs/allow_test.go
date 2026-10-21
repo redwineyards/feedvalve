@@ -26,10 +26,28 @@ func TestClassSeverityBoundary(t *testing.T) {
 		t.Errorf("firstErrorClass = %v, want ClassDecompressFailed -- the first ERROR class "+
 			"of Vol 4 section 6.2", firstErrorClass)
 	}
-	if ClassShardSendWait != firstErrorClass-1 {
-		t.Errorf("ClassShardSendWait = %d and firstErrorClass = %d: the WARN run no longer "+
+	if ClassEpochStalled != firstErrorClass-1 {
+		t.Errorf("ClassEpochStalled = %d and firstErrorClass = %d: the WARN run no longer "+
 			"ends immediately before the ERROR run, so Allow's severity test is wrong",
-			ClassShardSendWait, firstErrorClass)
+			ClassEpochStalled, firstErrorClass)
+	}
+	// The numeric position, pinned. P3-04 inserted the WARN epoch_stalled at the
+	// end of the WARN run, which moved firstErrorClass from 10 to 11 and
+	// relabelled every ERROR class's log_events_suppressed{class} slot. That was
+	// deliberate; the next move should be too, so it has to edit this number.
+	if firstErrorClass != 11 || numClasses != 22 {
+		t.Errorf("firstErrorClass = %d, numClasses = %d; want 11 and 22. A class was "+
+			"added or moved: check its severity run and update this pin deliberately",
+			firstErrorClass, numClasses)
+	}
+	// And the four P3-04 classes are on the side Vol 2 logs them at.
+	for _, c := range []Class{ClassBlobLenMismatch, ClassGuardDisabled, ClassDrainDeadline} {
+		if c < firstErrorClass {
+			t.Errorf("%v is in the WARN run; Vol 2 logs it at ERROR", c)
+		}
+	}
+	if ClassEpochStalled >= firstErrorClass {
+		t.Errorf("epoch_stalled is in the ERROR run; Vol 2 section 2.4 logs it at WARN")
 	}
 	// Every class is on one side or the other, and both sides are non-empty.
 	if firstErrorClass == 0 || firstErrorClass >= numClasses {
