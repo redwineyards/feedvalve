@@ -1017,6 +1017,13 @@ Applied to the LLD in one doc commit at the end of the phase:
 - **V4:1623** — G-ORD-1's "either one alone fails this test" holds across two setups (P3-07), not
   one: the `RecvMono` tiebreak alone resolves the canonical sequence (V2:1450), so only the
   pre-seeded setup proves it necessary and only the equal-`RecvMono` setup proves the slots are.
+- **V4:1624 / HLD §6.5** — G-ORD-2's "constant `BCSeqNo`" (and HLD §6.5's "constant or zero …
+  discards every contribution after the first") predate V2 §5.3 step 8. Every unit has its own
+  advancing `RecvMono` (B-V1b, V2:81, :1276), so a constant `BCSeqNo` with an equal `LogTime` falls
+  through steps 6-7 and is Applied at step 8: it freezes nothing and its ratio is 0. The fault the
+  gate guards against is a sequence field that reads as **older** at step 6 (descending, or reset
+  below the last value seen); "constant" reads that way. P3-12's G-ORD-2 test drives a descending
+  `BCSeqNo` with an advancing `RecvMono`, and pins the constant case as Apply (P3-12 review).
 - **V4:1633** — G-FLUSH-2 per D7.
 - **V4:1634, :1642** — G-FLUSH-3's "within microseconds" and G-INFL-4's "`1/m` of the wall time" are
   informational; the gates assert the cause (wake arm taken) and the concurrency (≤ m held, m
