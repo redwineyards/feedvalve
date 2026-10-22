@@ -109,7 +109,7 @@ func (s *Shard) applyCompletion(b *model.Batch) error {
 	// Steps 10-11 -- the baton returns. Free never exceeds m, its capacity.
 	s.Free = append(s.Free, b)
 	s.CohortOut--
-	s.inst.CompletionLagMaxNs.Observe(uint64(nowMono() - s.sentAt[i]))
+	s.inst.CompletionLagMaxNs.Observe(uint64(s.now() - s.sentAt[i]))
 
 	// Step 14 BEFORE step 13 (ruling D8): the failed rows head the accumulating
 	// ring as one block, in batch order, before closeEpoch can re-open from it
@@ -124,10 +124,7 @@ func (s *Shard) applyCompletion(b *model.Batch) error {
 	}
 
 	// Step 12 -- publish the depths, after the head push so dirty_depth counts it.
-	for d := range s.Accum {
-		s.inst.DirtyDepth[d].Store(int64(s.Accum[d].Len()))
-		s.inst.CohortDepth[d].Store(int64(s.Cohort[d].Len()))
-	}
+	s.publishDepths()
 
 	// Step 13 -- close the epoch or keep pumping.
 	var err error

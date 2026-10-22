@@ -45,7 +45,8 @@ type Shard struct {
 	Epoch         uint64 // monotonic, stamped into every Batch
 	CohortOut     int32  // batches of this epoch emitted and not yet returned
 	TickMissed    bool   // a W tick fired while the epoch was open
-	epochOpenedAt int64  // monotonic ns
+	epochOpenedAt int64  // monotonic ns, from now
+	stallWarned   bool   // this epoch's epoch_stalled is counted and logged (section 2.4)
 
 	// tickPending is a tick seen and not yet acted on: the tick arm sets it
 	// and stage B opens the epoch (section 2.3). maxBatchSize is the value
@@ -88,11 +89,23 @@ type Shard struct {
 	// guard is ordering.guard as last loaded from params, so the merge reads a
 	// field rather than loading the published Params per unit. Set at
 	// construction and refreshed at epoch open (section 6.3 step 7); it MUST
-	// be refreshed wherever else Params is loaded -- P3-11's tick (ruling D3)
-	// -- or a reload of ordering.guard never reaches the merge.
+	// be refreshed wherever else Params is loaded -- the tick (onTick, ruling
+	// D3) -- or a reload of ordering.guard never reaches the merge.
 	guard GuardMode
 
 	chunkRows int32 // Sizing.ArenaChunkRows
+
+	// now is the shard's monotonic clock in nanoseconds: nowMono, set by
+	// NewShard. A field so a test can step it: the epoch-stall check compares
+	// against flush.epochStallWarnMs, which configuration forbids below 1 s
+	// (section 2.4). Every epochOpenedAt and sentAt reading goes through it,
+	// so the differences are always taken on one clock.
+	now func() int64
+
+	// owner is G-ASSERT-1's shard half: under -tags feedvalve_assert a mutex
+	// whose TryLock wraps each pass of Run; otherwise an empty struct whose
+	// methods compile to nothing (assert_on.go, assert_off.go).
+	owner loopOwner
 
 	// ---- wiring: set by NewShard, read-only thereafter ----
 	in         <-chan model.UpdateUnit // Q1, this shard's ingest
@@ -100,6 +113,16 @@ type Shard struct {
 	tick       <-chan struct{}         // T, from the shared ticker
 	wake       <-chan struct{}         // W, the L1 wakeup, cap 1
 	batchQ     chan<- *model.Batch     // Q2, shared with every shard
+
+	// drainExpired is the one shared drain deadline (ruling D4), closed when
+	// it expires. Run selects on it only once it has seen in closed.
+	drainExpired <-chan struct{}
+
+	// report receives defect S3 (errBatchRowUnreported), the one error Run
+	// survives: it cannot call app's Fatal, and must keep running into the
+	// drain (ruling D9). A function, not an interface: one real caller (app,
+	// mapping it to F27) and one test double.
+	report func(error)
 
 	params  func() *Params // the published reloadable configuration (ruling D1)
 	bus     *FlushBus      // the only cross-shard surface
@@ -122,13 +145,18 @@ type Shard struct {
 type arenaChunk []model.Entry
 
 // Edges carries three of the four inbound channel edges of Vol 2 section 1.4
-// (shardCh, completionCh, tickCh) plus the outbound batchQ. The fourth inbound
-// edge, wake, comes from the FlushBus (FlushBus.Wake(k)).
+// (shardCh, completionCh, tickCh), the outbound batchQ, and the shared drain
+// deadline. The fourth inbound edge, wake, comes from the FlushBus
+// (FlushBus.Wake(k)).
 type Edges struct {
 	In         <-chan model.UpdateUnit // shardCh[k]
 	Completion <-chan *model.Batch     // completionCh[k]
 	Tick       <-chan struct{}         // tickCh[k]
 	BatchQ     chan<- *model.Batch     // batchQ, shared
+
+	// DrainExpired is closed when the one shared drain budget, armed from
+	// t_shutdown, runs out (ruling D4). The same channel for every shard.
+	DrainExpired <-chan struct{}
 }
 
 // NewShard builds shard k, performing every allocation the shard will make in
@@ -138,15 +166,16 @@ type Edges struct {
 //
 // params is called once here, so cfgGen starts at the first published
 // generation. guards is the one GuardTable every shard shares, and its
-// configured positions are the ones inst.Transcode is indexed by. It starts no
-// goroutine.
+// configured positions are the ones inst.Transcode is indexed by. report is
+// where Run sends defect S3 (ruling D9). It starts no goroutine.
 func NewShard(k model.ShardID, sz Sizing, params func() *Params, dst *destinations.Set,
-	guards *GuardTable, bus *FlushBus, inst *ShardInstruments, log *obs.AppLogger, e Edges) *Shard {
+	guards *GuardTable, bus *FlushBus, inst *ShardInstruments, log *obs.AppLogger,
+	report func(error), e Edges) *Shard {
 	// Wiring defects panic here rather than on the first unit: merge indexes
 	// inst.Transcode by the GuardTable's configured positions and logs
-	// through log.
-	if guards == nil || log == nil {
-		panic("mirror: NewShard given a nil GuardTable or AppLogger")
+	// through log, and Run reports S3 through report.
+	if guards == nil || log == nil || report == nil {
+		panic("mirror: NewShard given a nil GuardTable, AppLogger or report function")
 	}
 	if len(inst.Transcode.BlobLenMismatch) != len(guards.entries) {
 		panic("mirror: NewShard given " + strconv.Itoa(len(inst.Transcode.BlobLenMismatch)) +
@@ -155,23 +184,26 @@ func NewShard(k model.ShardID, sz Sizing, params func() *Params, dst *destinatio
 	}
 	p := params()
 	s := &Shard{
-		ID:         k,
-		chunkRows:  int32(sz.ArenaChunkRows),
-		in:         e.In,
-		completion: e.Completion,
-		tick:       e.Tick,
-		wake:       bus.Wake(k),
-		batchQ:     e.BatchQ,
-		params:     params,
-		bus:        bus,
-		dst:        dst,
-		guards:     guards,
-		inst:       inst,
-		log:        log,
-		busInst:    busInstruments{coalesced: inst.FlushCoalesced, wakeDropped: inst.FlushWakeDropped},
-		seed:       sz.Seed,
-		cfgGen:     p.Gen,
-		guard:      p.Guard,
+		ID:           k,
+		chunkRows:    int32(sz.ArenaChunkRows),
+		in:           e.In,
+		completion:   e.Completion,
+		tick:         e.Tick,
+		wake:         bus.Wake(k),
+		batchQ:       e.BatchQ,
+		drainExpired: e.DrainExpired,
+		report:       report,
+		now:          nowMono,
+		params:       params,
+		bus:          bus,
+		dst:          dst,
+		guards:       guards,
+		inst:         inst,
+		log:          log,
+		busInst:      busInstruments{coalesced: inst.FlushCoalesced, wakeDropped: inst.FlushWakeDropped},
+		seed:         sz.Seed,
+		cfgGen:       p.Gen,
+		guard:        p.Guard,
 	}
 
 	perShard := sz.ExpectedRows / sz.Shards

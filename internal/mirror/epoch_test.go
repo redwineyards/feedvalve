@@ -28,7 +28,7 @@ func newEpochShard(t testing.TB, qcap, maxBatch int) (s *Shard, q chan *model.Ba
 	log := obs.NewAppLogger(io.Discard, obs.LevelInfo, 1000, nil)
 	cur := &Params{Gen: 1, MaxBatchSize: maxBatch, Guard: GuardAuto}
 	q = make(chan *model.Batch, qcap)
-	s = NewShard(0, sz, func() *Params { return cur }, dst, guards, NewFlushBus(sz.Shards), inst, log,
+	s = NewShard(0, sz, func() *Params { return cur }, dst, guards, NewFlushBus(sz.Shards), inst, log, noReport,
 		Edges{BatchQ: q})
 	return s, q, func(p *Params) { cur = p }
 }

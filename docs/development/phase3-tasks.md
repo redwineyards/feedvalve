@@ -985,6 +985,10 @@ Applied to the LLD in one doc commit at the end of the phase:
   rises by exactly 1 per Supersede.
 - **V2 §1.1** — `tickPending`, `maxBatchSize`, `all`/`sentAt` missing from the struct.
 - **V2 §2.3** — V2:409 omits `tickPending`.
+- **V2 §6.3 / §6.4** — `flush_on_tick{k}` counts only an open with `tickPending` set (seam 4); a
+  `closeEpoch` re-open driven by `TickMissed` is not counted, so under sustained load
+  `flush_on_tick` runs below the tick-caused share of `epoch_opened` (P3-11 review). Documented,
+  not changed.
 - **V2 §6.3** — V2:1634, config read at epoch open **and** at each tick (D3); V2:1613's increment point.
 - **V2 §6.3 step 8** (V2:1590) — `dirty_depth{k,d}` publishes `Accum[d].Len()`, not 0: the
   accumulating rings are non-empty after a step-7 quarantine release (P3-10).

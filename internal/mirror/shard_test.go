@@ -53,8 +53,11 @@ func newTestShard(t testing.TB, sz Sizing, gen uint64) *Shard {
 	inst := testInstruments(sz.Shards)
 	guards, log := testWiring(dst, inst)
 	return NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards),
-		inst, log, Edges{})
+		inst, log, noReport, Edges{})
 }
+
+// noReport is the report function for a shard whose test never runs Run.
+func noReport(error) {}
 
 // testWiring is the GuardTable and AppLogger NewShard requires, built the way
 // app builds them: one fresh guard and blob_len_mismatch counter per
@@ -354,7 +357,7 @@ func TestNewShardAllocatesTheDerivedFigure(t *testing.T) {
 	for range samples {
 		var a, b runtime.MemStats
 		runtime.ReadMemStats(&a)
-		s := NewShard(0, sz, func() *Params { return p }, dst, guards, bus, inst, log, Edges{})
+		s := NewShard(0, sz, func() *Params { return p }, dst, guards, bus, inst, log, noReport, Edges{})
 		runtime.ReadMemStats(&b)
 		runtime.KeepAlive(s)
 		got = min(got, b.TotalAlloc-a.TotalAlloc)
@@ -417,10 +420,10 @@ func TestBatchIndexFindsEachBatchsOwnSentAt(t *testing.T) {
 	}
 }
 
-// TestNewShardRejectsMiswiring: a nil GuardTable or AppLogger, or a
-// blob_len_mismatch slice not indexed like the GuardTable, panics at
-// construction -- not on the shard goroutine at its first unit, where merge
-// would dereference or index them.
+// TestNewShardRejectsMiswiring: a nil GuardTable, AppLogger or report
+// function, or a blob_len_mismatch slice not indexed like the GuardTable,
+// panics at construction -- not on the shard goroutine at its first unit (or
+// first S3), where merge or Run would dereference or index them.
 func TestNewShardRejectsMiswiring(t *testing.T) {
 	sz := smallSizing(256)
 	dst, err := destinations.Default()
@@ -428,12 +431,13 @@ func TestNewShardRejectsMiswiring(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := &Params{Gen: 1, MaxBatchSize: sz.MaxBatchSizeCeiling}
+	report := noReport
 	build := func(mutate func(g **GuardTable, l **obs.AppLogger, in *ShardInstruments)) (panicked bool) {
 		defer func() { panicked = recover() != nil }()
 		inst := testInstruments(sz.Shards)
 		guards, log := testWiring(dst, inst)
 		mutate(&guards, &log, inst)
-		NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards), inst, log, Edges{})
+		NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards), inst, log, report, Edges{})
 		return false
 	}
 	cases := map[string]func(**GuardTable, **obs.AppLogger, *ShardInstruments){
@@ -450,5 +454,9 @@ func TestNewShardRejectsMiswiring(t *testing.T) {
 	}
 	if build(func(**GuardTable, **obs.AppLogger, *ShardInstruments) {}) {
 		t.Fatal("non-vacuity: NewShard panicked on correct wiring")
+	}
+	report = nil
+	if !build(func(**GuardTable, **obs.AppLogger, *ShardInstruments) {}) {
+		t.Error("nil report: NewShard did not panic")
 	}
 }

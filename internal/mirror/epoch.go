@@ -11,7 +11,8 @@ import (
 // wall-clock step cannot move.
 var monoStart = time.Now()
 
-// nowMono is monotonic nanoseconds since monoStart: epochOpenedAt and sentAt.
+// nowMono is monotonic nanoseconds since monoStart, and Shard.now's value
+// outside tests: epochOpenedAt, sentAt and the loop-pass timing.
 // Only ever differenced against another nowMono reading, never compared with
 // app's RecvMono, whose origin is a different instant.
 func nowMono() int64 { return int64(time.Since(monoStart)) }
@@ -42,6 +43,9 @@ func (s *Shard) maybeOpenEpoch() error {
 	}
 
 	// Step 1 -- a tick is a periodic sample, consumed whatever we decide.
+	// Remembered, because flush_on_tick{k} counts an epoch the tick opened
+	// (V2:1613's missing increment point, phase 3 seam 4).
+	onTick := s.tickPending
 	s.tickPending = false
 
 	// Step 2 -- nothing to flush: count it and leave req[k] EXACTLY as it was.
@@ -73,7 +77,8 @@ func (s *Shard) maybeOpenEpoch() error {
 	s.Epoch++
 	s.CohortOut = 0
 	s.TickMissed = false
-	s.epochOpenedAt = nowMono()
+	s.stallWarned = false
+	s.epochOpenedAt = s.now()
 
 	// Step 7 -- ONE Params load, held for the whole epoch (ruling D3), so two
 	// batches of one epoch never see two maxBatchSize values. ordering.guard
@@ -90,10 +95,10 @@ func (s *Shard) maybeOpenEpoch() error {
 	// accumulating rings are empty after the swap unless step 7 released
 	// quarantined rows onto them.
 	s.inst.EpochOpened.Add(1)
-	for d := range s.Cohort {
-		s.inst.DirtyDepth[d].Store(int64(s.Accum[d].Len()))
-		s.inst.CohortDepth[d].Store(int64(s.Cohort[d].Len()))
+	if onTick {
+		s.inst.FlushOnTick.Add(1)
 	}
+	s.publishDepths()
 
 	// Step 9.
 	return s.pump()
@@ -111,7 +116,7 @@ func (s *Shard) maybeOpenEpoch() error {
 // pump. Depth is bounded at 2 by construction.
 func (s *Shard) closeEpoch() error {
 	s.EpochOpen = false
-	dur := uint64(nowMono() - s.epochOpenedAt)
+	dur := uint64(s.now() - s.epochOpenedAt)
 	s.inst.EpochDurationMaxNs.Observe(dur)
 	s.inst.EpochNsTotal.Add(dur)
 	for d := range s.Cohort {

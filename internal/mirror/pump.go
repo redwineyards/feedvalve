@@ -56,7 +56,7 @@ func (s *Shard) pump() error {
 		case s.batchQ <- b:
 			// b is the writer's now; only the shard's own bookkeeping follows.
 			s.CohortOut++ // ONLY after a successful send
-			s.sentAt[i] = nowMono()
+			s.sentAt[i] = s.now()
 			s.out[i] = true
 			s.inst.EpochBatches.Add(1)
 			s.inst.EpochRows.Add(uint64(n))

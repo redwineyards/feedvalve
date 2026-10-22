@@ -88,7 +88,7 @@ func newMergeShard(t testing.TB, mode GuardMode) (*Shard, *bytes.Buffer) {
 	var buf bytes.Buffer
 	log := obs.NewAppLogger(&buf, obs.LevelInfo, 1000, nil)
 	p := &Params{Gen: 1, MaxBatchSize: sz.MaxBatchSizeCeiling, Guard: mode}
-	return NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards), inst, log, Edges{}), &buf
+	return NewShard(0, sz, func() *Params { return p }, dst, guards, NewFlushBus(sz.Shards), inst, log, noReport, Edges{}), &buf
 }
 
 // fv is one field of a contribution: a mask bit and its value, zero-filled by
