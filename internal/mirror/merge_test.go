@@ -426,41 +426,42 @@ func TestMergeSupersedeTouchesNothingAndCountsOnce(t *testing.T) {
 	}
 }
 
-// ---- section 12.3 P1 + P2, the merge half ----
+// ---- section 12.3 P1 + P2 ----
 
-// TestMergeMidFlightKeepsMaskAndDigest is section 12.3's P1 and P2 together, at
-// the merge: a row is batched (pump cleared its ColMask and the batch carries
-// the image's digest), then a newer value of a column the batch also carries
-// is merged mid-flight.
+// TestMergeMidFlightKeepsMaskAndDigest is section 12.3's P1 and P2 together,
+// through the real pump and completion: a row is batched (fillRow cleared its
+// ColMask and the batch carries the image's digest) over an earlier commit,
+// then a newer value of a column the batch also carries is merged mid-flight.
 //
-// ASSERTION: the row is ReDirty, on no ring, with the column back in ColMask
-// and the newer value in the image (P1); and the merge never wrote Digest,
-// Written or the batch's digest (P2) -- the completion is the only writer, and
-// it must take BatchRow.Digest.
+// ASSERTION, at the merge: the row is ReDirty, on no ring, with the column back
+// in ColMask and the newer value in the image (P1); and the merge never wrote
+// Digest or Written (P2). Then, after the batch completes Committed: Digest is
+// the BATCH's, not the image's (P2); ColMask still names the column (P1); the
+// row is requeued, and the next batch carries the newer value.
 //
-// P3-09 extends this test through applyCompletion, so that a fix to one
-// property that leaves the other fails it.
+// The two are tested together because they are the same mistake about two
+// fields: a fix to one that leaves the other must still fail here.
 func TestMergeMidFlightKeepsMaskAndDigest(t *testing.T) {
-	s, _ := newMergeShard(t, GuardAuto)
-	slot := slotOf(t, s, tokenQuote, 7208)
-	send := func(seq int32, ltp uint32) {
-		u := model.UpdateUnit{Code: 7208, Seq: seq, LogTime: 100, RecvMono: int64(seq)}
-		put(t, s, &u, tokenQuote, 7, slot, fv{0, be32(ltp)})
-		s.merge(u)
+	s, q, _ := newEpochShard(t, 8, 1000)
+	x := newSender7208(t, s)
+	x.send(7, fv{0, be32(500)}) // the earlier commit
+	if err := s.maybeOpenEpoch(); err != nil {
+		t.Fatalf("open: %v", err)
 	}
-	send(1, 1000)
+	if err := writeBack(s, next(t, q), allCommitted()); err != nil {
+		t.Fatalf("first completion: %v", err)
+	}
 	e := rowEntry(s, tokenQuote, 7)
+	prevDigest, prevWritten := e.Digest, e.Written
 
-	// Pump, as section 7.2 does it.
-	if _, ok := s.Accum[tokenQuote].PopFront(); !ok {
-		t.Fatal("the merged row was not queued")
+	x.send(7, fv{0, be32(1000)})
+	if err := s.maybeOpenEpoch(); err != nil {
+		t.Fatalf("second open: %v", err)
 	}
-	batchMask := e.ColMask
-	batchDigest := digest(s.seed, e.Image[:s.dst.ByID(tokenQuote).ImageLen])
-	e.Dirty, e.InFlight, e.ColMask = false, true, 0
-	e.Digest, e.Written = 0x1234, 0 // the previous commit's, untouched by pump
+	b := next(t, q)
+	batchMask, batchDigest := b.Rows[0].Mask, b.Rows[0].Digest
 
-	send(2, 2000)
+	x.send(7, fv{0, be32(2000)})
 	if !e.InFlight || e.Dirty || !e.ReDirty || s.Accum[tokenQuote].Len() != 0 {
 		t.Fatalf("mid-flight merge: InFlight %v Dirty %v ReDirty %v queued %d; want in flight, re-dirtied, on no ring",
 			e.InFlight, e.Dirty, e.ReDirty, s.Accum[tokenQuote].Len())
@@ -471,14 +472,31 @@ func TestMergeMidFlightKeepsMaskAndDigest(t *testing.T) {
 	if got := binary.BigEndian.Uint32(e.Image[0:4]); got != 2000 {
 		t.Fatalf("image holds %d, want the newer 2000", got)
 	}
-	if e.Digest != 0x1234 || e.Written != 0 { // P2
+	if e.Digest != prevDigest || e.Written != prevWritten { // P2
 		t.Fatalf("merge wrote Digest %#x / Written %#x; only the completion may", e.Digest, e.Written)
 	}
-	if digest(s.seed, e.Image[:s.dst.ByID(tokenQuote).ImageLen]) == batchDigest {
-		t.Fatal("non-vacuity: the mid-flight image digests like the batch's, so P2 could not be told apart")
+	if imageDigest(s, tokenQuote, e) == batchDigest || batchDigest == prevDigest {
+		t.Fatal("non-vacuity: the three images must digest apart, or P2 could not be told apart")
 	}
 	if got := s.inst.RedirtyTotal.Load(); got != 1 {
 		t.Fatalf("redirty_total = %d, want 1", got)
+	}
+
+	if err := writeBack(s, b, allCommitted()); err != nil {
+		t.Fatalf("second completion: %v", err)
+	}
+	if e.Digest != batchDigest { // P2
+		t.Fatalf("Digest = %#x after the commit, want the batch's %#x (never recomputed)", e.Digest, batchDigest)
+	}
+	if e.ColMask != batchMask || !e.Dirty || !slices.Equal(queued(s, tokenQuote), []int32{s.Index[tokenQuote][7]}) { // P1
+		t.Fatalf("after the commit: ColMask %#x Dirty %v queued %v; want the column kept and the row requeued",
+			e.ColMask, e.Dirty, queued(s, tokenQuote))
+	}
+	if err := s.maybeOpenEpoch(); err != nil {
+		t.Fatalf("third open: %v", err)
+	}
+	if b = next(t, q); b.Rows[0].Mask != batchMask || ltp(&b.Rows[0].Image) != 2000 {
+		t.Fatalf("next batch: Mask %#x ltp %d; want the column at 2000", b.Rows[0].Mask, ltp(&b.Rows[0].Image))
 	}
 }
 
@@ -488,38 +506,33 @@ func TestMergeMidFlightKeepsMaskAndDigest(t *testing.T) {
 // image hashes to D(A) again -- but Digest describes the last COMMIT, not the
 // batch, so suppressing would leave Oracle holding B and the mirror A with
 // nothing to requeue the row (Figure 2.4 has no suppression arc out of
-// InFlight). The merge must set ReDirty, and the modelled Committed arm must
-// put the row back on the ring.
+// InFlight). The merge must set ReDirty, and the real Committed arm (section
+// 8.4) must record B's digest and put the row back on the ring, so the next
+// batch writes A over B.
 func TestMergeMidFlightReturnToCommittedValueIsRequeued(t *testing.T) {
-	s, _ := newMergeShard(t, GuardAuto)
 	const d = tokenQuote
-	slot := slotOf(t, s, d, 7208)
-	imgLen := s.dst.ByID(d).ImageLen
-	seq := int32(0)
-	send := func(ltp uint32) {
-		seq++
-		u := model.UpdateUnit{Code: 7208, Seq: seq, LogTime: 100, RecvMono: int64(seq)}
-		put(t, s, &u, d, 1, slot, fv{0, be32(ltp)})
-		s.merge(u)
-	}
+	s, q, _ := newEpochShard(t, 8, 1000)
+	x := newSender7208(t, s)
 
-	send(500) // A, committed
+	x.send(1, fv{0, be32(500)}) // A, committed
+	if err := s.maybeOpenEpoch(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := writeBack(s, next(t, q), allCommitted()); err != nil {
+		t.Fatalf("A's completion: %v", err)
+	}
 	e := rowEntry(s, d, 1)
-	s.Accum[d].Reset()
-	e.Dirty, e.ColMask = false, 0
-	e.Digest, e.Written = digest(s.seed, e.Image[:imgLen]), model.Bit(0)
 	committedA := e.Digest
 
-	send(600) // B, pumped
-	i, ok := s.Accum[d].PopFront()
-	if !ok {
-		t.Fatal("B was not queued")
+	x.send(1, fv{0, be32(600)}) // B, pumped
+	if err := s.maybeOpenEpoch(); err != nil {
+		t.Fatalf("second open: %v", err)
 	}
-	e.Dirty, e.InFlight, e.ColMask = false, true, 0
-	batchB := digest(s.seed, e.Image[:imgLen])
+	b := next(t, q)
+	batchB := b.Rows[0].Digest
 
-	send(500) // A again, mid-flight
-	if e.Digest != committedA || e.ColMask&^e.Written != 0 || digest(s.seed, e.Image[:imgLen]) != committedA {
+	x.send(1, fv{0, be32(500)}) // A again, mid-flight
+	if e.Digest != committedA || e.ColMask&^e.Written != 0 || imageDigest(s, d, e) != committedA || batchB == committedA {
 		t.Fatal("non-vacuity: the mid-flight merge did not meet every other suppression clause")
 	}
 	if !e.ReDirty || s.inst.ChangeSuppressed.Load() != 0 || s.inst.RedirtyTotal.Load() != 1 {
@@ -527,14 +540,20 @@ func TestMergeMidFlightReturnToCommittedValueIsRequeued(t *testing.T) {
 			"want ReDirty, not suppressed", e.ReDirty, s.inst.ChangeSuppressed.Load(), s.inst.RedirtyTotal.Load())
 	}
 
-	// Section 8.3's Committed arm, as P3-09 will run it: B's digest, then requeue.
-	e.InFlight, e.Digest = false, batchB
-	if e.ReDirty {
-		e.ReDirty, e.Dirty = false, true
-		s.Accum[d].PushBack(i)
+	if err := writeBack(s, b, allCommitted()); err != nil {
+		t.Fatalf("B's completion: %v", err)
 	}
-	if !e.Dirty || s.Accum[d].Len() != 1 {
+	if e.Digest != batchB {
+		t.Fatalf("Digest = %#x after B committed, want B's %#x", e.Digest, batchB)
+	}
+	if !e.Dirty || !slices.Equal(queued(s, d), []int32{s.Index[d][1]}) {
 		t.Fatal("after B committed the row is clean and unqueued, but the mirror holds A: Oracle stays stale")
+	}
+	if err := s.maybeOpenEpoch(); err != nil {
+		t.Fatalf("third open: %v", err)
+	}
+	if b = next(t, q); ltp(&b.Rows[0].Image) != 500 {
+		t.Fatalf("next batch writes ltp %d, want A's 500 over B", ltp(&b.Rows[0].Image))
 	}
 }
 

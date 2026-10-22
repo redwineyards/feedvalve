@@ -97,8 +97,33 @@ func (s *Shard) maybeOpenEpoch() error {
 	return s.pump()
 }
 
+// closeEpoch closes the open epoch (Vol 2 section 6.4). Called only from
+// applyCompletion's step 13, once every cohort is empty and CohortOut is 0 --
+// and after the failed rows' head push (ruling D8), so a re-open here draws
+// them first.
+//
+// Step 4 re-opens at once when a non-rate-limited request is waiting, or a tick
+// was missed while this epoch was open and there is work for it. It cannot
+// recurse (section 2.5): maybeOpenEpoch proceeds only on a non-empty ring, so
+// the epoch it opens has a non-empty cohort and cannot close inside its own
+// pump. Depth is bounded at 2 by construction.
+func (s *Shard) closeEpoch() error {
+	s.EpochOpen = false
+	dur := uint64(nowMono() - s.epochOpenedAt)
+	s.inst.EpochDurationMaxNs.Observe(dur)
+	s.inst.EpochNsTotal.Add(dur)
+	for d := range s.Cohort {
+		s.inst.CohortDepth[d].Store(0)
+		s.inst.DirtyDepth[d].Store(int64(s.Accum[d].Len()))
+	}
+	if s.bus.Pending(s.ID) || (s.TickMissed && s.Accum[0].Len()+s.Accum[1].Len()+s.Accum[2].Len() > 0) {
+		return s.maybeOpenEpoch()
+	}
+	return nil
+}
+
 // releaseQuarantine releases every quarantined row on a configuration
-// generation change (Vol 2 section 9.5). Card P3-10 fills it; until then
-// nothing can reach it with a non-empty quarantine, because only P3-09's
-// completion path quarantines a row.
+// generation change (Vol 2 section 9.5). Card P3-10 fills it; until then a Gen
+// advance at epoch open drops the release and the rows stay quarantined.
+// Unreachable in production: Gen does not move until Phase 5's SIGHUP reload.
 func (s *Shard) releaseQuarantine() {}

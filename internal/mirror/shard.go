@@ -61,12 +61,16 @@ type Shard struct {
 	Free []*model.Batch
 
 	// all is every batch this shard owns, in a fixed order, and sentAt[i] is
-	// when all[i] was last sent on batchQ -- section 8.5's batchSentAt. Free's
+	// when all[i] was last sent on batchQ -- section 8.5's batchSentAt. out[i]
+	// is whether all[i] is with a writer now: set by the pump's successful send,
+	// cleared by the completion, so a batch returned twice is caught at step 0a
+	// instead of entering Free twice. Free's
 	// position is not an identity (it is a stack, and completions arrive out of
 	// order), and model.Batch gains no field for it, so a batch's index is found
 	// by a linear scan of all: m is 2 by default.
 	all    []*model.Batch
 	sentAt []int64
+	out    []bool
 
 	// Quarantine[d] is the slots of destination-d rows Oracle has permanently
 	// refused (section 9). Expected empty; walked only on a reload.
@@ -183,6 +187,7 @@ func NewShard(k model.ShardID, sz Sizing, params func() *Params, dst *destinatio
 	m := sz.MaxInFlightPerShard
 	s.all = make([]*model.Batch, m)
 	s.sentAt = make([]int64, m)
+	s.out = make([]bool, m)
 	s.Free = make([]*model.Batch, 0, m)
 	for i := range m {
 		b := &model.Batch{Shard: k, Rows: make([]model.BatchRow, sz.MaxBatchSizeCeiling)}
