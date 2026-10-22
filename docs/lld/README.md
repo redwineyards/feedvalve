@@ -101,7 +101,7 @@ Three decisions were taken at the same time and are now part of the contract:
   reader and the decoder, superseding ADR-001 — whose two grounds for rejecting a pre-classification
   queue are now one answered (single consumer preserves arrival order) and one expired (there is no
   per-class drop policy left to inform). Adds one goroutine, 8.5 MB, and ~3.4 s of absorption on top
-  of the kernel's 0.53 s. Resident total moves to **220.8 MB**.
+  of the kernel's 0.53 s. Resident total moves to **220.8 MB** (222.3 MB after Phase 3's ring erratum).
 
 ## Cross-volume reconciliation
 
@@ -114,7 +114,7 @@ Resolved after the volumes were written. These are binding.
 | `MsgHeader.LogTime` annotated "both layouts" in Vol 0, corrected by Vol 1's V-V1 | **Different offsets: 4 in `BCAST_HEADER`, 2 in `MESSAGE_HEADER`** (bible §2.8). Read at one fixed offset, the other layout yields `AlphaChar` — two characters of `Symbol` construed as a timestamp, feeding the ordering guard |
 | `SEC_INFO.OptionType` at @24 in Vol 0, corrected by Vol 1's V-V2 | **@26.** @24 overlaps `StrikePrice` (22–26) and makes the struct 28 bytes against a declared 30. The four *absolute* offsets Vol 0 derives are unaffected |
 | `maxBatchSize` reload direction | **Reloadable in both directions** within a startup-only ceiling (Vol 0 §7.3 C2). Buffers are pre-allocated at the ceiling, so any value within it is safe. Vol 4 correctly bound to Vol 0 over a looser instruction |
-| Memory envelope — Vol 0 said 189 MB resident, Vol 2 said 212.4 MB | **220.8 MB.** Vol 2's quantisation corrections (arena chunking, map bucket rounding, pre-sized rings) supersede Vol 0's occupied-byte arithmetic, plus 8.5 MB for QD. 0.55% of the 40 GB partition; every HLD §7.8 and §11.3 conclusion survives |
+| Memory envelope — Vol 0 said 189 MB resident, Vol 2 said 212.4 MB | **222.3 MB** (220.8 MB before the Phase 3 erratum counting the rings at their power-of-two capacity, 6.3 MB not 4.8 MB). Vol 2's quantisation corrections (arena chunking, map bucket rounding, pre-sized rings) supersede Vol 0's occupied-byte arithmetic, plus 8.5 MB for QD. 0.56% of the 40 GB partition; every HLD §7.8 and §11.3 conclusion survives |
 | **ADR-L06 … ADR-L12 were each defined twice** — once in Vol 1, once in Vol 4, for unrelated decisions | **Vol 4 renumbered to ADR-L30 … ADR-L38.** A citation of "ADR-L10" previously resolved to recover-boundary placement *or* the session-event channel depending on which volume you held. Blocks allocated per volume now: Vol 0 L01–L05 and L13, Vol 1 L06–L12, Vol 2 L20–L24, Vol 3 W01–W08, Vol 4 L30–L38 |
 | **"Q0" meant two different things** — the HLD defines it as the kernel socket buffer; the new ring needed a label | The ring is **QD**. Q0 keeps its existing meaning, and Q1/Q2/Q2c are untouched — renumbering them would have been a large, risky edit for no gain |
 | `blob_overrun{code}` (Vol 1, decode) vs `blob_len_mismatch{code}` (Vol 2, shard) | **Both kept.** The same invariant seen from two sides with two different remedies — a decoder writing past a declared width, versus a unit whose blob length disagrees with its mask |

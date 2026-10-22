@@ -961,7 +961,10 @@ gates; D8's ordering and V0-Δ1 are both one-line mistakes no other gate catches
 
 ### Errata to file
 
-Applied to the LLD in one doc commit at the end of the phase:
+**Applied to the LLD in this commit** (the end-of-phase errata doc commit). The list below is kept as
+the record; each volume marks its edits "*(erratum, Phase 3: …)*". One entry is not LLD text: the
+P3-10 note concerns this plan. Seam 9's erratum was also carried into Vol 1 §10.3 and its `RecvMono`
+row, which described the raw `time.Since` reading:
 
 - **V2 §2.2** (V2:402-403) — no `ctx.Done()` arm (D5).
 - **V2 §2.6** (V2:385, 535) — one shared deadline, armed from `t_shutdown`, gated on `in` closed (D4).

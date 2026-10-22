@@ -649,9 +649,10 @@ HLD's 147 MB.
 > **Superseded by Vol 2 §10, which is canonical for the envelope.** Occupied-byte arithmetic
 > understates the real figure because it ignores quantisation: arenas are allocated in chunks, Go
 > rounds map buckets to a power of two, and the rings are pre-sized. Vol 2 re-derived arenas at
-> **187.6 MB**, indexes at **11.7 MB** and rings at **4.8 MB**. With Q1 at 5.9 MB, the new datagram
+> **187.6 MB**, indexes at **11.7 MB** and rings at **6.3 MB** *(erratum, Phase 3: 4.8 MB before the
+> rings' power-of-two capacity was counted, Vol 2 §10.3)*. With Q1 at 5.9 MB, the new datagram
 > ring **QD** at 8.5 MB (§9.5.2), batch rows at 2.3 MB and fixed buffers under 1 MB, the resident
-> total is ≈ **220.8 MB — 0.55 % of the 40 GB partition.** Use these figures, not the 169.6/189 pair.
+> total is ≈ **222.3 MB — 0.56 % of the 40 GB partition.** Use these figures, not the 169.6/189 pair.
 
 Every conclusion in HLD
 §7.8 and §11.3 survives unchanged.
@@ -835,10 +836,11 @@ type RegistryEntry struct {
     Class     model.Class
     Slots     [maxDestinations]uint8    // contributor slot of Code in each destination
     Contrib   [maxDestinations]ColSpec  // which columns of each destination Code supplies
-    GuardOff  *atomic.Bool              // per-transcode ordering-guard kill switch (HLD §6.5,
-                                        // `auto`). Written once by the stats goroutine, read
-                                        // by the shards with one atomic load
 }
+// (erratum, Phase 3, ruling D2: the draft carried GuardOff *atomic.Bool here. The
+// registry is immutable and swapped whole on a reload, so the bit lives instead in
+// mirror.GuardTable — built once by app, shared by every shard, never rebuilt —
+// with its guard_offered/guard_superseded counters resolved before Freeze.)
 
 // ColSpec is one transcode's declared contribution to one destination: the mask
 // of fields it supplies and the total packed width of their values. Width is
@@ -1504,7 +1506,13 @@ suppress  ⟺   class == ClassRateLimited                       (HLD §6.8, §7.
           ∧   e.Digest != 0                                    row has been written at least once
           ∧   digest(e, d) == e.Digest                         image unchanged since that write
           ∧   (e.ColMask &^ e.Written) == 0                    no field is new to the Oracle row
+          ∧   !e.InFlight                                      no batch of this row is in flight
 ```
+
+*(erratum, Phase 3: the fifth clause. `Digest` describes the last **commit**, not the batch in flight,
+so a value that returns to the committed one mid-flight — A committed, B pumped, A merged — matches it
+and would be dropped, leaving Oracle at B and the mirror at A with nothing to requeue the row. Vol 2
+Figure 2.4 already has no suppression arc out of `InFlight`.)*
 
 The fourth clause is why `Entry.Written` exists, and the failure it prevents is concrete. Suppose
 destination 1 is fed by two transcodes and the second one contributes `tick_size` for the first time,
@@ -1533,7 +1541,7 @@ obligations any mechanism must satisfy.**
 | `BatchRow.Outcome` | `Entry.Digest` | `Entry.Written` | `Entry.ColMask` | Ring action |
 |---|---|---|---|---|
 | `OutcomeCommitted` | `= BatchRow.Digest` — **the digest of the image the batch carried**, never recomputed from the entry | `\|= BatchRow.Mask` | untouched (zeroed at pump; now holds exactly what was dirtied since) | tail of the accumulating ring **iff** `ReDirty` |
-| `OutcomeRejected` | **unchanged** | **unchanged** | untouched | **not requeued**; count `row_rejected` |
+| `OutcomeRejected` | **unchanged** | **unchanged** | untouched, except that a row which stays quarantined gets `\|= BatchRow.Mask` back so a release rewrites the refused columns *(erratum, Phase 3: Vol 2 §8.4, ruling D13)* | **not requeued**; the shard counts `row_quarantined`, the writer `row_rejected` *(erratum, Phase 3: ruling D11)* |
 | `OutcomeFailed` | **unchanged** | **unchanged** | `\|= BatchRow.Mask` (restore the unwritten fields) | **head** of the accumulating ring; count `retry_requeued` |
 | `OutcomePending` on return | — | — | — | **defect.** Count `batch_row_unreported` and stop loudly: the writer returned a batch it never adjudicated |
 
