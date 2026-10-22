@@ -940,6 +940,7 @@ gates; D8's ordering and V0-Δ1 are both one-line mistakes no other gate catches
 | **D10** | Nothing consumes `batchQ` until Phase 4 | No in-binary writer stub (P3-13 callout) |
 | **D11** | `row_rejected` owner: ledger says writer (`ledger.go:150`), V3:1140 and G-STMT-2 (V4:1652) agree; V2:2148 has the shard count it | **The writer's.** The shard counts only `row_quarantined{d}` (A19). G-ROW-1's "`row_rejected`++" reads `row_quarantined`++ (erratum). Prevents a Phase 4 double count |
 | **D12** | V0 §5A pre-validation: "validate at merge, per contribution" (V0:1677); all three instruments are the shard's (`ledger.go:203-205`); the DDL facts are on the column (`column.go:93-99`); the rejection behaviour is specified (V0:1679-1682) | **Phase 3, card P3-07b**, inside merge step 4. Vol 2 never names the step: erratum to V2 §4 |
+| **D13** | A row released from quarantine with no merge in between carries `ColMask == 0`; the writer rejects an empty mask (V3 W-4) and the row re-quarantines, so a correct operator fix reads as "did not take" (P3-10 review) | The reject arm's stay-quarantined branch folds the refused mask back, `ColMask \|= r.Mask` (after the V0-Δ1 test), so the release rewrites the refused columns — V2 §9.4's "a release writes the latest state". Errata to V2 §8.4 and G-ROW-1 (V4:1648) |
 
 ### Other seams
 
@@ -985,9 +986,24 @@ Applied to the LLD in one doc commit at the end of the phase:
 - **V2 §1.1** — `tickPending`, `maxBatchSize`, `all`/`sentAt` missing from the struct.
 - **V2 §2.3** — V2:409 omits `tickPending`.
 - **V2 §6.3** — V2:1634, config read at epoch open **and** at each tick (D3); V2:1613's increment point.
+- **V2 §6.3 step 8** (V2:1590) — `dirty_depth{k,d}` publishes `Accum[d].Len()`, not 0: the
+  accumulating rings are non-empty after a step-7 quarantine release (P3-10).
+- **V2 §8.4** — the Rejected arm's stay-quarantined branch folds the refused columns back,
+  `ColMask |= r.Mask`, **after** the V0-Delta-1 disjoint test (which needs `ColMask` without them),
+  exactly as the Failed arm does (P3-10 review). Otherwise a row not merged into while quarantined is
+  released with `ColMask == 0` and batched with `Mask == 0`, which Vol 3 W-4 (A17) refuses as a Vol 2
+  defect (`batch_row_empty_mask`, re-quarantined) — runbook step 4 then reads "the fix did not take"
+  though it did — and the refused columns are never rewritten unless a later merge touches them,
+  contradicting §9.4's "a release writes the **latest** state". Nothing is re-offered early: merge
+  step 6 still keeps a quarantined row off the rings.
 - **V2 §8.5–8.6** — `batchSentAt` defined; head push before step 13 (D8).
 - **V2 §9.4** — duplicated paragraphs (V2:2393-2404 vs 2406-2416); stale `Fail` for `Quarantined`
   (V2:1089, 2643, 2800, 2837).
+- **V2 §9.5** — the pseudocode's `publish rows_quarantined_current{d} = 0` is right only with one
+  shard: the gauge has no shard label and every shard shares it (`ledger.go`, `dimDest`;
+  `app/instruments.go`), so a release subtracts its own count, `rows_quarantined_current{d} −=
+  released[d]`, matching V0-Delta-1's `−= 1` (V2:2160). Released rows go to the tail in quarantine
+  order (P3-10).
 - **V2 §10.3** — rings 6.3 MB, not 4.8 MB.
 - **V4:168** — exit-4 list: add V7, F27, `FatalShardInvariant`. The same count recurs at V4:255
   (step 2's `reason=` list) and V4:1358 ("the five terminal conditions").
@@ -1001,10 +1017,14 @@ Applied to the LLD in one doc commit at the end of the phase:
 - **V4:1634, :1642** — G-FLUSH-3's "within microseconds" and G-INFL-4's "`1/m` of the wall time" are
   informational; the gates assert the cause (wake arm taken) and the concurrency (≤ m held, m
   reached), which do not flake under G-RACE-2's `-race -count=20`.
-- **V4:1648** — G-ROW-1: "nothing changed" reads "`Digest`, `Written`, `ColMask` unchanged" (the
-  quarantine flag is the specified change), and `row_rejected`++ reads `row_quarantined`++ (D11).
+- **V4:1648** — G-ROW-1: "nothing changed" reads "`Digest`, `Written` unchanged, `ColMask` = the
+  refused `Mask`" (the quarantine flag is the specified change; the mask fold is the V2 §8.4 erratum
+  above), and `row_rejected`++ reads `row_quarantined`++ (D11).
 - **V4:1662** — G-LIFE-5's "five `FatalReason`s … 4×5" becomes **eight** (six today, plus F27 and
   `FatalShardInvariant`).
+- **This plan, P3-10's first test** — the released row is on `Accum` (the next epoch), not "in the
+  cohort": V2 §6.3 step 7 runs after step 5's swap, and §9.5 / Figure 2.4 push it to the tail of
+  `Accum[d]` ("one epoch after the reload", §9.3).
 - **Phase 2's loose end** — Vol 1's gate count, 24 declared vs 21 enumerated (`phase2-tasks.md` §8).
 
 ---

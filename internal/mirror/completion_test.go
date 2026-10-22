@@ -404,7 +404,8 @@ func TestG_EPOCH_2_MidDrainMergeWaitsForTheNextEpoch(t *testing.T) {
 //
 // ASSERTION, per Vol 0 section 5.4's table:
 //   - C: Digest = BatchRow.Digest, Written |= Mask, clean, not requeued.
-//   - R: Digest, Written and ColMask unchanged; on no ring; Quarantined and in
+//   - R: Digest and Written unchanged, ColMask = Mask (the refused columns
+//     folded back for the release, P3-10 erratum); on no ring; Quarantined and in
 //     Quarantine[0]; row_quarantined and rows_quarantined_current 1; 1438 is
 //     predictable and pre-validation passed it, so
 //     rows_rejected_by_oracle_unpredicted 1; one ERROR line naming the row and
@@ -470,8 +471,9 @@ func TestG_ROW_1_ThreeOutcomesThreeObligations(t *testing.T) {
 		t.Fatalf("Committed: Digest %#x Written %#x ColMask %#x Dirty %v InFlight %v",
 			c.Digest, c.Written, c.ColMask, c.Dirty, c.InFlight)
 	}
-	if r.Digest != priorDigest || r.Written != priorWritten || r.ColMask != 0 {
-		t.Fatalf("Rejected changed the row: Digest %#x Written %#x ColMask %#x", r.Digest, r.Written, r.ColMask)
+	if r.Digest != priorDigest || r.Written != priorWritten || r.ColMask != mask {
+		t.Fatalf("Rejected: Digest %#x Written %#x ColMask %#x; want unchanged, unchanged, the refused Mask",
+			r.Digest, r.Written, r.ColMask)
 	}
 	if !r.Quarantined || r.Dirty || r.InFlight || !slices.Equal(s.Quarantine[tokenQuote], slotsOf(s, tokenQuote, 'R')) {
 		t.Fatalf("Rejected: Quarantined %v Dirty %v InFlight %v quarantine %v",

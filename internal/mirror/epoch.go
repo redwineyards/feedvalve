@@ -86,10 +86,12 @@ func (s *Shard) maybeOpenEpoch() error {
 		s.cfgGen = p.Gen
 	}
 
-	// Step 8 -- count it and publish the depth gauges (shape G).
+	// Step 8 -- count it and publish the depth gauges (shape G). The
+	// accumulating rings are empty after the swap unless step 7 released
+	// quarantined rows onto them.
 	s.inst.EpochOpened.Add(1)
 	for d := range s.Cohort {
-		s.inst.DirtyDepth[d].Store(0)
+		s.inst.DirtyDepth[d].Store(int64(s.Accum[d].Len()))
 		s.inst.CohortDepth[d].Store(int64(s.Cohort[d].Len()))
 	}
 
@@ -121,9 +123,3 @@ func (s *Shard) closeEpoch() error {
 	}
 	return nil
 }
-
-// releaseQuarantine releases every quarantined row on a configuration
-// generation change (Vol 2 section 9.5). Card P3-10 fills it; until then a Gen
-// advance at epoch open drops the release and the rows stay quarantined.
-// Unreachable in production: Gen does not move until Phase 5's SIGHUP reload.
-func (s *Shard) releaseQuarantine() {}
