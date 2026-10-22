@@ -35,13 +35,17 @@ func TestClassSeverityBoundary(t *testing.T) {
 	// end of the WARN run, which moved firstErrorClass from 10 to 11 and
 	// relabelled every ERROR class's log_events_suppressed{class} slot. That was
 	// deliberate; the next move should be too, so it has to edit this number.
-	if firstErrorClass != 11 || numClasses != 22 {
-		t.Errorf("firstErrorClass = %d, numClasses = %d; want 11 and 22. A class was "+
+	// P3-13 appended the ERROR shard_defect at the very end, which moves no
+	// existing slot.
+	if firstErrorClass != 11 || numClasses != 23 {
+		t.Errorf("firstErrorClass = %d, numClasses = %d; want 11 and 23. A class was "+
 			"added or moved: check its severity run and update this pin deliberately",
 			firstErrorClass, numClasses)
 	}
 	// And the four P3-04 classes are on the side Vol 2 logs them at.
-	for _, c := range []Class{ClassBlobLenMismatch, ClassGuardDisabled, ClassDrainDeadline} {
+	// So is P3-13's shard_defect: its lines report a stopping process.
+	for _, c := range []Class{ClassBlobLenMismatch, ClassGuardDisabled, ClassDrainDeadline,
+		ClassShardDefect} {
 		if c < firstErrorClass {
 			t.Errorf("%v is in the WARN run; Vol 2 logs it at ERROR", c)
 		}

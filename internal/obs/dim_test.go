@@ -147,8 +147,8 @@ func TestClassTableMatchesTheEnum(t *testing.T) {
 	if ClassSeqGap.String() != "seq_gap" {
 		t.Errorf("ClassSeqGap = %q, want seq_gap", ClassSeqGap)
 	}
-	if ClassDrainDeadline.String() != "drain_deadline" {
-		t.Errorf("ClassDrainDeadline = %q, want drain_deadline", ClassDrainDeadline)
+	if ClassShardDefect.String() != "shard_defect" {
+		t.Errorf("ClassShardDefect = %q, want shard_defect", ClassShardDefect)
 	}
 	// And the two seams P3-04 inserted at: the end of the WARN run and the end
 	// of the ERROR run. A name landing one slot off shifts every label after it.
@@ -159,6 +159,7 @@ func TestClassTableMatchesTheEnum(t *testing.T) {
 		ClassStartupFailed:    "startup_failed",
 		ClassBlobLenMismatch:  "blob_len_mismatch",
 		ClassGuardDisabled:    "guard_disabled",
+		ClassDrainDeadline:    "drain_deadline",
 	} {
 		if c.String() != want {
 			t.Errorf("class %d = %q, want %q", c, c, want)

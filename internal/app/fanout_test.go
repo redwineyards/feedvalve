@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -315,6 +316,7 @@ func TestFanOutBudgetExpiryIsFatal(t *testing.T) {
 	t.Run("the timer fires", func(t *testing.T) {
 		f := newFanoutFixture(t, 1, 1, 1, 1)
 		f.g.shardCh[0] <- model.UpdateUnit{} // full, and nothing drains it
+		f.g.inst().mirrorShards[0].ShardLoopMaxNs.Observe(stalledLoopNs)
 		f.prime(1)
 
 		err := f.r.route([]model.UpdateUnit{{Token: 1, Code: 7208}}, 0, 1)
@@ -327,6 +329,7 @@ func TestFanOutBudgetExpiryIsFatal(t *testing.T) {
 	t.Run("an earlier unit already spent it", func(t *testing.T) {
 		f := newFanoutFixture(t, 1, 1, 1, 50)
 		f.g.shardCh[0] <- model.UpdateUnit{}
+		f.g.inst().mirrorShards[0].ShardLoopMaxNs.Observe(stalledLoopNs)
 		f.prime(1)
 		// Past the budget before this unit was even offered, which is the
 		// shape section 10.5 checks BEFORE arming the timer -- Reset with a
@@ -341,6 +344,10 @@ func TestFanOutBudgetExpiryIsFatal(t *testing.T) {
 		assertQ1Fatal(t, f)
 	})
 }
+
+// stalledLoopNs is the shard_loop_max_ns{0} the expiry tests plant, so the
+// terminal line can be checked for it by value.
+const stalledLoopNs uint64 = 7_777_777
 
 // assertQ1Fatal checks that the terminal condition was reported once, under
 // the right reason, and that the log line carries section 10.6's table.
@@ -365,6 +372,9 @@ func assertQ1Fatal(t *testing.T, f *fanoutFixture) {
 		"shard=0", "depth=1", "cap=1", "code=7208", "token=1",
 		"unit_index=0/1", "units_in_datagram=1", "subpacket=1/1",
 		"datagram_bytes=512", "budget_ms=", "used_ns=", "depths=0:1",
+		// The stalled shard's own instrument, by value, so the field is shown
+		// to read shard k's max and not merely to be present.
+		"shard_loop_max_ns=" + strconv.FormatUint(stalledLoopNs, 10),
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("the terminal line does not carry %q:\n%s", want, line)

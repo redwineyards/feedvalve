@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"feedvalve/internal/framing"
+	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 	"feedvalve/internal/wire"
@@ -36,7 +37,8 @@ const readBufferLen = 65536
 // The returned error is nil for a requested shutdown -- INCLUDING one whose
 // drain deadline expired and abandoned rows, which is a counted, logged
 // degradation of a stop we asked for and not a failure (ADR-L37) -- and non-nil
-// only for a terminal runtime condition, which main maps to exit code 4.
+// only for a terminal runtime condition, which main maps to exit code 4. That
+// includes one raised DURING a requested drain: the request does not absorb it.
 //
 // THE DRAIN IS IN THE BODY, NOT A DEFER, and Vol 4 section 1.1 is explicit
 // about why: "a defer cannot be sequenced against another defer's resource, and
@@ -56,12 +58,10 @@ func (g *Graph) Run(ctx context.Context) error {
 	// a bind failure must return an error with the database closed, not exit.
 	defer g.teardown()
 
-	// Step 14: the Q1 consumers, BEFORE the decoder that feeds them -- the same
-	// consumers-before-producers rule as below, one queue further down. Until
-	// Phase 3 these discard; what matters now is that the channel always has a
-	// reader, so the fan-out's budget measures the design's fast path rather
-	// than the absence of a shard.
-	g.startShardConsumers()
+	// Step 14: the shards, Q1's consumers, BEFORE the decoder that feeds them --
+	// the same consumers-before-producers rule as below, one queue further
+	// down.
+	g.startShards()
 
 	// Step 14a: the decoder, BEFORE the producer that feeds it. Consumers
 	// before producers is the same rule that puts the writers before the
@@ -69,8 +69,11 @@ func (g *Graph) Run(ctx context.Context) error {
 	// burns queue slack for nothing.
 	g.startDecoder()
 
-	// Step 15: the stats and health goroutine. Before the socket, so the
-	// liveness clock is already running when the first datagram could arrive.
+	// Step 15: the flush ticker, then the stats and health goroutine. After
+	// the shards, so the first tick cannot land on a shard that does not
+	// exist; before the socket, so the liveness clock is already running when
+	// the first datagram could arrive.
+	g.startFlushTicker()
 	g.startStats()
 
 	// Step 16: the listener, LAST of the resources, so nothing arrives before
@@ -89,6 +92,20 @@ func (g *Graph) Run(ctx context.Context) error {
 
 	// Steps 3 to 10: the drain.
 	g.teardown()
+
+	// A terminal condition raised DURING a requested drain -- F26 or F27 from
+	// a shard, which runs on into the drain by design (ruling D9) -- must
+	// still reach the exit code. wait() stopped reading g.fatal at
+	// ctx.Done(); Fatal is one-shot into a buffer of one, so one non-blocking
+	// read after every goroutine has joined sees it if it came.
+	if !terminal {
+		select {
+		case ev = <-g.fatal:
+			terminal = true
+			g.deps.Log.Infof("shutdown escalated reason=%s%s", ev.reason, detailSuffix(ev.detail))
+		default:
+		}
+	}
 
 	if terminal {
 		return &ExitError{
@@ -433,16 +450,25 @@ func (g *Graph) startStats() {
 	g.mark(&g.acquired, "stats-goroutine")
 
 	interval := g.deps.Cfg.StatsInterval()
+	guardEvery := g.guardEvalEvery
 	go func() {
 		defer close(g.statsDone)
 		t := time.NewTicker(interval)
 		defer t.Stop()
+		// The second ticker: the ordering guard's evaluator, every
+		// ordering.guardEvalIntervalSec -- deliberately not the 60 s stats
+		// interval, because a frozen transcode's rows stop updating entirely
+		// until it runs (Vol 2 section 5.5).
+		guard := time.NewTicker(guardEvery)
+		defer guard.Stop()
 
 		last := time.Now()
 		for {
 			select {
 			case <-g.statsStop:
 				return
+			case <-guard.C:
+				g.evaluateGuards()
 			case now := <-t.C:
 				// A wall clock that jumped by much more than the interval is a
 				// step, and it makes every timestamp in the log discontinuous.
@@ -471,12 +497,22 @@ func (g *Graph) emitStats() error {
 	return g.deps.Reg.Emit(g.deps.Stderr)
 }
 
+// evaluateGuards is one pass of the ordering guard's auto-disable (Vol 2
+// section 5.5), under emitMu like the other stats-goroutine work, so the
+// evaluator's snapshot and an emission never interleave.
+func (g *Graph) evaluateGuards() {
+	g.emitMu.Lock()
+	defer g.emitMu.Unlock()
+	mirror.EvaluateGuards(g.guards, g.loadRuntime().Mirror, g.guardSnap, g.deps.Log)
+}
+
 // sampleGauges stores the values Vol 0 section 8.2 describes as sampled at
 // emission and whose owner is the lifecycle. Caller holds emitMu.
 func (g *Graph) sampleGauges() {
 	in := g.inst()
 	in.configGeneration.Store(int64(g.deps.Store.Gen()))
 	in.writersConfigured.Store(int64(g.deps.Cfg.Writers.Count))
+	in.batchqDepth.Store(int64(len(g.batchQ)))
 	// The ring's own counters are plain numbers, not instruments: the ledger
 	// assigns qd_wake_parked to the decoder, so the decoder's handle reports
 	// it rather than the ring writing it directly.
@@ -571,6 +607,9 @@ func (g *Graph) wait(ctx context.Context) (fatalEvent, bool) {
 
 func (g *Graph) logShutdownInitiated(ev fatalEvent, terminal bool) {
 	g.drainStarted = time.Now()
+	// t_shutdown: the shared drain deadline runs from here (Vol 4 section 1.5
+	// step 7), not from the moment each shard sees its channel close.
+	g.armDrainDeadline()
 	reason := "signal"
 	if terminal {
 		reason = ev.reason.String()
@@ -633,11 +672,19 @@ func (g *Graph) teardown() {
 		// close safe rather than a panic: the decoder is Q1's sole producer,
 		// so once it is joined nothing can send. Same shape as the QD stage
 		// above -- drained, not abandoned.
+		//
+		// Steps 7 and 8 are inside that wait: each shard drains under the ONE
+		// shared deadline, armed at t_shutdown -- or here, on an error path
+		// that never logged it -- and counts what it abandons. The deadline is
+		// stopped once every shard is quiescent, and the flush ticker once
+		// they have returned.
+		g.armDrainDeadline()
 		g.stopShardConsumers()
+		g.drainTimer.Stop()
+		g.stopFlushTicker()
 
-		// Steps 7 to 10 -- the shard drain under one shared deadline, close
-		// batchQ, the writers' last batch -- arrive with Phase 3 and Phase 4.
-		// The ordering is what P1-09 fixes; the stages slot in here.
+		// Steps 9 and 10 -- close batchQ, the writers' last batch -- arrive
+		// with Phase 4.
 
 		if g.statsStarted {
 			close(g.statsStop)

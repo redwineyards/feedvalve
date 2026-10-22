@@ -112,7 +112,7 @@ func newDiffFixture(t *testing.T, configured []int, traced []int) *diffFixture {
 
 	g.setRuntime(&Runtime{Cfg: cfg, Reg: reg, Dests: dests})
 	g.allocShardQueues(cfg.Runtime.Shards, cfg.Runtime.ShardQueueCapacity)
-	g.startShardConsumers()
+	g.startDiscardConsumers()
 	t.Cleanup(g.stopShardConsumers)
 
 	rcv := newReceiver(g)

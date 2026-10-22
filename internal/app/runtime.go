@@ -1,9 +1,13 @@
 package app
 
 import (
+	"hash/maphash"
+	"time"
+
 	"feedvalve/internal/config"
 	"feedvalve/internal/decode"
 	"feedvalve/internal/destinations"
+	"feedvalve/internal/mirror"
 )
 
 // Runtime is the configuration and everything derived from it, published as ONE
@@ -28,6 +32,59 @@ type Runtime struct {
 	Cfg   *config.Config
 	Reg   decode.Registry
 	Dests *destinations.Set
+
+	// Mirror is Cfg projected onto the shard's reloadable parameters (phase 3
+	// ruling D1). Inside this snapshot rather than behind a second
+	// atomic.Pointer, for the skew argument above: a shard loading Params must
+	// never see a generation the rest of the snapshot does not describe.
+	Mirror *mirror.Params
+}
+
+// mirrorParams projects the configuration onto mirror.Params -- the ONE place
+// it is derived, so the startup path and Phase 5's reload cannot disagree
+// about a unit conversion. mirror cannot import config (ruling D1: config
+// carries oradb.DBSettings, and G-DEP-1 is transitive), which is why this lives
+// in app, beside transcodeSpecs and obsOptions.
+func mirrorParams(cfg *config.Config) *mirror.Params {
+	return &mirror.Params{
+		Gen:            cfg.Gen,
+		Window:         cfg.Window(),
+		MaxBatchSize:   cfg.Flush.MaxBatchSize,
+		EpochStallWarn: time.Duration(cfg.Flush.EpochStallWarnMs) * time.Millisecond,
+		DrainTimeout:   cfg.DrainTimeout(),
+
+		Guard:                 parseGuard(cfg.Ordering.Guard),
+		GuardSuppressionRatio: cfg.Ordering.GuardSuppressionRatio,
+		GuardMinSamples:       cfg.Ordering.GuardMinSamples,
+		GuardEvalInterval:     time.Duration(cfg.Ordering.GuardEvalIntervalSec) * time.Second,
+	}
+}
+
+// mirrorSizing is the startup-only half: what sizes the structures NewShard
+// allocates, plus the one process-wide digest seed every shard shares.
+func mirrorSizing(cfg *config.Config, seed maphash.Seed) mirror.Sizing {
+	r := &cfg.Runtime
+	return mirror.Sizing{
+		Shards:              r.Shards,
+		ExpectedRows:        r.ExpectedRows,
+		ArenaChunkRows:      r.ArenaChunkRows,
+		MaxInFlightPerShard: r.MaxInFlightPerShard,
+		MaxBatchSizeCeiling: r.MaxBatchSizeCeiling,
+		Seed:                seed,
+	}
+}
+
+// parseGuard maps ordering.guard onto mirror.GuardMode. config's V-RANGE has
+// already restricted it to on, off and auto; auto, the default, is the
+// fallback for the branch no validated Config reaches.
+func parseGuard(s string) mirror.GuardMode {
+	switch s {
+	case "on":
+		return mirror.GuardOn
+	case "off":
+		return mirror.GuardOff
+	}
+	return mirror.GuardAuto
 }
 
 // loadRuntime returns the current snapshot.

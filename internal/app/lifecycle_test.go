@@ -43,6 +43,12 @@ func testGraphWith(t *testing.T, listen string, tune func(*config.Config),
 	// defaults are the shipped values anyway.
 	cfg := config.Defaults()
 	cfg.UDP.Listen = listen
+	// Small mirrors. At the defaults every Build allocates ~41 MB of arenas,
+	// indexes, rings and batches, and G-LIFE-5 builds one graph per
+	// FatalReason under -race's memory multiplier. Nothing here needs the
+	// production pre-size; a tune can still restore it.
+	cfg.Runtime.ExpectedRows = 1024
+	cfg.Runtime.ArenaChunkRows = 256
 	if tune != nil {
 		tune(cfg)
 	}
@@ -126,8 +132,8 @@ func TestG_LIFE_1_TheSocketIsBoundLast(t *testing.T) {
 	if listener < 0 {
 		t.Fatalf("the listener was never acquired: %v", got)
 	}
-	for _, earlier := range []string{"derived-state", "qd-ring", "shard-channels",
-		"shard-consumers", "decoder", "stats-goroutine"} {
+	for _, earlier := range []string{"derived-state", "qd-ring", "shard-channels", "shards",
+		"shard-consumers", "decoder", "flush-ticker", "stats-goroutine"} {
 		at := idx(earlier)
 		if at < 0 {
 			t.Errorf("%q was never acquired: %v", earlier, got)
@@ -139,6 +145,15 @@ func TestG_LIFE_1_TheSocketIsBoundLast(t *testing.T) {
 				"is somewhere to put it and before the goroutine that will drain it "+
 				"exists (Vol 4 section 1.4 step 16).", earlier, got)
 		}
+	}
+
+	// Step 15 after steps 14 and 14a: the flush ticker starts beside the
+	// stats goroutine, after the shards it ticks, so the first tick cannot
+	// land on a shard that does not exist (Vol 4 section 1.4).
+	if ticker := idx("flush-ticker"); ticker < idx("shard-consumers") || ticker < idx("decoder") ||
+		ticker > idx("stats-goroutine") {
+		t.Errorf("the flush ticker is not at step 15, after the shards and the decoder and "+
+			"beside the stats goroutine (order: %v)", got)
 	}
 }
 
@@ -160,7 +175,7 @@ func TestEveryAcquiredResourceIsReleased(t *testing.T) {
 
 	released := g.Released()
 	for _, want := range []string{"udp-listener", "qd-ring", "decoder",
-		"shard-channels", "shard-consumers", "stats-goroutine"} {
+		"shard-channels", "shard-consumers", "flush-ticker", "stats-goroutine"} {
 		if !slices.Contains(released, want) {
 			t.Errorf("%q was acquired but never released (released: %v)", want, released)
 		}

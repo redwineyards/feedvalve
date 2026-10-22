@@ -1,10 +1,18 @@
 package mirror
 
 import (
+	"errors"
 	"fmt"
 
 	"feedvalve/internal/model"
 )
+
+// ErrBatchQSendFailed is defect S1 (Vol 2 section 2.7): the pump's
+// non-blocking batchQ send failed, which section 7.4 shows cannot happen by
+// construction. Exported, unlike every other Run error, because app maps it to
+// its own fatal reason (F21, FatalBatchQSendFail) while S2, cohort_not_empty
+// and step 0a share one (phase 3 ruling D9). Match it with errors.Is.
+var ErrBatchQSendFailed = errors.New("batchQ send failed")
 
 // pump emits batches from the open epoch's cohort while the free list allows
 // (Vol 2 section 7). Called on epoch open (section 6.3 step 9) and again on
@@ -66,8 +74,8 @@ func (s *Shard) pump() error {
 			}
 		default:
 			s.inst.FlushDeferred.Add(1)
-			return fmt.Errorf("shard %d: batchQ send failed with %d batches outstanding "+
-				"(epoch %d, %d rows) -- see LLD Vol 2 section 7.4", s.ID, s.CohortOut, s.Epoch, n)
+			return fmt.Errorf("shard %d: %w with %d batches outstanding "+
+				"(epoch %d, %d rows) -- see LLD Vol 2 section 7.4", s.ID, ErrBatchQSendFailed, s.CohortOut, s.Epoch, n)
 		}
 	}
 	return nil

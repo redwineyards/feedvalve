@@ -151,8 +151,14 @@ type instruments struct {
 	// both counters index it.
 	unconfiguredTranscode func(code int) (*obs.Counter, bool)
 
-	// stats-owned
+	// stats-owned. batchqDepth is len(batchQ), sampled at emission -- race-free
+	// on a channel, which is why the ledger lets the stats goroutine own it.
 	clockStepDetected *obs.Counter
+	batchqDepth       *obs.Gauge
+
+	// panics_recovered{stage=shard}: F26's observable (Vol 4 section 5),
+	// counted by the shard goroutine's recover in runShard.
+	panicsRecoveredShard *obs.Counter
 }
 
 // resolveInstruments performs the resolution half of startup step 9. The caller
@@ -223,7 +229,9 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 
 		qdWakeParked: reg.Counter(obs.IDQDWakeParked),
 
-		clockStepDetected: reg.Counter(obs.IDClockStepDetected),
+		clockStepDetected:    reg.Counter(obs.IDClockStepDetected),
+		batchqDepth:          reg.Gauge(obs.IDBatchqDepth),
+		panicsRecoveredShard: reg.CounterAt(obs.IDPanicsRecovered, int(obs.StageShard)),
 
 		subpacketsTotal:        reg.Counter(obs.IDSubpacketsTotal),
 		subpacketsCompressed:   reg.Counter(obs.IDSubpacketsCompressed),

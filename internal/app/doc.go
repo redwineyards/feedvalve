@@ -31,9 +31,9 @@
 //
 // What P1-09 orders and what it does not yet contain: the loggers, the
 // instrument registry, the database handle, QD, the decoder, the stats
-// goroutine and the listener are all here. The shard and writer pools are
-// Phase 3 and Phase 4, and the slots they take in the startup and shutdown
-// sequences are marked in lifecycle.go. The decoder's callback is the seam
+// goroutine and the listener are all here, and since Phase 3 the shards and
+// the flush ticker. The writer pool is Phase 4, and the slot it takes in the
+// startup and shutdown sequences is marked in lifecycle.go. The decoder's callback is the seam
 // Phase 2 fills with framing and decode; until then it drains and discards,
 // which still has to TAKE each datagram or shutdown would abandon a ring with
 // items in it.

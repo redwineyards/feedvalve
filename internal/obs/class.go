@@ -14,7 +14,8 @@ package obs
 //
 // The classes are Vol 4 section 6.2's WARN and ERROR rows, one per distinct
 // event the table names, plus four Vol 2 events that table omits (one WARN,
-// three ERROR; an erratum to Vol 4 section 6.2, phase 3 task P3-04). They live
+// three ERROR; an erratum to Vol 4 section 6.2, phase 3 task P3-04), plus
+// shard_defect (ERROR; phase 3 task P3-13, the same erratum). They live
 // here rather than at the call sites because obs owns the buckets; without a
 // shared vocabulary each Phase 2 call site would invent its own spelling and
 // the suppression counters would fragment into near-duplicates.
@@ -46,6 +47,7 @@ const (
 	ClassBlobLenMismatch  // Vol 2 section 4 step 4 -- a decoder or configuration defect
 	ClassGuardDisabled    // Vol 2 section 5.5 -- the ordering guard switched off for a transcode
 	ClassDrainDeadline    // Vol 2 section 2.6 -- the drain ran out of time with rows unwritten
+	ClassShardDefect      // phase 3 ruling D9 -- a shard construction defect (S1, S2, S3/F27)
 
 	numClasses
 )
@@ -87,6 +89,7 @@ var logClasses = []string{
 	ClassBlobLenMismatch:    "blob_len_mismatch",
 	ClassGuardDisabled:      "guard_disabled",
 	ClassDrainDeadline:      "drain_deadline",
+	ClassShardDefect:        "shard_defect",
 }
 
 func (c Class) String() string {

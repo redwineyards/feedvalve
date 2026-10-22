@@ -2,6 +2,7 @@ package app
 
 import (
 	"database/sql"
+	"hash/maphash"
 	"io"
 	"net"
 	"net/netip"
@@ -13,13 +14,15 @@ import (
 	"feedvalve/internal/decode"
 	"feedvalve/internal/destinations"
 	"feedvalve/internal/framing"
+	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 )
 
-// FatalReason enumerates the five terminal conditions of Vol 4 section 1.2
-// exit code 4, so the shutdown line and the exit path cannot disagree about
-// which one fired.
+// FatalReason enumerates the terminal conditions of Vol 4 section 1.2 exit
+// code 4 -- eight of them, Vol 4's five plus V7, F27 and FatalShardInvariant
+// (phase 3 ruling D9) -- so the shutdown line and the exit path cannot disagree
+// about which one fired.
 //
 // They are an enumeration rather than an error string because the shutdown
 // summary, the exit code and the log line all have to name the same condition,
@@ -50,17 +53,30 @@ const (
 	// here means the drain runs: the shards still owe their dirty rows to the
 	// database, which is exactly what an os.Exit would skip.
 	FatalUDPReadFailure
+	// FatalBatchRowUnreported is F27 -- a writer returned a batch with a row
+	// it never adjudicated (Vol 2 section 2.7, S3). The shard requeued the rows
+	// and keeps running into the drain, so they can still be written on the
+	// way down (phase 3 ruling D9).
+	FatalBatchRowUnreported
+	// FatalShardInvariant is a shard construction defect that is not a panic:
+	// S2 (a row in two batches), cohort_not_empty, or a misrouted or twice
+	// returned batch (step 0a). Not F26, whose runbook is "file a bug with the
+	// stack" and whose observable is panics_recovered{stage=shard} -- neither
+	// holds for a returned error (ruling D9).
+	FatalShardInvariant
 
 	numFatalReasons
 )
 
 var fatalReasonNames = [numFatalReasons]string{
-	FatalQ1Overflow:     "F9-q1-overflow",
-	FatalDBFailFast:     "F13-db-fail-fast",
-	FatalWriterPoolStop: "F20-writer-pool-stop",
-	FatalBatchQSendFail: "F21-batchq-send-failed",
-	FatalShardPanic:     "F26-shard-panic",
-	FatalUDPReadFailure: "V7-udp-read-failure",
+	FatalQ1Overflow:         "F9-q1-overflow",
+	FatalDBFailFast:         "F13-db-fail-fast",
+	FatalWriterPoolStop:     "F20-writer-pool-stop",
+	FatalBatchQSendFail:     "F21-batchq-send-failed",
+	FatalShardPanic:         "F26-shard-panic",
+	FatalUDPReadFailure:     "V7-udp-read-failure",
+	FatalBatchRowUnreported: "F27-batch-row-unreported",
+	FatalShardInvariant:     "shard-invariant",
 }
 
 func (r FatalReason) String() string {
@@ -157,6 +173,46 @@ type Graph struct {
 	// drained and closed, so teardown can join them rather than assume.
 	shardDrainDone        []chan struct{}
 	shardConsumersStarted bool
+
+	// The mirror (Vol 2), allocated by Build at startup step 12 and run by
+	// startShards. shards[k] is the sole consumer of shardCh[k].
+	//
+	// batchQ is Q2, shared by every shard, capacity shards x
+	// maxInFlightPerShard, so a shard's non-blocking send can never find it
+	// full (Vol 2 section 7.4). completionCh[k] is Q2c, capacity
+	// maxInFlightPerShard -- LOAD BEARING (V2 section 2.6, gate G-LIFE-4): a
+	// shard returning at the drain deadline with all m batches out leaves room
+	// for every one of them, so no writer blocks on a shard that stopped
+	// reading. tickCh[k] is cap 1, fed by the flush ticker with a non-blocking
+	// send. Nothing consumes batchQ until Phase 4 (ruling D10), and nothing
+	// closes it until then either.
+	shards       []*mirror.Shard
+	batchQ       chan *model.Batch
+	completionCh []chan *model.Batch
+	tickCh       []chan struct{}
+	bus          *mirror.FlushBus
+
+	// guards is the per-transcode guard state every shard shares (ruling D2),
+	// and guardSnap the evaluator's own state, touched only by the stats
+	// goroutine under emitMu. guardEvalEvery is ordering.guardEvalIntervalSec,
+	// derived here so a test can shorten it below the configuration's 1 s
+	// floor before Run without a new key.
+	guards         *mirror.GuardTable
+	guardSnap      *mirror.GuardSnapshot
+	guardEvalEvery time.Duration
+
+	// drainExpired is the ONE shared drain deadline (Vol 4 section 1.5 step 7,
+	// ruling D4), closed by drainTimer flush.drainTimeoutMs after t_shutdown.
+	// Armed once (drainArm), stopped if every shard is quiescent first.
+	drainExpired chan struct{}
+	drainArm     sync.Once
+	drainTimer   *time.Timer
+
+	// The flush ticker: one time.Ticker at flush.windowMs, a non-blocking send
+	// per tickCh[k].
+	tickerStarted bool
+	tickerStop    chan struct{}
+	tickerDone    chan struct{}
 
 	// conn is the UDP listener, bound by Run as the LAST resource.
 	//
@@ -256,12 +312,12 @@ type Graph struct {
 // section 1.4 step 10 (immutable derived state) and step 12 (pre-allocation).
 //
 // It deliberately starts NO goroutine and binds NO socket. The sketch in
-// section 1.7 has Build starting the writer and shard goroutines, which do not
-// exist until Phase 3; keeping Build allocation-only means a failure between
-// Build and Run has nothing running to stop, which is what makes the unwind in
-// gate G-LIFE-3 simple enough to be obviously correct. When Phase 3 adds those
-// pools the same argument will apply to them: start them in Run, where the
-// teardown that must stop them also lives.
+// section 1.7 has Build starting the writer and shard goroutines; keeping Build
+// allocation-only means a failure between Build and Run has nothing running to
+// stop, which is what makes the unwind in gate G-LIFE-3 simple enough to be
+// obviously correct. So Build allocates the shards and Run starts them, where
+// the teardown that must stop them also lives -- and Phase 4's writers the
+// same way.
 //
 // Step 11 -- OpenDB and its deferred Close -- happens in run before this,
 // because the one-shot -dbcheck mode needs the connection without a graph.
@@ -278,12 +334,15 @@ func Build(d Deps) (*Graph, error) {
 	}
 
 	g := &Graph{
-		deps:        d,
-		fatal:       make(chan fatalEvent, 1),
-		readerDone:  make(chan struct{}),
-		decoderDone: make(chan struct{}),
-		statsDone:   make(chan struct{}),
-		statsStop:   make(chan struct{}),
+		deps:         d,
+		fatal:        make(chan fatalEvent, 1),
+		readerDone:   make(chan struct{}),
+		decoderDone:  make(chan struct{}),
+		statsDone:    make(chan struct{}),
+		statsStop:    make(chan struct{}),
+		tickerStop:   make(chan struct{}),
+		tickerDone:   make(chan struct{}),
+		drainExpired: make(chan struct{}),
 	}
 
 	// Step 10: the immutable derived state. The destination table, the ColMask
@@ -331,9 +390,20 @@ func Build(d Deps) (*Graph, error) {
 	cnt.setRegistry(reg)
 	g.deps = d
 
+	// The ordering guard's per-transcode table, zipped HERE from the handles
+	// resolved before Freeze and the registry's codes -- the same configured
+	// positions the assertion above just checked agree (ruling D2).
+	mt := &g.deps.Inst.mirrorTranscode
+	g.guards = mirror.NewGuardTable(reg.Codes(), mt.GuardOffered, mt.GuardSuperseded)
+	g.guardSnap = mirror.NewGuardSnapshot(g.guards, mt.GuardDisabled)
+
 	// Published BEFORE any goroutine exists, which is what makes the decoder's
 	// load unconditional rather than a nil check it has to repeat (ADR-L11).
-	g.setRuntime(&Runtime{Cfg: d.Cfg, Reg: reg, Dests: d.Dests})
+	// The mirror's reloadable parameters travel in the same snapshot (ruling
+	// D1): one pointer, so no reader sees a new Config beside old Params.
+	params := mirrorParams(d.Cfg)
+	g.guardEvalEvery = params.GuardEvalInterval
+	g.setRuntime(&Runtime{Cfg: d.Cfg, Reg: reg, Dests: d.Dests, Mirror: params})
 	g.mark(&g.acquired, "derived-state")
 
 	// Step 12: pre-allocation, BEFORE any socket exists. A
@@ -341,9 +411,8 @@ func Build(d Deps) (*Graph, error) {
 	// stall budget on packet one at market open, and an out-of-memory
 	// condition must be a startup failure rather than a 10:00:00 failure.
 	//
-	// QD is the part of step 12 that exists today: one allocation of
-	// capacity x 1040 bytes, pointer-free. The arenas, the shard indexes and
-	// the batch free lists arrive with Phase 3.
+	// QD first: one allocation of capacity x 1040 bytes, pointer-free. Q1
+	// and the shards -- arenas, indexes, rings, batch free lists -- follow.
 	p, c, err := framing.NewRing(d.Cfg.Runtime.DatagramQueueCapacity)
 	if err != nil {
 		return nil, exitf(ExitStartup, "allocating the datagram ring at capacity %d: %w",
@@ -364,6 +433,11 @@ func Build(d Deps) (*Graph, error) {
 	// check here that would duplicate one the configuration cannot get past.
 	g.allocShardQueues(d.Cfg.Runtime.Shards, d.Cfg.Runtime.ShardQueueCapacity)
 	g.mark(&g.acquired, "shard-channels")
+
+	// The rest of step 12: the shards themselves -- arenas, indexes, rings and
+	// batches -- with their channels and the one seed (Vol 2 section 1.3).
+	g.buildShards(mirrorSizing(d.Cfg, maphash.MakeSeed()))
+	g.mark(&g.acquired, "shards")
 
 	return g, nil
 }

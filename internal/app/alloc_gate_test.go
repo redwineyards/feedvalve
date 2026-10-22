@@ -125,12 +125,34 @@ func newAllocGateFixture(t *testing.T, tune func(*config.Config)) *allocGateFixt
 	// Q1 DRAINED, unlike newSubPacketFixture's deliberately unconsumed queues:
 	// this runs the fan-out thousands of times, so an undrained 4,096-slot
 	// channel would fill and turn the gate into a stall-budget test.
-	g.startShardConsumers()
+	g.startDiscardConsumers()
 	t.Cleanup(g.stopShardConsumers)
 
 	rcv := newReceiver(g)
 	rcv.rt = g.loadRuntime()
 	return &allocGateFixture{r: rcv, g: g, buf: buf, in: &g.deps.Inst}
+}
+
+// startDiscardConsumers drains Q1 with one goroutine per shard that receives
+// and discards -- Phase 2's throwaway consumer, now test infrastructure
+// (phase2-tasks.md: "the throwaway consumer is test infrastructure").
+//
+// Not the real shards, deliberately: testing.AllocsPerRun counts every
+// goroutine's allocations, so a live shard's index inserts and arena growth on
+// fresh tokens would be charged to the receive path this gate measures. Each
+// closes shardDrainDone[k] exactly as a shard does, so stopShardConsumers
+// joins either kind.
+func (g *Graph) startDiscardConsumers() {
+	g.shardConsumersStarted = true
+	g.mark(&g.acquired, "shard-consumers")
+	for k := range g.shardCh {
+		ch, done := g.shardCh[k], g.shardDrainDone[k]
+		go func() {
+			defer close(done)
+			for range ch {
+			}
+		}()
+	}
 }
 
 // Absolute offsets inside a 7208 payload, transcribed from bible Part V rather
