@@ -16,7 +16,10 @@
 #   1. -selfcheck     needs no password, no network, no database. If this
 #                     fails, nothing below is worth running.
 #   2. test binaries  the layout constants and the timezone, AT RUNTIME on
-#                     big-endian ppc64 (G-AIX-1 assertions 3 and 4).
+#                     big-endian ppc64 (G-AIX-1 assertions 3 and 4), and the
+#                     mirror's ownership assertions (mirror-assert.test,
+#                     G-ASSERT-1). Then G-AIX-1 assertion 2 on its own: the
+#                     digest's allocations and MB/s, recorded for OQ-L3.
 #   3. -dbcheck       proves the credential, the listener and the service name
 #                     FROM THIS HOST -- before step 4 can blame the binary for
 #                     a database that was never reachable.
@@ -74,8 +77,10 @@ found_tests=0
 for t in ./*.test; do
 	[ -f "$t" ] || continue
 	found_tests=1
-	run "$t -test.short"
-	if "$t" -test.short; then
+	# G-AIX-1 assertion 2 is skipped here and run on its own below, so an
+	# OQ-L3 failure is reported once, as itself, and not also as a layout one.
+	run "$t -test.short -test.skip ^TestG_AIX_1_2_"
+	if "$t" -test.short -test.skip '^TestG_AIX_1_2_'; then
 		pass "$(basename "$t")"
 	else
 		fail "$(basename "$t") -- a layout or runtime assertion failed ON THE TARGET, which is the case no amd64 run can make"
@@ -83,6 +88,30 @@ for t in ./*.test; do
 done
 if [ "$found_tests" -eq 0 ]; then
 	skip "no *.test binaries beside this script -- run scripts/build-aix.sh"
+fi
+
+say ""
+say "G-AIX-1 assertion 2 (OQ-L3): the mirror's digest (hash/maphash) over a"
+say "181-byte row image must allocate nothing and run at >= 200 MB/s on THIS"
+say "machine. It is skipped in the loop above and run here on its own, so its"
+say "figures are printed for the record and a failure is reported once, as"
+say "itself. A FAIL here triggers the FNV-1a fallback (ADR-L02) -- record it."
+if [ -f ./mirror.test ]; then
+	run "./mirror.test -test.run ^TestG_AIX_1_2_ -test.v"
+	OUT2=$(./mirror.test -test.run '^TestG_AIX_1_2_' -test.v 2>&1)
+	rc=$?
+	printf '%s\n' "$OUT2" | sed 's/^/    /'
+	if [ "$rc" -eq 0 ] && printf '%s\n' "$OUT2" | grep -q -- '--- PASS: TestG_AIX_1_2_'; then
+		pass "digest: 0 allocs/op and >= 200 MB/s (OQ-L3 closed -- record the figures above)"
+	else
+		fail "digest on the target -- OQ-L3: switch the digest to FNV-1a (ADR-L02) and record the figures above"
+	fi
+else
+	skip "no mirror.test beside this script, so G-AIX-1 assertion 2 cannot run"
+fi
+
+if [ ! -f ./mirror-assert.test ]; then
+	skip "no mirror-assert.test beside this script, so G-ASSERT-1's shard half did not run on the target"
 fi
 
 # --- 3 -----------------------------------------------------------------------

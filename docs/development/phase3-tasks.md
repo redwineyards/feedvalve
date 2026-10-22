@@ -954,6 +954,7 @@ gates; D8's ordering and V0-Δ1 are both one-line mistakes no other gate catches
 | 6 | Four Vol 2 log events have no class in V4 §6.2 (`04:1356-1357`) | Classes added in P3-04; erratum to V4 §6.2 |
 | 7 | `NotNull` is advisory (V0 §5A.2): "check it, warn on it" — but at merge the mirror cannot tell an insert from an update | Not checked in Phase 3; revisit with Phase 4's catalogue check (V0 §7.6) |
 | 8 | `policy` is still empty | Not Phase 3's; Vol 2 consumes only `FlagNonRateLimited` |
+| 9 | **Receipt-clock ties (P3-14 review).** V2:1273-1276 and B-V1b rest step 8's `>` on "equality is unreachable in practice". It is not on windows/amd64: `time.Since(processStart)` moves only once per timer tick there, so two datagrams read in one tick share a `RecvMono`, and the second datagram's contribution to a row the first touched is superseded as a re-delivery and **discarded** — the G-ORD-1 failure mode. G-RACE-3's 60 s dev-host run counted 10,373 such ties (13–32% of records, depending on run length and tick rate). The target's `CLOCK_MONOTONIC` is presumed fine-grained, but unmeasured | **Open.** Owner: the receiver's step 4 (`internal/app/lifecycle.go:248-250`), as a follow-up card — not P3-14, which is a test card and does not change the receive path. Candidate fix: a strictly increasing stamp, `RecvMono = max(now, last+1)`, which keeps B-V1b's "monotonic, from `processStart`" and makes V2's premise true by construction. Until then G-RACE-3 asserts `units_superseded_out_of_order` equals its own tie count (0, as V4:1623 specifies, wherever the clock produced none) and logs a `CAVEAT (seam 9)` line naming the count whenever it did not. Erratum to V2 §5.3 (V2:1273-1276) and B-V1b (V2:81) |
 
 **Not Phase 3's scope:** G-LIFE-4 and G-DRAIN-1/2 end to end, G-UNT-1 (Phase 4);
 `clock_step_detected`, `Logger.SetLevel`, G-CFG-4 (Phase 5).
@@ -1009,6 +1010,9 @@ Applied to the LLD in one doc commit at the end of the phase:
   released[d]`, matching V0-Delta-1's `−= 1` (V2:2160). Released rows go to the tail in quarantine
   order (P3-10).
 - **V2 §10.3** — rings 6.3 MB, not 4.8 MB.
+- **V2 §5.3 (V2:1273-1276) / B-V1b (V2:81)** — "equality is unreachable in practice" is a property
+  of the clock, not of `time.Since`: on a timer-tick monotonic clock (windows/amd64) it is reached
+  routinely and discards distinct datagrams' contributions (seam 9, open).
 - **V4:168** — exit-4 list: add V7, F27, `FatalShardInvariant`. The same count recurs at V4:255
   (step 2's `reason=` list) and V4:1358 ("the five terminal conditions").
 - **V4 §5 catalogue** (V4:1063-1064) — a row for `FatalShardInvariant`.

@@ -70,6 +70,14 @@ for pkg in model wire lzo decode policy mirror writer health obs framing destina
 	fi
 done
 
+# G-ASSERT-1 on the target (Vol 4 section 7.6). -race does not exist for
+# aix/ppc64, so the shard's ownership check -- a TryLock around each loop pass,
+# compiled in only under -tags feedvalve_assert -- is "the only concurrency
+# check available at all" there. The mirror binary therefore ships twice: the
+# production build above and this one. lpar-smoke.sh runs every *.test.
+go test -c -tags feedvalve_assert -o "$OUT/mirror-assert.test" ./internal/mirror
+echo "  mirror-assert.test (-tags feedvalve_assert, G-ASSERT-1)"
+
 # The golden dependency list. Vol 4 section 8.2 asks for it committed so that
 # "the dependency set cannot change without somebody noticing" -- the
 # golden-list form of G-DEP-1, and the thing that catches a new dependency that
