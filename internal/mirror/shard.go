@@ -83,9 +83,9 @@ type Shard struct {
 
 	// guard is ordering.guard as last loaded from params, so the merge reads a
 	// field rather than loading the published Params per unit. Set at
-	// construction only, today; it MUST be refreshed wherever Params is
-	// loaded -- P3-08's epoch open (step 7) and P3-11's tick (ruling D3) --
-	// or a reload of ordering.guard never reaches the merge.
+	// construction and refreshed at epoch open (section 6.3 step 7); it MUST
+	// be refreshed wherever else Params is loaded -- P3-11's tick (ruling D3)
+	// -- or a reload of ordering.guard never reaches the merge.
 	guard GuardMode
 
 	chunkRows int32 // Sizing.ArenaChunkRows
