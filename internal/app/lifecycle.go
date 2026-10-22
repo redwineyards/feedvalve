@@ -204,6 +204,7 @@ func (g *Graph) startReader(ctx context.Context) {
 		conn := g.getConn()
 		cfg := g.deps.Cfg
 		in := g.inst()
+		var lastRecv int64 // the previous datagram's RecvMono; see nextRecvMono
 
 		for {
 			// Step 2. The only blocking call in the loop that is not bounded
@@ -247,7 +248,8 @@ func (g *Graph) startReader(ctx context.Context) {
 			// are monotonic, because t0 carries time.Now's monotonic reading
 			// and Sub uses it. Never a wall-clock difference.
 			t0 := time.Now()
-			d.RecvMono = int64(t0.Sub(processStart))
+			d.RecvMono = nextRecvMono(int64(t0.Sub(processStart)), lastRecv)
+			lastRecv = d.RecvMono
 
 			// Step 5.
 			in.datagramsReceived.Add(1)

@@ -258,11 +258,9 @@ func (w *stressWriter) record(b *model.Batch) {
 //
 // ASSERTION, over the accumulated state once Run has returned:
 //   - G-ORD-1: every row holds the last value the decoder saw for it, and
-//     nothing was superseded (V4:1623). Where the host's receipt clock ties
-//     -- phase3-tasks seam 9, open -- the superseded count must equal the
-//     ties counted here, and the run logs a CAVEAT naming them: a tie is a
-//     distinct datagram discarded as a re-delivery, which is the defect the
-//     seam records, not a pass;
+//     nothing was superseded (V4:1623), and the receipt clock never tied --
+//     a tie would discard a distinct datagram as a re-delivery, which
+//     nextRecvMono rules out (phase3-tasks seam 9, closed);
 //   - G-MASK-1: every non-quarantined row's database image equals its mirror
 //     image over every column ever written -- no column re-dirtied in flight
 //     was lost -- and its ColMask is 0;
@@ -438,15 +436,13 @@ func TestG_RACE_3_TheSchedulerStressHarness(t *testing.T) {
 	if n := abandoned(g); n != 0 {
 		t.Errorf("drain_abandoned_rows = %d, want 0 with working writers\n%s", n, buf.String())
 	}
-	if n := in.mirrorShards[0].UnitsSupersededOutOfOrder.Load(); n != ties {
-		t.Errorf("G-ORD-1: units_superseded_out_of_order = %d, want %d (0, plus any receipt-clock "+
-			"ties): a unit was judged out of order on a feed whose order is its arrival", n, ties)
+	if n := in.mirrorShards[0].UnitsSupersededOutOfOrder.Load(); n != 0 {
+		t.Errorf("G-ORD-1: units_superseded_out_of_order = %d, want 0: a unit was judged out of "+
+			"order on a feed whose order is its arrival", n)
 	}
 	if ties != 0 {
-		t.Logf("CAVEAT (phase3-tasks seam 9, open): the receipt clock tied %d times on this host, "+
-			"and each tie discarded a distinct datagram's contribution as a re-delivery. V4:1623's "+
-			"\"none superseded\" holds here only net of those; V2:1273-1276's \"equality is "+
-			"unreachable\" does not hold on this clock", ties)
+		t.Errorf("seam 9 regressed: the receipt clock tied %d times; nextRecvMono must make RecvMono "+
+			"strictly increasing, or each tie discards a distinct datagram as a re-delivery", ties)
 	}
 	if w.reoffered != 0 {
 		t.Errorf("G-ROW-1: a row whose last verdict was Rejected was offered to a writer again %d "+
