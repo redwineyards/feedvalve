@@ -385,8 +385,7 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 	// V-T1 and V-T6, evaluated rather than deferred. BuildRegistry is the only
 	// place the catalogue and the resolved ColSpecs both exist, so this is
 	// where "every configured transcode has a decoder" and "every ColSpec
-	// width matches its mask" are answered -- the two rules
-	// config.Unchecked() listed from P1-06 until P2-05.
+	// width matches its mask" are answered.
 	// NopCounters: -selfcheck builds the registry to VALIDATE it and never
 	// decodes a message, so there is nothing to count and no instrument
 	// registry resolved at this point.
@@ -398,13 +397,7 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 		"to a decoder (V-T1) and every ColSpec width matches its mask (V-T6)\n",
 		reg.Len(), reg.Codes())
 
-	// Stated rather than implied, so nobody reads a pass as more than it
-	// is. The list comes from the validator itself rather than from a
-	// string here, so it shrinks automatically as rules become checkable --
-	// and as of P2-05 it is empty, which is why nothing is printed from it.
-	for rule, why := range config.Unchecked() {
-		fmt.Fprintf(out, "selfcheck: NOT checked -- %s: %s\n", rule, why)
-	}
+	// Stated rather than implied, so nobody reads a pass as more than it is.
 	fmt.Fprintln(out, "selfcheck: NOT checked -- V-X7: db.connMaxLifetimeMinutes against the "+
 		"Oracle profile's IDLE_TIME. Un-checkable from here by nature; the observable "+
 		"is a recurring ORA-03113 on first reuse of a session the server already closed")

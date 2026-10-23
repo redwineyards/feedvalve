@@ -383,8 +383,7 @@ func Build(d Deps) (*Graph, error) {
 
 	// The decoder registry: level 2 of Vol 1 section 8.1, resolved against the
 	// catalogue and the destination table. This is where rules V-T1 and V-T6
-	// are evaluated -- the two config.Unchecked() named as needing the
-	// registry since P1-06 -- so a configuration naming a transcode this build
+	// are evaluated, so a configuration naming a transcode this build
 	// cannot decode fails HERE, at startup, rather than by storing nothing for
 	// it in production.
 	// The decoders' counter sink, constructed BEFORE the registry because

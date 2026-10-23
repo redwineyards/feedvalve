@@ -541,8 +541,7 @@ func parseClass(s string) model.Class {
 // The identifiers are declared once, in config/problem.go, and decode does not
 // know them -- it reports KINDS. This table is the join, and it is in app for
 // the same reason the projection above is: app is where both vocabularies are
-// legal. V-T1 and V-T6 are the two rules config.Unchecked() listed as
-// un-evaluable from P1-06 until this task.
+// legal.
 var registryProblemRules = map[decode.ProblemKind]string{
 	decode.ProblemNoDecoder:          config.RuleDecoderExists, // V-T1
 	decode.ProblemColSpecWidth:       config.RuleColSpecWidth,  // V-T6

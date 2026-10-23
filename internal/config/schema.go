@@ -34,11 +34,10 @@ const (
 // configuration and field map, nil except on reload.
 //
 // Two rules of Vol 4 section 2.2 are NOT here and cannot be, because they
-// need the decoder registry, which arrives in Phase 2: V-T1 (every configured
-// transcode resolves to a registered decoder) and V-T6 (each ColSpec.Width
-// equals the sum of its mask's declared widths). Unchecked returns their
-// identifiers so a caller can say what it has not verified rather than imply
-// a clean bill of health.
+// need the decoder registry: V-T1 (every configured transcode resolves to a
+// registered decoder) and V-T6 (each ColSpec.Width equals the sum of its mask's
+// declared widths). decode.BuildRegistry evaluates both and reports them in this
+// package's V- identifiers.
 func ValidateAll(c *Config, dests, prevDests *destinations.Set, prev *Config, mode Mode) error {
 	var p problems
 	validateInto(&p, c, prev)
@@ -61,25 +60,6 @@ func ValidateAll(c *Config, dests, prevDests *destinations.Set, prev *Config, mo
 	}
 
 	return p.err()
-}
-
-// Unchecked lists the rule identifiers ValidateAll cannot evaluate, with the
-// reason. A pass should never be read as more than it is.
-//
-// EMPTY since P2-05. V-T1 and V-T6 were the two entries, and both are now
-// evaluated -- by decode.BuildRegistry, which is where the catalogue and the
-// resolved ColSpecs exist. They report through this package's own taxonomy
-// (config.Problem, config.ValidationError, the same V- identifiers), so
-// -selfcheck prints them exactly as it prints every other rule and nothing had
-// to learn a second error vocabulary.
-//
-// Kept rather than deleted, and the empty map is the point: the function is the
-// contract that a caller may ask "what did you NOT check?", and the answer
-// being "nothing" is worth stating explicitly. A future rule that cannot be
-// evaluated at load time belongs here on the day it is written, not in a
-// comment.
-func Unchecked() map[string]string {
-	return map[string]string{}
 }
 
 // validateDestsStartupOnly is V-R2: the destination set is startup-only in its

@@ -440,41 +440,6 @@ func TestNoPasswordKeyIsV_DB3(t *testing.T) {
 	}
 }
 
-// TestUncheckedIsHonest: the rules that cannot run must be reported by the
-// validator itself, not by a hand-written string somewhere, so the list shrinks
-// automatically as they become checkable.
-//
-// It is now EMPTY, and that is the assertion. V-T1 and V-T6 were the two
-// entries from P1-06 until P2-05, which gave them somewhere to be evaluated:
-// decode.BuildRegistry, where the catalogue and the resolved ColSpecs exist.
-// The list shrank by itself, which is what the original design intended -- so
-// this test inverted rather than being deleted.
-func TestUncheckedIsHonest(t *testing.T) {
-	u := Unchecked()
-	for _, gone := range []string{RuleDecoderExists, RuleColSpecWidth} {
-		if why, ok := u[gone]; ok {
-			t.Errorf("%s is still listed as un-evaluable (%q), but decode.BuildRegistry "+
-				"evaluates it since P2-05", gone, why)
-		}
-	}
-	if len(u) != 0 {
-		t.Errorf("Unchecked() lists %d rules; every rule is evaluated somewhere as of P2-05, so "+
-			"a new entry needs its reason read: %v", len(u), u)
-	}
-	for rule, why := range u {
-		if why == "" {
-			t.Errorf("%s is listed as unchecked with no reason", rule)
-		}
-	}
-
-	// And a rule that IS implemented must not still be listed.
-	for _, implemented := range []string{RuleRowKeyDerivable, RuleContribColumn, RuleBlobFits} {
-		if _, ok := u[implemented]; ok {
-			t.Errorf("%s is implemented but still listed as unchecked", implemented)
-		}
-	}
-}
-
 func TestValidationErrorReportsEveryRule(t *testing.T) {
 	c := valid()
 	c.UDP.StallBudgetMs = 500
