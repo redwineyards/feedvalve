@@ -198,7 +198,6 @@ var ledger = [numInstruments]row{
 	// ---- Datagram ring and pre-validation (section 8.2a) ----
 	IDQDDepthMax:                      {"qd_depth_max", shapeMax, "datagrams", GroupQueues, "receiver", dimNone},
 	IDQDSendBlocked:                   {"qd_send_blocked", shapeCounter, "publishes", GroupStall, "receiver", dimNone},
-	IDQDWakeParked:                    {"qd_wake_parked", shapeCounter, "parks", GroupQueues, "decoder", dimNone},
 	IDDecoderLoopMaxNs:                {"decoder_loop_max_ns", shapeMax, "ns", GroupStall, "decoder", dimNone},
 	IDPrevalidateRejected:             {"prevalidate_rejected", shapeCounter, "values", GroupSchemaFit, "shard", dimDestReason},
 	IDPrevalidateRejectedTranscode:    {"prevalidate_rejected_transcode", shapeCounter, "values", GroupSchemaFit, "shard", dimTranscode},
@@ -267,8 +266,14 @@ const multiNameRows = 3
 // duplicatedNames is decompress_failed, which appears in both tables.
 const duplicatedNames = 1
 
+// withdrawnRows are section 8.2a rows the code no longer carries because the
+// mechanism they measured is gone: qd_wake_parked counted the lock-free QD
+// ring's consumer parks, and QD is now a buffered channel with no park of its
+// own (framing/qd.go).
+const withdrawnRows = 1
+
 // The arithmetic that reconciles the two counts, pinned so neither can be
 // edited without the other being reconsidered: 129 rows + 3 extra names - 1
-// duplicate = 131 instruments.
-const _ = uint(ledgerRows+multiNameRows-duplicatedNames-numInstruments) +
-	uint(numInstruments-(ledgerRows+multiNameRows-duplicatedNames))
+// duplicate - 1 withdrawn = 130 instruments.
+const _ = uint(ledgerRows+multiNameRows-duplicatedNames-withdrawnRows-numInstruments) +
+	uint(numInstruments-(ledgerRows+multiNameRows-duplicatedNames-withdrawnRows))

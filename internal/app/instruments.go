@@ -41,9 +41,6 @@ type instruments struct {
 	udpReadErrors          *obs.Counter
 	lastDatagramMonoNs     *obs.Gauge
 
-	// decoder-owned, likewise
-	qdWakeParked *obs.Counter
-
 	// The fan-out's two (P2-08). The ledger assigns both to the receiver, which
 	// in this topology is the decoder goroutine -- the same reconciliation
 	// loadRuntime records, and for the same reason: the contract draws read,
@@ -265,8 +262,6 @@ func resolveStaticInstruments(reg *obs.Reg) instruments {
 		qdDepthMax:             reg.Max(obs.IDQDDepthMax),
 		udpReadErrors:          reg.Counter(obs.IDUDPReadErrors),
 		lastDatagramMonoNs:     reg.Gauge(obs.IDLastDatagramMonoNs),
-
-		qdWakeParked: reg.Counter(obs.IDQDWakeParked),
 
 		clockStepDetected:    reg.Counter(obs.IDClockStepDetected),
 		batchqDepth:          reg.Gauge(obs.IDBatchqDepth),

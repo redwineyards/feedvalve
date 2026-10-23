@@ -16,7 +16,7 @@ package obs
 // positional correspondence to maintain by hand.
 type ID uint16
 
-// The 131 instruments of Vol 0 section 8.2 and section 8.2a, in ledger order.
+// The 130 instruments of Vol 0 section 8.2 and section 8.2a, in ledger order.
 //
 // 131, not the 129 the task card and section 2 of the task breakdown say. Both
 // numbers are right about different things: section 8.2 and section 8.2a hold
@@ -25,7 +25,8 @@ type ID uint16
 // writes_succeeded / writes_failed -- giving 132 names, of which
 // decompress_failed appears in both tables. Section 8.2a's preamble says it
 // supersedes the sibling volumes' addition sections, so its {reason}-labelled
-// form wins and those two rows are ONE instrument. 129 rows, 131 instruments.
+// form wins and those two rows are ONE instrument. 129 rows, 131 instruments,
+// less qd_wake_parked, withdrawn with the QD ring it measured: 130.
 const (
 	// Ingress -- section 8.2.
 	IDDatagramsReceived ID = iota
@@ -143,7 +144,6 @@ const (
 	// Datagram ring and pre-validation -- section 8.2a, new in that merge.
 	IDQDDepthMax
 	IDQDSendBlocked
-	IDQDWakeParked
 	IDDecoderLoopMaxNs
 	IDPrevalidateRejected
 	IDPrevalidateRejectedTranscode

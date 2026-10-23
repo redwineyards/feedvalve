@@ -231,26 +231,6 @@ var mutations = []mutation{
 			"only a modulo for a power of two. A non-power-of-two biases every probe " +
 			"toward the low slots and silently loses codes to the overflow bucket.",
 	},
-	{
-		gate: "Vol 0 section 9.5.3", name: "qd-cache-line-separation",
-		pkg: "./internal/framing", file: "internal/framing/ring.go",
-		from: "const cacheLine = 128", to: "const cacheLine = 64",
-		wantErr: "overflows",
-		why: "head and tail must sit one ppc64 cache line apart, and the line is 128 " +
-			"bytes there, not 64. Unpadded, the producer and consumer write the same " +
-			"line on every operation and false sharing costs more than the lock the " +
-			"structure exists to avoid -- with no correctness symptom and no profiler " +
-			"on the target to find it.",
-	},
-	{
-		gate: "Vol 0 section 9.5.4", name: "spin-bound-ceiling",
-		pkg: "./internal/framing", file: "internal/framing/consume.go",
-		from: "const spinBeforePark = 64", to: "const spinBeforePark = 4096",
-		wantErr: "overflows",
-		why: "A spin an order of magnitude longer is a different design -- it starts " +
-			"burning the entitled capacity that section 9.5.4 rejects busy-waiting " +
-			"over -- and should fail the build rather than be reviewed.",
-	},
 }
 
 // TestEveryBuildTimeGateCanBeSeenToFail is the harness.

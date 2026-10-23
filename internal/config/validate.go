@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"math/bits"
 	"slices"
 	"strconv"
 	"strings"
@@ -185,15 +184,6 @@ func validateUDP(c *Config, p *problems) {
 
 func validateRuntime(c *Config, p *problems) {
 	r := &c.Runtime
-
-	// The QD ring wraps by masking, so a non-power-of-two does not merely
-	// waste space -- it silently corrupts the index and the ring starts
-	// returning the wrong datagram.
-	if r.DatagramQueueCapacity > 0 && bits.OnesCount(uint(r.DatagramQueueCapacity)) != 1 {
-		p.add(RuleRange, "runtime.datagramQueueCapacity is %d, which is not a power of two. "+
-			"The datagram ring wraps by masking; a non-power-of-two silently corrupts "+
-			"the index rather than failing", r.DatagramQueueCapacity)
-	}
 
 	// V-X4. An out-of-range designated shard routes every general unit into
 	// a shard that does not exist.

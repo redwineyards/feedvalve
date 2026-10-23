@@ -300,7 +300,7 @@ func (g *Graph) startReader(ctx context.Context) {
 				}
 			}
 
-			// Step 8. Truncation is a second-order consequence of the ring's
+			// Step 8. Truncation is a second-order consequence of QD's
 			// fixed slot, not the oversize policy, which is why it is silent
 			// now that the line above is not.
 			if n > len(d.Buf) {
@@ -327,7 +327,7 @@ func (g *Graph) startReader(ctx context.Context) {
 				switch {
 				case err == nil:
 				case errors.Is(err, framing.ErrClosed):
-					// The ring was closed under us, which only teardown does.
+					// QD was closed under us, which only teardown does.
 					// Shutting down, not a failure.
 					return
 				default:
@@ -338,7 +338,7 @@ func (g *Graph) startReader(ctx context.Context) {
 					// says so for QD in those words), and RETURNED so Run's
 					// defers get to run.
 					g.deps.Log.Errorf(obsClassStartup,
-						"QD enqueue budget expired after %s with the ring full (%d/%d) -- "+
+						"QD enqueue budget expired after %s with QD full (%d/%d) -- "+
 							"the decoder is not draining; nothing is discarded, the process "+
 							"stops", cfg.StallBudget(), g.qdProducer.Len(),
 						cfg.Runtime.DatagramQueueCapacity)
@@ -486,13 +486,6 @@ func (g *Graph) sampleGauges() {
 	// Resize), so a reload that changes writers.count is not overwritten by the
 	// startup value.
 	in.batchqDepth.Store(int64(len(g.batchQ)))
-	// The ring's own counters are plain numbers, not instruments: the ledger
-	// assigns qd_wake_parked to the decoder, so the decoder's handle reports
-	// it rather than the ring writing it directly.
-	if parks := g.qdConsumer.Parks(); parks > g.lastParks {
-		in.qdWakeParked.Add(parks - g.lastParks)
-		g.lastParks = parks
-	}
 }
 
 // wait blocks until a requested shutdown or a terminal condition. One entry
@@ -601,11 +594,11 @@ func (g *Graph) teardown() {
 		// The QD drain stage, between "stop reading" and "stop decoding"
 		// (section 9.5.7). QD must be DRAINED, not abandoned, or the no-loss
 		// property has a hole at shutdown precisely where it is easiest to
-		// overlook -- so Close marks the ring and the decoder keeps delivering
+		// overlook -- so Close closes QD and the decoder keeps delivering
 		// until it is empty.
 		if g.qdProducer != nil {
 			g.qdProducer.Close()
-			g.mark(&g.released, "qd-ring")
+			g.mark(&g.released, "qd")
 		}
 		if g.decoderStarted {
 			<-g.decoderDone

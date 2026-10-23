@@ -130,7 +130,7 @@ func TestG_LIFE_1_TheSocketIsBoundLast(t *testing.T) {
 	if listener < 0 {
 		t.Fatalf("the listener was never acquired: %v", got)
 	}
-	for _, earlier := range []string{"derived-state", "qd-ring", "shard-channels", "shards",
+	for _, earlier := range []string{"derived-state", "qd", "shard-channels", "shards",
 		"shard-consumers", "decoder", "flush-ticker", "stats-goroutine"} {
 		at := idx(earlier)
 		if at < 0 {
@@ -172,7 +172,7 @@ func TestEveryAcquiredResourceIsReleased(t *testing.T) {
 	}
 
 	released := g.Released()
-	for _, want := range []string{"udp-listener", "qd-ring", "decoder",
+	for _, want := range []string{"udp-listener", "qd", "decoder",
 		"shard-channels", "shard-consumers", "flush-ticker", "stats-goroutine"} {
 		if !slices.Contains(released, want) {
 			t.Errorf("%q was acquired but never released (released: %v)", want, released)
@@ -184,7 +184,7 @@ func TestEveryAcquiredResourceIsReleased(t *testing.T) {
 	// drain it; then the decoder itself; and only then Q1, whose sole producer
 	// the decoder is.
 	li, qi, di := slices.Index(released, "udp-listener"),
-		slices.Index(released, "qd-ring"), slices.Index(released, "decoder")
+		slices.Index(released, "qd"), slices.Index(released, "decoder")
 	si := slices.Index(released, "shard-channels")
 	if !(li < qi && qi < di) {
 		t.Errorf("the drain released resources in the wrong order: %v.\n"+
@@ -439,11 +439,10 @@ func TestFatalIsOneShotAndTheFirstReasonWins(t *testing.T) {
 // construction unwinds the partially-built graph without panicking".
 func TestBuildRejectsABadCapacityWithoutPanicking(t *testing.T) {
 	cfg := config.Defaults()
-	// Not a power of two. config's own V-RANGE rule rejects this before the
-	// relay ever runs; Build refuses it too, because the ring is constructible
-	// without config and a masked index on a non-power-of-two silently returns
-	// the wrong datagram.
-	cfg.Runtime.DatagramQueueCapacity = 5000
+	// No room at all. config's own V-RANGE rule rejects this before the relay
+	// ever runs; Build refuses it too, because QD is constructible without
+	// config.
+	cfg.Runtime.DatagramQueueCapacity = 0
 
 	dests, derr := destinations.Default()
 	if derr != nil {
@@ -460,7 +459,7 @@ func TestBuildRejectsABadCapacityWithoutPanicking(t *testing.T) {
 		Dests: dests, Stderr: buf, Inst: inst,
 	})
 	if err == nil {
-		t.Fatal("Build accepted a capacity that is not a power of two")
+		t.Fatal("Build accepted a datagram queue capacity of zero")
 	}
 	if g != nil {
 		t.Error("Build returned a graph alongside an error; a partially built graph " +
@@ -742,14 +741,14 @@ func TestQDBudgetExpiryIsTerminal(t *testing.T) {
 //
 // The lifecycle has two emitters. The stats goroutine's tick, and
 // logShutdownInitiated on the Run goroutine -- which overlap, because teardown
-// stops stats LAST, after the shutdown snapshot. Both called sampleGauges (a
-// read-modify-write of the plain lastParks field) and Reg.Emit (whose snapshot
-// writes the slab its render pass reads) with nothing between them.
+// stops stats LAST, after the shutdown snapshot. Both called Reg.Emit (whose
+// snapshot writes the slab its render pass reads) with nothing between them.
+// (The original defect also had sampleGauges read-modify-write a lastParks
+// field; that went with the QD ring's park count.)
 //
 // SETUP: a running graph with the stats interval at its 1 s minimum, and a
-// sender keeping real datagrams flowing -- paced, so the decoder empties QD
-// and parks between them and the park count that sampleGauges reads keeps
-// moving while it is read.
+// sender keeping real datagrams flowing, so datagrams_received keeps moving
+// while the emitters snapshot it.
 //
 // STIMULUS: one goroutine calls emitStats in a loop while another calls
 // logShutdownInitiated in a loop, and the window stays open until the REAL
@@ -759,15 +758,14 @@ func TestQDBudgetExpiryIsTerminal(t *testing.T) {
 // emission once the decoder has stopped.
 //
 // ASSERTION: under -race, no report. And the adversarial half, which holds
-// without the race detector: the qd_wake_parked deltas summed across EVERY
-// emitted line equal the ring's Parks(). Two unserialised sampleGauges can
-// both read the same lastParks and both add the same delta (too many); two
-// unserialised snapshots overwrite each other's curC and deltaC between
-// computing and rendering them (too few, which is what the unlocked code
-// actually showed: 159 summed against 396 parks). Either way the sum stops
-// being the parks that happened. Non-vacuity: both test emitters ran
-// repeatedly, parks moved, and the real ticker's emissions inside the window
-// (lines emitted minus the test emitters' own) are at least two.
+// without the race detector: the datagrams_received deltas summed across EVERY
+// emitted ingress line equal the final count. Two unserialised snapshots
+// overwrite each other's curC and deltaC between computing and rendering them,
+// so a delta is lost or repeated and the sum stops being the datagrams that
+// arrived (the unlocked code showed 159 summed against 396 on the counter this
+// test used to read). Non-vacuity: both test emitters ran repeatedly, traffic
+// moved, and the real ticker's emissions inside the window (lines emitted
+// minus the test emitters' own) are at least two.
 //
 // WOULD HAVE CAUGHT: the defect as it stood. With emitMu removed from
 // emitStats, -race reported 292 data races in -count=3 (in obs.Reg.snapshot
@@ -811,8 +809,7 @@ func TestTheTwoEmittersAreSerialised(t *testing.T) {
 	})
 	t.Cleanup(shutdown)
 
-	// Traffic. Paced rather than flat out: a decoder that never finds the ring
-	// empty never parks, and then the value under contention never changes.
+	// Traffic, paced so the decoder keeps up and loopback does not drop it all.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -859,19 +856,17 @@ func TestTheTwoEmittersAreSerialised(t *testing.T) {
 		n := int64(strings.Count(buf.String(), " group=health"))
 		return n - ticks.Load() - snapshots.Load()
 	}
-	parksBefore := g.qdConsumer.Parks()
+	recvBefore := g.inst().datagramsReceived.Load()
 	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(50 * time.Millisecond) {
-		if realTicksSoFar() >= 2 &&
-			g.qdConsumer.Parks() > parksBefore+10 &&
-			g.inst().datagramsReceived.Load() > 10 {
+		if realTicksSoFar() >= 2 && g.inst().datagramsReceived.Load() > recvBefore+10 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for two real ticks, parks and traffic in the overlap "+
+			t.Fatalf("timed out waiting for two real ticks and traffic in the overlap "+
 				"(real ticks=%d ticks=%d snapshots=%d)", realTicksSoFar(), ticks.Load(), snapshots.Load())
 		}
 	}
-	parksDuring := g.qdConsumer.Parks() - parksBefore
+	recvDuring := g.inst().datagramsReceived.Load() - recvBefore
 	stop.Store(true)
 	wg.Wait()
 	// Read before cancel, now exact: no test emitter is left, so every line
@@ -884,14 +879,14 @@ func TestTheTwoEmittersAreSerialised(t *testing.T) {
 		t.Fatalf("Run = %v", runErr)
 	}
 
-	// The decoder has returned, so Parks() is final. One more emission moves
-	// whatever is still unreported onto a line.
+	// The receiver has returned, so the count is final. One more emission
+	// moves whatever is still unreported onto a line.
 	if err := g.emitStats(); err != nil {
 		t.Fatalf("the final emitStats: %v", err)
 	}
-	parks := g.qdConsumer.Parks()
+	received := g.inst().datagramsReceived.Load()
 
-	// Non-vacuity: all three emitters ran, repeatedly, while parks moved.
+	// Non-vacuity: all three emitters ran, repeatedly, while traffic moved.
 	if ticks.Load() < 10 || snapshots.Load() < 10 {
 		t.Fatalf("the emitters ran %d and %d times; the overlap was not exercised",
 			ticks.Load(), snapshots.Load())
@@ -899,12 +894,21 @@ func TestTheTwoEmittersAreSerialised(t *testing.T) {
 	if realTicks < 2 {
 		t.Fatalf("the real ticker emitted %d times inside the overlap, want >= 2", realTicks)
 	}
-	t.Logf("ticks=%d snapshots=%d realTicks=%d parks during overlap=%d total=%d",
-		ticks.Load(), snapshots.Load(), realTicks, parksDuring, parks)
+	t.Logf("ticks=%d snapshots=%d realTicks=%d received during overlap=%d total=%d",
+		ticks.Load(), snapshots.Load(), realTicks, recvDuring, received)
 
-	var sum, lines uint64
-	var last uint64
-	for _, m := range qdWakeParkedRE.FindAllStringSubmatch(buf.String(), -1) {
+	// The ingress group line only: the health line repeats datagrams_received,
+	// and counting both would add every delta twice. A group line is skipped
+	// only when nothing in it moved, so skipping one drops only zero deltas.
+	var sum, lines, last uint64
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if !strings.Contains(line, " group=ingress") {
+			continue
+		}
+		m := datagramsReceivedRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
 		cum, _ := strconv.ParseUint(m[1], 10, 64)
 		delta, _ := strconv.ParseUint(m[2], 10, 64)
 		sum += delta
@@ -912,16 +916,16 @@ func TestTheTwoEmittersAreSerialised(t *testing.T) {
 		lines++
 	}
 	if lines == 0 {
-		t.Fatal("no qd_wake_parked value was emitted at all; the check below would be vacuous")
+		t.Fatal("no datagrams_received value was emitted at all; the check below would be vacuous")
 	}
-	if sum != parks {
-		t.Errorf("qd_wake_parked deltas summed across %d lines = %d, but the ring parked %d "+
-			"times -- two emitters were not serialised", lines, sum, parks)
+	if sum != received {
+		t.Errorf("datagrams_received deltas summed across %d lines = %d, but %d datagrams "+
+			"arrived -- two emitters were not serialised", lines, sum, received)
 	}
-	if last != parks {
-		t.Errorf("the last emitted qd_wake_parked total is %d, want Parks() = %d", last, parks)
+	if last != received {
+		t.Errorf("the last emitted datagrams_received total is %d, want %d", last, received)
 	}
 }
 
-// qdWakeParkedRE matches a counter's "name=total(+delta)" rendering.
-var qdWakeParkedRE = regexp.MustCompile(`\bqd_wake_parked=(\d+)\(\+(\d+)\)`)
+// datagramsReceivedRE matches a counter's "name=total(+delta)" rendering.
+var datagramsReceivedRE = regexp.MustCompile(`\bdatagrams_received=(\d+)\(\+(\d+)\)`)

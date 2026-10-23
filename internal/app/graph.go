@@ -148,7 +148,7 @@ type Deps struct {
 // Graph is the constructed process graph.
 //
 // No field is exported, because nothing outside app may hold a reference to the
-// socket, the ring or a goroutine's done channel. What the tests need instead
+// socket, QD or a goroutine's done channel. What the tests need instead
 // is the acquisition and release ORDER, which is recorded rather than exposed --
 // see stages.
 type Graph struct {
@@ -289,19 +289,12 @@ type Graph struct {
 	// logShutdownInitiated on the Run goroutine. They overlap because
 	// teardown stops stats LAST, after the shutdown snapshot has been emitted.
 	// Held around sampleGauges and Reg.Emit together (emitStats), because
-	// both halves are unsafe for two callers: Reg.Emit's snapshot writes the
-	// slab its render pass reads, and sampleGauges read-modify-writes
-	// lastParks, which two callers would turn into a doubled qd_wake_parked.
+	// Reg.Emit is unsafe for two callers: its snapshot writes the slab its
+	// render pass reads.
 	//
 	// Here and not inside obs, which owns no goroutine and has exactly one
 	// caller per emission by design; the lifecycle is what has two.
 	emitMu sync.Mutex
-
-	// lastParks converts the ring's cumulative park count into the delta
-	// qd_wake_parked wants. The ring exposes a plain number because the
-	// ledger assigns that instrument to the decoder, not to framing.
-	// Guarded by emitMu.
-	lastParks uint64
 
 	// stages records every resource acquisition and release, in order.
 	//
@@ -444,13 +437,13 @@ func Build(d Deps) (*Graph, error) {
 	//
 	// QD first: one allocation of capacity x 1040 bytes, pointer-free. Q1
 	// and the shards -- arenas, indexes, rings, batch free lists -- follow.
-	p, c, err := framing.NewRing(d.Cfg.Runtime.DatagramQueueCapacity)
+	p, c, err := framing.NewQD(d.Cfg.Runtime.DatagramQueueCapacity)
 	if err != nil {
-		return nil, exitf(ExitStartup, "allocating the datagram ring at capacity %d: %w",
+		return nil, exitf(ExitStartup, "allocating the datagram queue at capacity %d: %w",
 			d.Cfg.Runtime.DatagramQueueCapacity, err)
 	}
 	g.qdProducer, g.qdConsumer = p, c
-	g.mark(&g.acquired, "qd-ring")
+	g.mark(&g.acquired, "qd")
 
 	// Q1, the other half of step 12: shards x shardQueueCapacity x 360 bytes,
 	// 5.6 MB at the defaults. Allocated HERE, before any socket exists, for the
@@ -555,8 +548,8 @@ func (g *Graph) gapReports() decode.Reports {
 }
 
 // Len is the number of datagrams currently queued in QD. For diagnostics and
-// for the drain assertion; the ring's own Len is exact only from the producer
-// or the consumer goroutine.
+// for the drain assertion; from any goroutine but the receiver or the decoder
+// it is a sample.
 func (g *Graph) Len() int {
 	if g.qdConsumer == nil {
 		return 0

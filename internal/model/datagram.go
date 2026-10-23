@@ -1,7 +1,7 @@
 package model
 
-// Datagram is one received datagram, carried through the QD ring by value.
-// Fixed size and pointer-free: the whole ring is one allocation the collector
+// Datagram is one received datagram, carried through QD by value.
+// Fixed size and pointer-free: QD's whole buffer is one allocation the collector
 // never traces.
 type Datagram struct {
 	RecvMono int64 // receipt monotonic ns, taken ONCE immediately after ReadFrom.
@@ -15,8 +15,8 @@ type Datagram struct {
 	// (bible section 3.2), so this is roughly a 2x margin, which means an
 	// oversized datagram is still carried INTACT and can be reported by
 	// framing as the envelope-assumption break it is -- rather than being
-	// silently truncated at the ring and misframed downstream. The extra
-	// 4 MB across the ring buys the ability to diagnose that case instead
+	// silently truncated in QD and misframed downstream. The extra
+	// 4 MB across QD buys the ability to diagnose that case instead
 	// of corrupting it.
 }
 

@@ -52,9 +52,7 @@ type RuntimeConfig struct {
 	Shards                int
 	GeneralShard          int // the designated shard for non-token units
 	ShardQueueCapacity    int // Q1 depth
-	DatagramQueueCapacity int // QD depth; MUST be a power of two, because the ring
-	// wraps by masking and a non-power-of-two silently
-	// corrupts the index
+	DatagramQueueCapacity int // QD depth
 	MaxInFlightPerShard   int
 	MaxBatchSizeCeiling   int // sizes the pre-allocated Batch.Rows slices
 	ExpectedRows          int // pre-sizes each shard's index

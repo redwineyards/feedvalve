@@ -179,7 +179,6 @@ func TestRejections(t *testing.T) {
 		{"netId out of range", `{"udp":{"expectedNetId":256}}`, "udp.expectedNetId"},
 		{"empty listen", `{"udp":{"listen":""}}`, "udp.listen is empty"},
 
-		{"datagram queue not a power of two", `{"runtime":{"datagramQueueCapacity":5000}}`, "not a power of two"},
 		{"datagram queue too small", `{"runtime":{"datagramQueueCapacity":512}}`, "runtime.datagramQueueCapacity"},
 		{"generalShard outside shards", `{"runtime":{"shards":4,"generalShard":4}}`, "runtime.generalShard"},
 		{"gomaxprocs zero", `{"runtime":{"gomaxprocs":0}}`, "runtime.gomaxprocs"},

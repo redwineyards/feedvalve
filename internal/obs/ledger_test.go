@@ -21,14 +21,15 @@ import (
 // versus shard_depth_max, and blob_overrun versus blob_len_mismatch. Those
 // rows are prose about a decision, not ledger entries.
 func TestInstrumentCountReconcilesWithTheLedgerRows(t *testing.T) {
-	if numInstruments != 131 {
-		t.Errorf("numInstruments = %d, want 131. Vol 0 section 8.2 and section 8.2a "+
-			"name 131 distinct instruments across 129 table rows", numInstruments)
+	if numInstruments != 130 {
+		t.Errorf("numInstruments = %d, want 130. Vol 0 section 8.2 and section 8.2a "+
+			"name 131 distinct instruments across 129 table rows, and one "+
+			"(qd_wake_parked) is withdrawn", numInstruments)
 	}
-	if got := ledgerRows + multiNameRows - duplicatedNames; got != int(numInstruments) {
+	if got := ledgerRows + multiNameRows - duplicatedNames - withdrawnRows; got != int(numInstruments) {
 		t.Errorf("the reconciliation does not hold: %d rows + %d extra names - %d "+
-			"duplicate = %d, but numInstruments is %d",
-			ledgerRows, multiNameRows, duplicatedNames, got, numInstruments)
+			"duplicate - %d withdrawn = %d, but numInstruments is %d",
+			ledgerRows, multiNameRows, duplicatedNames, withdrawnRows, got, numInstruments)
 	}
 }
 
