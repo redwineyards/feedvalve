@@ -14,12 +14,13 @@ import (
 // images and every stored digest in one step. That is why the whole
 // destinations array is startup-only configuration.
 type Destination struct {
-	ID       model.DestID
-	Name     string     // "MD_TOKEN_QUOTE"
-	Table    string     // the Oracle table name
-	Key      RowKeyRule // how RowKey is derived from a unit (ASM-15)
-	Columns  []Column   // declared order == bit order == image order
-	ImageLen int        // sum of the column widths; at most model.ImageSize (ASM-16b)
+	ID        model.DestID
+	Name      string     // "MD_TOKEN_QUOTE"
+	Table     string     // the Oracle table name
+	Key       RowKeyRule // how RowKey is derived from a unit (ASM-15)
+	KeyColumn string     // the SQL column holding RowKey: in ON and INSERT, never in SET (V3 3.1)
+	Columns   []Column   // declared order == bit order == image order
+	ImageLen  int        // sum of the column widths; at most model.ImageSize (ASM-16b)
 
 	// Contributors are the transaction codes that may write this
 	// destination, in SLOT ORDER: ascending code, assigned once at startup.

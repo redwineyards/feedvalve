@@ -14,7 +14,7 @@ func i8(v int8) *int8 { return &v }
 func base() fileMapping {
 	return fileMapping{Destinations: []fileDestination{
 		{
-			Name: "D0", Table: "T0", RowKey: "token", ImageLen: 6,
+			Name: "D0", Table: "T0", RowKey: "token", KeyColumn: "k", ImageLen: 6,
 			Contributors: []int{7208},
 			Columns: []fileColumn{
 				{Bit: 0, Width: 4, Kind: "long", SQL: []string{"alpha"}},
@@ -22,14 +22,14 @@ func base() fileMapping {
 			},
 		},
 		{
-			Name: "D1", Table: "T1", RowKey: "token", ImageLen: 2,
+			Name: "D1", Table: "T1", RowKey: "token", KeyColumn: "k", ImageLen: 2,
 			Contributors: []int{7305},
 			Columns: []fileColumn{
 				{Bit: 0, Width: 2, Kind: "short", SQL: []string{"gamma"}},
 			},
 		},
 		{
-			Name: "D2", Table: "T2", RowKey: "marketType", ImageLen: 1,
+			Name: "D2", Table: "T2", RowKey: "marketType", KeyColumn: "k", ImageLen: 1,
 			Contributors: []int{6511},
 			Columns: []fileColumn{
 				{Bit: 0, Width: 1, Kind: "char1", SQL: []string{"delta"}},
@@ -136,6 +136,31 @@ func TestRejections(t *testing.T) {
 			name:   "unknown rowKey",
 			mutate: func(f *fileMapping) { f.Destinations[0].RowKey = "isin" },
 			want:   "unknown rowKey",
+		},
+		{
+			name:   "hostile keyColumn",
+			mutate: func(f *fileMapping) { f.Destinations[0].KeyColumn = "k) OR (1=1" },
+			want:   "keyColumn",
+		},
+		{
+			name:   "missing keyColumn",
+			mutate: func(f *fileMapping) { f.Destinations[1].KeyColumn = "" },
+			want:   "keyColumn: empty identifier",
+		},
+		{
+			name:   "keyColumn is also a data column",
+			mutate: func(f *fileMapping) { f.Destinations[0].KeyColumn = "alpha" },
+			want:   "is also the keyColumn",
+		},
+		{
+			name:   "keyColumn is updated_at",
+			mutate: func(f *fileMapping) { f.Destinations[0].KeyColumn = "Updated_At" },
+			want:   "writer-owned",
+		},
+		{
+			name:   "data column is updated_at",
+			mutate: func(f *fileMapping) { f.Destinations[0].Columns[0].SQL = []string{"updated_at"} },
+			want:   "reserved for the writer's clock",
 		},
 		{
 			name:   "unknown column kind",

@@ -197,13 +197,13 @@ func TestReloadRulesFireExactlyOnce(t *testing.T) {
 // both, so the only thing wrong is the keying.
 func TestRowKeyDerivableIsEnforced(t *testing.T) {
 	const mapping = `{"destinations":[
-	  {"name":"D_TOKEN","table":"D_TOKEN","rowKey":"token","imageLen":4,
+	  {"name":"D_TOKEN","table":"D_TOKEN","rowKey":"token","keyColumn":"k","imageLen":4,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":4,"kind":"long","sql":["v"]}]},
-	  {"name":"D_MARKET","table":"D_MARKET","rowKey":"marketType","imageLen":4,
+	  {"name":"D_MARKET","table":"D_MARKET","rowKey":"marketType","keyColumn":"k","imageLen":4,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":4,"kind":"long","sql":["w"]}]},
-	  {"name":"D_SPARE","table":"D_SPARE","rowKey":"token","imageLen":1,
+	  {"name":"D_SPARE","table":"D_SPARE","rowKey":"token","keyColumn":"k","imageLen":1,
 	   "contributors":[7305],
 	   "columns":[{"bit":0,"width":1,"kind":"char1","sql":["f"]}]}
 	]}`
@@ -268,13 +268,13 @@ func TestRowKeyDerivableIsEnforced(t *testing.T) {
 // Using a purpose-built map is what keeps this test about the blob bound.
 func TestBlobFitsIsEnforced(t *testing.T) {
 	const mapping = `{"destinations":[
-	  {"name":"D_WIDE","table":"D_WIDE","rowKey":"token","imageLen":250,
+	  {"name":"D_WIDE","table":"D_WIDE","rowKey":"token","keyColumn":"k","imageLen":250,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":250,"kind":"text","lenBit":-1,"sql":["wide"]}]},
-	  {"name":"D_ALSO","table":"D_ALSO","rowKey":"token","imageLen":20,
+	  {"name":"D_ALSO","table":"D_ALSO","rowKey":"token","keyColumn":"k","imageLen":20,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":20,"kind":"text","lenBit":-1,"sql":["alsowide"]}]},
-	  {"name":"D_STATUS","table":"D_STATUS","rowKey":"marketType","imageLen":1,
+	  {"name":"D_STATUS","table":"D_STATUS","rowKey":"marketType","keyColumn":"k","imageLen":1,
 	   "contributors":[6511],
 	   "columns":[{"bit":0,"width":1,"kind":"char1","sql":["flag"]}]}
 	]}`

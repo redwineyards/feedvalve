@@ -1,0 +1,40 @@
+MERGE INTO MD_MARKET_STATUS t
+USING (SELECT
+  :1 AS market_type,
+  :2 AS transcode,
+  :3 AS message_len,
+  :4 AS message_text,
+  :5 AS bcast_destination,
+  :6 AS token,
+  :7 AS effective_ts,
+  :8 AS updated_at
+  FROM dual) s
+ON (t.market_type = s.market_type)
+WHEN MATCHED THEN UPDATE SET
+  t.transcode = s.transcode,
+  t.message_len = s.message_len,
+  t.message_text = s.message_text,
+  t.bcast_destination = s.bcast_destination,
+  t.token = s.token,
+  t.effective_ts = s.effective_ts,
+  t.updated_at = s.updated_at
+WHEN NOT MATCHED THEN INSERT (
+  market_type,
+  transcode,
+  message_len,
+  message_text,
+  bcast_destination,
+  token,
+  effective_ts,
+  updated_at
+)
+VALUES (
+  s.market_type,
+  s.transcode,
+  s.message_len,
+  s.message_text,
+  s.bcast_destination,
+  s.token,
+  s.effective_ts,
+  s.updated_at
+)

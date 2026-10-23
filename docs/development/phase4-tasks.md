@@ -356,6 +356,11 @@ Critical path: 04 → 05 → 06 → 07a → 07b → 09 → 10 → 11 → 14.
 - V4 §6.2 writer log classes; V4 G-ROW-1 `row_rejected` is the writer's; G-DRAIN-2 abandoned rows
   include rows in held batches.
 - `oradb/doc.go` and `writer/doc.go` import claims.
+- V3 §3.2 / §6.3 ladder bind order: the LLD prints and fixes it attribute-major (all `bid_qty_*`, then
+  `bid_px_*`, then `bid_ord_*`, then the ask side). `mapping.json` declares it record by record
+  (`bid_qty_1, bid_px_1, bid_ord_1, bid_qty_2, ...`), which is the order P4-04's `BindPlan` follows
+  and the binder (P4-05) must follow. Statements name their columns, so DDL column order is
+  irrelevant to binds. Correct the LLD text, not the mapping.
 
 ## 7. Exit checklist
 

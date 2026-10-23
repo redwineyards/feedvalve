@@ -1,0 +1,24 @@
+MERGE INTO MD_SECURITY_MASTER t
+USING (SELECT
+  :1 AS token,
+  :2 AS symbol,
+  :3 AS delete_flag,
+  :4 AS updated_at
+  FROM dual) s
+ON (t.token = s.token)
+WHEN MATCHED THEN UPDATE SET
+  t.symbol = s.symbol,
+  t.delete_flag = s.delete_flag,
+  t.updated_at = s.updated_at
+WHEN NOT MATCHED THEN INSERT (
+  token,
+  symbol,
+  delete_flag,
+  updated_at
+)
+VALUES (
+  s.token,
+  s.symbol,
+  s.delete_flag,
+  s.updated_at
+)

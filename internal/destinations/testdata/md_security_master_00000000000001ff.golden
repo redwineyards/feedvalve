@@ -1,0 +1,52 @@
+MERGE INTO MD_SECURITY_MASTER t
+USING (SELECT
+  :1 AS token,
+  :2 AS symbol,
+  :3 AS series,
+  :4 AS expiry_date,
+  :5 AS strike_price,
+  :6 AS board_lot_quantity,
+  :7 AS tick_size,
+  :8 AS base_price,
+  :9 AS delete_flag,
+  :10 AS effective_ts,
+  :11 AS updated_at
+  FROM dual) s
+ON (t.token = s.token)
+WHEN MATCHED THEN UPDATE SET
+  t.symbol = s.symbol,
+  t.series = s.series,
+  t.expiry_date = s.expiry_date,
+  t.strike_price = s.strike_price / 100,
+  t.board_lot_quantity = s.board_lot_quantity,
+  t.tick_size = s.tick_size / 100,
+  t.base_price = s.base_price / 100,
+  t.delete_flag = s.delete_flag,
+  t.effective_ts = s.effective_ts,
+  t.updated_at = s.updated_at
+WHEN NOT MATCHED THEN INSERT (
+  token,
+  symbol,
+  series,
+  expiry_date,
+  strike_price,
+  board_lot_quantity,
+  tick_size,
+  base_price,
+  delete_flag,
+  effective_ts,
+  updated_at
+)
+VALUES (
+  s.token,
+  s.symbol,
+  s.series,
+  s.expiry_date,
+  s.strike_price / 100,
+  s.board_lot_quantity,
+  s.tick_size / 100,
+  s.base_price / 100,
+  s.delete_flag,
+  s.effective_ts,
+  s.updated_at
+)
