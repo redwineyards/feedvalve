@@ -28,7 +28,7 @@ func pkg(name string) string { return module + "/internal/" + name }
 // a rule fails rather than passing silently.
 var allInternal = []string{
 	"app", "config", "decode", "destinations", "framing", "health", "lzo",
-	"mirror", "model", "obs", "oradb", "policy", "wire", "writer",
+	"mirror", "model", "obs", "oradb", "oradb/oratest", "policy", "wire", "writer",
 }
 
 const (
@@ -76,7 +76,7 @@ func otherInternal(name string) []string {
 // model import database/sql with the gate green, which is exactly the coupling
 // this file exists to prevent.
 func recvPath(extra ...string) []string {
-	base := []string{databaseSQL, goOra, pkg("oradb"), pkg("writer")}
+	base := []string{databaseSQL, goOra, pkg("oradb"), pkg("writer"), pkg("oradb/oratest")}
 	return append(base, extra...)
 }
 
@@ -130,7 +130,7 @@ var rules = []rule{
 	},
 	{
 		pkg:       "mirror",
-		forbidden: []string{pkg("oradb"), pkg("writer"), databaseSQL, goOra, "net"},
+		forbidden: []string{pkg("oradb"), pkg("oradb/oratest"), pkg("writer"), databaseSQL, goOra, "net"},
 		why: "a shard goroutine that cannot name a database handle cannot block on a commit, " +
 			"and one that cannot name the socket cannot block on the network. Both halves of " +
 			"that are load-bearing: the mirror is the queue, and a shard that stalls stops " +
@@ -138,16 +138,24 @@ var rules = []rule{
 	},
 	{
 		pkg:       "writer",
-		forbidden: []string{pkg("framing"), pkg("decode"), pkg("mirror"), "net"},
+		forbidden: []string{pkg("framing"), pkg("decode"), pkg("mirror"), pkg("oradb/oratest"), "net"},
 		why: "the writer pool is stateless and sees batches, never the feed. If it could reach " +
 			"mirror it could read shard-owned state off the shard's goroutine, which is a data " +
 			"race on a platform with no race detector.",
 	},
 	{
 		pkg:       "oradb",
-		forbidden: []string{pkg("framing"), pkg("decode"), pkg("mirror"), pkg("destinations")},
-		why: "oradb is the only package permitted to name database/sql and go-ora. It stays a " +
-			"leaf so that privilege cannot spread by transitive import.",
+		forbidden: []string{pkg("framing"), pkg("decode"), pkg("mirror"), pkg("destinations"), pkg("oradb/oratest")},
+		why: "oradb is the only production package permitted to name database/sql and go-ora. It " +
+			"stays a leaf so that privilege cannot spread by transitive import. Its tests import " +
+			"oratest; its production code must not, or the fake driver ships.",
+	},
+	{
+		pkg:       "oradb/oratest",
+		forbidden: otherInternal("oradb/oratest"),
+		why: "oratest is the scripted fake driver. It may name database/sql and go-ora's network " +
+			"package, nothing of ours: oradb's tests import it, so an edge back to oradb is an " +
+			"import cycle, and any other edge would let test scaffolding steer production types.",
 	},
 	{
 		pkg:       "config",
@@ -195,6 +203,31 @@ func TestImportDirection(t *testing.T) {
 	}
 }
 
+// TestG_DEP_2_OratestIsNotInTheBinary is gate G-DEP-2.
+//
+// SETUP: the dependency closure of the shipped command, without test imports.
+// STIMULUS: look for the scripted fake driver in it.
+// ASSERTION: oratest is absent, while the closure demonstrably contains the
+// real database layer, so an empty or truncated listing cannot pass.
+// WOULD HAVE CAUGHT: a stub writer or a "dry-run" option wired into the
+// binary through oratest, which would ship a database that always succeeds.
+func TestG_DEP_2_OratestIsNotInTheBinary(t *testing.T) {
+	deps := goListDeps(t, "./cmd/feedvalve")
+	if !slices.Contains(deps, pkg("app")) || !slices.Contains(deps, goOra) {
+		t.Fatalf("go list -deps ./cmd/feedvalve does not contain app and go-ora (%d entries); "+
+			"this check would pass vacuously", len(deps))
+	}
+	if f, bad := matchForbidden(pkg("oradb/oratest"), []string{pkg("oradb/oratest")}); !bad {
+		t.Fatalf("matcher cannot see oratest (%s)", f)
+	}
+	for _, dep := range deps {
+		if dep == pkg("oradb/oratest") || strings.HasPrefix(dep, pkg("oradb/oratest")+"/") {
+			t.Errorf("the shipped binary reaches %s. oratest is test scaffolding and must "+
+				"never be linked into feedvalve.", dep)
+		}
+	}
+}
+
 // TestEveryPackageHasARule fails when a package is added to the tree without
 // deciding what it may import. Without this, a new package silently inherits no
 // restrictions at all, and the gate above would still pass.
@@ -236,7 +269,7 @@ func TestEveryPackageHasARule(t *testing.T) {
 // names database/sql explicitly, so the rules must too.
 func TestReceivePathRuleIsComplete(t *testing.T) {
 	receivePath := []string{"model", "wire", "lzo", "framing", "decode", "destinations", "policy"}
-	required := []string{databaseSQL, goOra, pkg("oradb"), pkg("writer")}
+	required := []string{databaseSQL, goOra, pkg("oradb"), pkg("writer"), pkg("oradb/oratest")}
 
 	for _, name := range receivePath {
 		i := slices.IndexFunc(rules, func(r rule) bool { return r.pkg == name })
