@@ -54,7 +54,7 @@ const (
 
 	dimMarketType       // {market_type} -- bible Appendix A, 1 to 4
 	dimHypothesis       // {hypothesis} -- global | per-transcode
-	dimRetryClass       // {class} on write_retry -- session | deadlock
+	dimRetryClass       // {class} on write_retry -- session | deadlock | space | unknown
 	dimLogClass         // {class} on log_events_suppressed -- the log event classes
 	dimPanicStage       // {stage} on panics_recovered -- decode | shard | writer | stats
 	dimPayloadStage     // {stage} on short_payload -- header | body
@@ -125,9 +125,11 @@ type RetryClass uint8
 const (
 	RetrySession RetryClass = iota
 	RetryDeadlock
+	RetrySpace
+	RetryUnknown
 )
 
-var retryClasses = []string{"session", "deadlock"}
+var retryClasses = []string{"session", "deadlock", "space", "unknown"}
 
 // PanicStage indexes panics_recovered{stage}, canonical for every recovered
 // panic. Vol 0 section 8.2a withdraws decode_panic{code} and writer_panic in

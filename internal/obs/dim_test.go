@@ -178,7 +178,7 @@ func TestStaticVocabularyTablesCoverTheirEnums(t *testing.T) {
 		{"decompressReasons", decompressReasons, int(ReasonInputNotConsumed)},
 		{"recycleReasons", recycleReasons, int(RecycleError)},
 		{"prevalidateReasons", prevalidateReasons, int(PrevalidateNonfinite)},
-		{"retryClasses", retryClasses, int(RetryDeadlock)},
+		{"retryClasses", retryClasses, int(RetryUnknown)},
 		{"panicStages", panicStages, int(StageStats)},
 		{"payloadStages", payloadStages, int(PayloadBody)},
 		{"probeResults", probeResults, int(ProbeFail)},
@@ -192,6 +192,22 @@ func TestStaticVocabularyTablesCoverTheirEnums(t *testing.T) {
 			if s == "" {
 				t.Errorf("%s[%d] is empty", tc.name, i)
 			}
+		}
+	}
+}
+
+// Hand-written label table: swapping the order of retryClasses would pass the
+// length check above but mislabel every write_retry sample.
+func TestRetryClassLabelStrings(t *testing.T) {
+	want := map[RetryClass]string{
+		RetrySession:  "session",
+		RetryDeadlock: "deadlock",
+		RetrySpace:    "space",
+		RetryUnknown:  "unknown",
+	}
+	for c, w := range want {
+		if got := retryClasses[c]; got != w {
+			t.Errorf("retryClasses[%d] = %q, want %q", c, got, w)
 		}
 	}
 }
