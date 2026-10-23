@@ -15,9 +15,8 @@ import (
 // oradb.DBSettings, and the seam is the same one mirror uses, ruling D1);
 // app projects config onto these plain values.
 type Config struct {
-	Writers               int   // writers.count at Start
-	Ceiling               int   // runtime.maxBatchSizeCeiling, the grouper and binder scratch
-	Time1980UnixOffsetSec int64 // 0 means DefaultTime1980UnixOffsetSec
+	Writers int // writers.count at Start
+	Ceiling int // runtime.maxBatchSizeCeiling, the grouper and binder scratch
 }
 
 // Params is the reloadable half. A published *Params is immutable: a reload
@@ -33,10 +32,24 @@ type Params struct {
 	ConnHold        time.Duration // db.connMaxLifetimeMinutes; 0 disables the bounded hold
 	StmtCacheSize   int           // writers.stmtCacheSize
 
+	// Time1980UnixOffsetSec is runtime.time1980UnixOffsetSec (Vol 3 A8),
+	// reloadable: a batch binds with the value its Params carried. 0 means
+	// DefaultTime1980UnixOffsetSec (an offset of 0 would put the epoch at 1970,
+	// which no reading of the spec supports).
+	Time1980UnixOffsetSec int64
+
 	FailFastWindow       time.Duration // writers.failFastSeconds
 	FailFastWrites       int           // writers.failFastWrites
 	StatementFailWriters int           // writers.statementFailWriters
 	StatementFailWindow  time.Duration // writers.statementFailWindowSec
+}
+
+// time1980 is the offset a batch binds with.
+func (p *Params) time1980() int64 {
+	if p.Time1980UnixOffsetSec == 0 {
+		return DefaultTime1980UnixOffsetSec
+	}
+	return p.Time1980UnixOffsetSec
 }
 
 // exitKind is why a writer's loop returned.

@@ -42,8 +42,8 @@ import (
 //	udp.sourceAllowList, sourceEnforce per datagram, rt.SrcPrefixes / rt.Cfg
 //	udp.stallBudgetMs                  per datagram, rt.Cfg (receiver, fanout)
 //	runtime.gomaxprocs                 applyLive, only if changed
-//	runtime.time1980UnixOffsetSec      NOT PICKED UP: nothing in app passes it to
-//	                                   the writer (a Phase 4 gap, reported)
+//	runtime.time1980UnixOffsetSec      writerParams, per batch (writer.Params);
+//	                                   the runner refreshes cached binders
 //	flush.*                            rt.Mirror, read per tick / epoch / batch
 //	writers.count                      applyLive: Pool.Resize, only if changed
 //	writers.* (the rest), db.queryTimeoutSec
@@ -53,8 +53,11 @@ import (
 //	  db.connectTimeoutSec             applyLive: DB setters (next Acquire for a
 //	                                   pinned session)
 //	ordering.guard*                    rt.Mirror, read per evaluation / unit
-//	ordering.guardEvalIntervalSec      stats goroutine's guard ticker is a fixed
-//	                                   period set before Run (P5-13's loop)
+//	ordering.guardEvalIntervalSec      stats goroutine re-arms the guard timer from
+//	                                   rt.Mirror after each evaluation (stats.go
+//	                                   guardInterval): takes effect within one OLD
+//	                                   period, like stats.intervalSec (Vol 4 sec 2,
+//	                                   documented rather than engineered around)
 //	ordering.gapScope, gapAuditPackets decoder goroutine, GapDetector.Reconfigure
 //	                                   at the next datagram after a new Gen
 //	stats.logLevel, eventRatePerMin    applyLive: SetLevel, SetRatePerMin
@@ -196,6 +199,8 @@ func (g *Graph) reload() reloadOutcome {
 	// "did my reload land?" is answerable at once.
 	g.inst().configReloads.Add(1)
 	g.inst().configGeneration.Store(int64(g.deps.Store.Gen()))
+	// The text "config reloaded generation=" is grepped by scripts/lpar-smoke.sh
+	// (step 4a) and quoted in docs/runbook.md; change all three together.
 	g.deps.Log.Infof("config reloaded generation=%d changed=%v applied=%v failed=%v",
 		next.Gen, changedKeys(prev, next), applied, failed)
 	return reloadApplied

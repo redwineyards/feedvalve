@@ -163,7 +163,36 @@ else
 		fail "the process exited during startup"
 		say "--- output ---"; cat "$LOG"; say "--- end ---"
 	else
-		say "  started, pid $PID; waiting ${WAIT}s for an emission"
+		say "  started, pid $PID"
+
+		# SIGHUP (OQ-L7 / ASM-A9): does the signal reach a Go handler on AIX
+		# and drive a reload? The assertion is the INFO line the reload itself
+		# writes, "config reloaded generation=", NOT the config_generation
+		# gauge, which is only sampled at the next stats emission (up to
+		# stats.intervalSec later) and would make this step slow and ambiguous.
+		# An unchanged file still reloads, so no edit to config.json is needed.
+		# A rejected reload logs "config reload rejected" instead, reported as
+		# its own failure so a bad file is not mistaken for a lost signal.
+		head2 "4a. SIGHUP reloads the configuration (OQ-L7 / ASM-A9)"
+		run "kill -HUP $PID"
+		if kill -HUP "$PID" 2>/dev/null; then
+			i=0
+			while [ "$i" -lt 10 ] && ! grep -q 'config reloaded generation=' "$LOG"; do
+				sleep 1
+				i=$((i + 1))
+			done
+			if grep -q 'config reloaded generation=' "$LOG"; then
+				pass "SIGHUP reached the handler: $(grep -m1 'config reloaded generation=' "$LOG")"
+			elif grep -q 'SIGHUP received' "$LOG"; then
+				fail "SIGHUP was delivered but no reload completed -- see $LOG (a rejected reload is a WARN just above)"
+			else
+				fail "no SIGHUP log line in 10s -- the signal never reached the Go handler on this host (OQ-L7: record the AIX/Go version)"
+			fi
+		else
+			skip "could not send SIGHUP to pid $PID"
+		fi
+
+		say "  waiting ${WAIT}s for an emission"
 		sleep "$WAIT"
 		kill -TERM "$PID" 2>/dev/null
 		wait "$PID"

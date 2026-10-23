@@ -28,9 +28,6 @@ func (p *Pool) loop(ctx context.Context, w *writer) exitKind {
 	w.par = p.params()
 	w.cache = newStmtCache(p.db.Prepare, p.dests, w.par.StmtCacheSize, p.inst, w.id)
 	w.r = newRunner(w.id, p.db, p.dests, w.cache, p.cfg.Ceiling, w.par.QueryTimeout)
-	if p.cfg.Time1980UnixOffsetSec != 0 {
-		w.r.time1980 = p.cfg.Time1980UnixOffsetSec
-	}
 	w.r.inst, w.r.run, w.r.log, w.r.oracleErr = p.inst, p.inst.Run, p.log, p.inst.OracleError
 	defer func() {
 		w.release(-1)
@@ -145,6 +142,7 @@ func (p *Pool) publishHealth() { setGauge(p.inst.HealthState, int64(p.health.Sta
 func (p *Pool) serve(ctx context.Context, w *writer, b *model.Batch) exitKind {
 	shard, epoch, rows := b.Shard, b.Epoch, b.N
 	w.r.queryTimeout = w.par.QueryTimeout
+	w.r.time1980 = w.par.time1980()
 	add(p.inst.WritesAttempted)
 
 	var (

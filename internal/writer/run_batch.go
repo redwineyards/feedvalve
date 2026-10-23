@@ -105,6 +105,7 @@ func newRunner(id int, db *oradb.DB, dests *destinations.Set, cache *stmtCache, 
 // binder returns the Binder for a statement identity, building it on first use.
 func (r *runner) binder(k stmtKey) (*Binder, error) {
 	if b, ok := r.binders[k]; ok {
+		b.Time1980UnixOffsetSec = r.time1980 // a reload may have changed it since b was built
 		return b, nil
 	}
 	d := r.dests.ByID(k.Dest)

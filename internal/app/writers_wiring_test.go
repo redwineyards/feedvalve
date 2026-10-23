@@ -561,7 +561,9 @@ func TestWriterParamsProjectsEveryField(t *testing.T) {
 	w := &cfg.Writers
 	w.RetryInitialMs, w.RetryMaxMs, w.ConnIdleReleaseSec, w.StmtCacheSize = 13, 17, 19, 23
 	w.FailFastSeconds, w.FailFastWrites, w.StatementFailWriters, w.StatementFailWindowSec = 29, 31, 37, 41
+	cfg.Runtime.Time1980UnixOffsetSec = 315552600
 	want := writer.Params{
+		Time1980UnixOffsetSec: 315552600,
 		QueryTimeout: 7 * time.Second, RetryInitial: 13 * time.Millisecond, RetryMax: 17 * time.Millisecond,
 		ConnIdleRelease: 19 * time.Second, ConnHold: 11 * time.Minute, StmtCacheSize: 23,
 		FailFastWindow: 29 * time.Second, FailFastWrites: 31, StatementFailWriters: 37,

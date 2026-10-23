@@ -47,6 +47,8 @@ func writerParams(cfg *config.Config) *writer.Params {
 		ConnHold:        time.Duration(cfg.DB.ConnMaxLifetimeMinutes) * time.Minute,
 		StmtCacheSize:   w.StmtCacheSize,
 
+		Time1980UnixOffsetSec: int64(cfg.Runtime.Time1980UnixOffsetSec),
+
 		FailFastWindow:       time.Duration(w.FailFastSeconds) * time.Second,
 		FailFastWrites:       w.FailFastWrites,
 		StatementFailWriters: w.StatementFailWriters,
