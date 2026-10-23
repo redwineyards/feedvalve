@@ -59,7 +59,7 @@ func (r *runner) rejectEmptyMasks(b *model.Batch, d model.DestID) {
 			add(r.inst.cache.BatchRowEmptyMask[d])
 		}
 		if r.log != nil {
-			r.log.Warnf(obs.ClassWriteFailed, "writer: batch row empty mask dest=%d row=%d slot=%d rejected", d, row.Row, row.Slot)
+			r.log.Warnf(obs.ClassWriteFailed, "writer: batch row empty mask dest=%d slot=%d rejected", d, row.Slot)
 		}
 	}
 }
@@ -99,7 +99,7 @@ func (r *runner) execRows(ctx context.Context, tx *sql.Tx, b *model.Batch, k stm
 			add(r.run.RowRejected[k.Dest])
 		}
 		if r.log != nil {
-			r.log.Errorf(obs.ClassRowRejected, "writer: row rejected dest=%d row=%d slot=%d ORA-%05d", k.Dest, row.Row, row.Slot, cerr.Code)
+			r.log.Errorf(obs.ClassRowRejected, "writer: row rejected dest=%d slot=%d ORA-%05d", k.Dest, row.Slot, cerr.Code)
 		}
 	}
 	return nil

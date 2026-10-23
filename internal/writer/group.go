@@ -53,7 +53,7 @@ func (g *grouper) group(b *model.Batch, d model.DestID, inst *Instruments, log *
 				add(inst.cache.BatchRowEmptyMask[d])
 			}
 			if log != nil {
-				log.Warnf(obs.ClassWriteFailed, "writer: batch row empty mask dest=%d row=%d slot=%d rejected", d, r.Row, r.Slot)
+				log.Warnf(obs.ClassWriteFailed, "writer: batch row empty mask dest=%d slot=%d rejected", d, r.Slot)
 			}
 			continue
 		}

@@ -70,6 +70,20 @@ for pkg in model wire lzo decode policy mirror writer health obs framing destina
 	fi
 done
 
+# oratest is the scripted fake driver the writer and oradb tests run against
+# (internal/oradb/oratest). It sits one directory deeper than the packages
+# above, so the loop's "internal/$pkg" and "$pkg.test" would put its binary in
+# a subdirectory that does not exist. It is shipped under its own name;
+# lpar-smoke.sh runs every *.test.
+if [ -d internal/oradb/oratest ]; then
+	go test -c -o "$OUT/oratest.test" ./internal/oradb/oratest
+	if [ -f "$OUT/oratest.test" ]; then
+		echo "  oratest.test"
+	else
+		echo "  oratest: no test files, nothing to ship"
+	fi
+fi
+
 # G-ASSERT-1 on the target (Vol 4 section 7.6). -race does not exist for
 # aix/ppc64, so the shard's ownership check -- a TryLock around each loop pass,
 # compiled in only under -tags feedvalve_assert -- is "the only concurrency

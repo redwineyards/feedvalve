@@ -347,6 +347,16 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 		fmt.Fprintln(out, "selfcheck: no database configured")
 	}
 
+	// V3 section 11: every statement the writer could ever generate, at every
+	// single-bit mask and the full mask, with every identifier checked. Pure:
+	// no database, no password, no network.
+	nStmts, err := destinations.CheckStatements(dests)
+	if err != nil {
+		return exitf(ExitSelfCheckFailed, "statement generation: %w", err)
+	}
+	fmt.Fprintf(out, "selfcheck: %d statements generated (every destination, every single-bit mask, full mask); "+
+		"identifiers match [A-Za-z][A-Za-z0-9_]{0,29}\n", nStmts)
+
 	// The catalogue, printed because Vol 1 section 8.2 asks for it: "which
 	// codes does this build know?" should be answerable from a log rather than
 	// from the source tree. Empty until P2-06 registers the first decoder, and

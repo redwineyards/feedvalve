@@ -22,7 +22,8 @@
 #                     digest's allocations and MB/s, recorded for OQ-L3.
 #   3. -dbcheck       proves the credential, the listener and the service name
 #                     FROM THIS HOST -- before step 4 can blame the binary for
-#                     a database that was never reachable.
+#                     a database that was never reachable. Also reports the
+#                     catalogue check: the tables match the field map.
 #   4. the full run   start, one instrument line, SIGTERM, clean exit.
 #   5. the host       no cgo, and the receive buffer actually granted
 #                     (G-AIX-1 assertion 5, the only thing that falsifies
@@ -125,8 +126,21 @@ if [ -z "${FEEDVALVE_DB_PASSWORD:-}" ]; then
 	say "one and does not say so."
 else
 	run "$BIN -config $CFG -dbcheck"
-	if "$BIN" -config "$CFG" -dbcheck; then
+	DBCHECK_OUT=$("$BIN" -config "$CFG" -dbcheck 2>&1)
+	DBCHECK_RC=$?
+	echo "$DBCHECK_OUT"
+	if [ "$DBCHECK_RC" -eq 0 ]; then
 		pass "dbcheck"
+		# The catalogue half of -dbcheck (Vol 0 section 7.6): every mapped column
+		# exists, with a compatible type, and is NOT NULL only where the writer
+		# always sets it. Printed as its own line because "the round trip worked
+		# but the tables are wrong" is the failure step 4 would otherwise report
+		# as a writer fault.
+		if echo "$DBCHECK_OUT" | grep -q "catalogue matches the field map"; then
+			pass "catalogue matches the field map"
+		else
+			fail "dbcheck passed but did not report the catalogue check -- is this binary older than the catalogue check?"
+		fi
 	else
 		fail "dbcheck -- credential, listener or service name is wrong from this host. Step 4 will fail for this reason and not because of the binary"
 	fi

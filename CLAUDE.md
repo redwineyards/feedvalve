@@ -128,6 +128,16 @@ port, see `poc/decompress.go`).
   - `-dbcheck`: connect to the database configured under `db`, verify a round trip
     (`SELECT 1 FROM dual`), log the server version, and exit without starting the relay. Read-only;
     the way to prove credentials and network reachability from a deployment host.
+- `./cmd/feedvalve -selfcheck`: no database, password or network. Besides the config and decoder
+  catalogue it runs `destinations.StatementFor` for every destination at every single-bit column
+  mask plus the full mask and rejects any identifier off `[A-Za-z][A-Za-z0-9_]{0,29}` (gate G-SC-1).
+- `./cmd/feedvalve -dbcheck`: the round trip above, then the **catalogue check** (Vol 0 7.6): every
+  mapped column exists in the target table with a compatible type, and is `NOT NULL` only where the
+  writer always sets it. Read-only; any finding fails it. The DDL it expects is in `db/schema/*.sql`
+  (documentation, never executed by the program).
+- Live writer spike: `FEEDVALVE_ORACLE_DSN='oracle://user:pass@host:1521/SVC' go test -run
+  TestDBIntegrationWriter -v ./internal/writer/` (skips without the DSN; non-gating, logs what the
+  real server and go-ora do for the OQ-W3 questions).
 - Build for AIX: `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go build -o gobrdclnt ./poc`. Since the cgo
   dependency is gone this now **cross-compiles from any host** — it no longer has to be built on an
   AIX machine. `poc/build_aix.sh` predates this and still documents the old cgo/`liblzo2`
@@ -311,6 +321,27 @@ nil`) — which is what keeps the decoder tests working — and `updateDummyRow`
 a SQL error is logged (`ERROR update dummy row ... err=...`) and swallowed, since a database problem
 must not stop the relay decoding the feed. Note it sits *after* the parse, so a payload that fails to
 parse writes nothing.
+
+## The new writer and Oracle layer (`internal/*`)
+
+- `internal/oradb` — the only production package that names `database/sql` and go-ora. `DB`
+  (`OpenDriver` is the substitutability seam), `Session` (one pinned connection, `ExecTx`),
+  `Classify` (ORA number to `ErrClass`, by `errors.As`, never by text), `Catalog` and `Check`.
+- `internal/oradb/oratest` — a scripted fake `database/sql` driver. It imports nothing of ours
+  (oradb's tests import it, so an edge back would be a cycle) and is test-only: the receive path,
+  `mirror` and production wiring must never import it.
+- `internal/writer` — statement assembly from a batch mask, array binds, the transaction boundary
+  and per-row attribution. A `Pool` of stateless writers; it reaches the driver only through oradb.
+- `internal/destinations` — mapping, `StatementFor` and `BindPlan`; pure, no `database/sql`.
+- `db/schema/*.sql` — the three tables the writer expects, INSERT/UPDATE grants only.
+
+Things that will bite you here: the writer **never logs the password, a bind value or statement
+text** (gate G-SEC-1, scanned in `internal/writer/integration_test.go`); array-bind `RowsAffected`
+is not recoverable through go-ora, hence the two-phase execute (array, then row-by-row only after a
+row-data error); and `AllocsPerRun`-style tests and `go test -race` need the toolchain notes in
+memory (`CC` must be the full clang path). Gate G-BLD-3 (no `os.Exit` or `Fatal*` outside
+`cmd/feedvalve/main.go`) scans `internal/` and `cmd/`, so writer and oradb are covered, and
+`TestG_BLD_3_ScanCoversTheWriterAndOradb` proves the scan actually reaches them.
 
 ## Debugging parsed data
 

@@ -34,6 +34,13 @@
 // from the V3 §8.2 table and an already-redacted cause; context.Canceled is
 // not a failure and classifies as ok == false.
 //
+// The package also holds the DB wrapper (OpenDriver is the seam that lets a
+// scripted driver stand in for Oracle), Session (one pinned connection and its
+// transactions) and Catalog, the read-only query -dbcheck compares against the
+// field map. Its tests run against internal/oradb/oratest, a fake driver that
+// imports nothing of ours, so oradb's tests may import it and it may never
+// import oradb.
+//
 // Carried over from poc/db.go.
 //
 // Specified by docs/lld/03-writer-persistence.md. Built in Phase 4.
