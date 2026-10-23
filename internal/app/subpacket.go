@@ -458,11 +458,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 	// debug.traceTranscodes produced the 40-byte header and not one body field,
 	// which is also what made runbook question Q6a ("are the bytes wrong, or
 	// are the right bytes in the wrong field?") unanswerable by the tool it
-	// names. Entry.Trace is resolved at registry build, so this costs one
-	// interface store and no type assertion.
-	if entry.Trace != nil {
-		entry.Trace.SetTrace(sink)
-	}
+	// names. One interface call and no type assertion.
+	entry.Dec.SetTrace(sink)
 
 	units := entry.Dec.MaxUnits()
 	if units > len(r.fanoutBuf) {

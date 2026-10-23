@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"feedvalve/internal/model"
+	"feedvalve/internal/wire"
 )
 
 // The catalogue and the registry: Vol 1 section 8.1's two levels, and section
@@ -34,6 +35,7 @@ type fakeDecoder struct {
 func (f fakeDecoder) Code() model.TransCode { return f.code }
 func (f fakeDecoder) BodyLen() int          { return f.bodyLen }
 func (f fakeDecoder) MaxUnits() int         { return f.maxUnits }
+func (f fakeDecoder) SetTrace(wire.TraceSink) {}
 
 func (f fakeDecoder) Decode(h model.MsgHeader, p []byte, out []model.UpdateUnit) (int, error) {
 	if f.decode != nil {
