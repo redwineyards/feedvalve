@@ -91,11 +91,11 @@ func TestEveryRejectCounterExistsInTheLedger(t *testing.T) {
 		}
 	}
 
-	// model has nine rejections that name a counter. Pinned, so that a Reject
-	// added in Phase 2 without a ledger entry fails here rather than passing a
+	// model has three rejections that name a counter. Pinned, so that a Reject
+	// added without a ledger entry fails here rather than passing a
 	// loop that happens to find nothing to check.
-	if checked != 9 {
-		t.Errorf("checked %d Reject counter names, want 9. model.rejectCounter "+
+	if checked != 3 {
+		t.Errorf("checked %d Reject counter names, want 3. model.rejectCounter "+
 			"changed; confirm the new name is in Vol 0 section 8.2 or section 8.2a "+
 			"before adding it to the ledger", checked)
 	}

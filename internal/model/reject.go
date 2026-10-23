@@ -9,32 +9,24 @@ import "errors"
 // must not -- at 10,000 packets/s during a misframe, a wrapped error is both
 // the loudest and the slowest thing in the process. Context belongs in the
 // counter label, not in an error string.
+//
+// Only the outcomes framing and decode.ReadHeader actually return are values
+// here. The rest of the receive path's rejections (oversize, decompression,
+// body length, unknown transcode, record clamp, panic) are counted directly
+// where they happen and never travel as a value.
 type Reject uint8
 
 const (
 	// RejectNone is the zero value: no rejection.
 	RejectNone Reject = iota
-	// RejectOversizeDatagram is over 516 bytes; trimmed to 512 and processed (F6).
-	RejectOversizeDatagram
 	// RejectShortMessageLen is MessageLength below 40, which abandons the
-	// remainder of the datagram (F4).
+	// remainder of the datagram (F4). framing also returns it for every other
+	// envelope rule, since all of them count as framing_abandoned.
 	RejectShortMessageLen
-	// RejectDecompress means DecompressSafe failed; this sub-packet only (F3).
-	RejectDecompress
 	// RejectErrorCode is a non-zero header ErrorCode, meaning MS_ERROR_RESPONSE (F7).
 	RejectErrorCode
-	// RejectBodyLenMismatch is a declared MessageLength disagreeing with the
-	// registry's BodyLen.
-	RejectBodyLenMismatch
 	// RejectShortPayload is a payload shorter than the declared body.
 	RejectShortPayload
-	// RejectUnknownTranscode means no decoder is configured (F2).
-	RejectUnknownTranscode
-	// RejectRecordCountClamped is NoOfRecords out of range; clamped and parsed (F8).
-	RejectRecordCountClamped
-	// RejectPanic is the value the recover boundary returns. Every other
-	// outcome on that path has one, so this one exists too.
-	RejectPanic
 )
 
 // rejectCounter maps each rejection to the obs counter it increments.
@@ -48,16 +40,10 @@ const (
 // nothing and simply yields the empty string -- which TestCounterIsTotal
 // rejects.
 var rejectCounter = [...]string{
-	RejectNone:               "",
-	RejectOversizeDatagram:   "datagrams_oversize",
-	RejectShortMessageLen:    "framing_abandoned",
-	RejectDecompress:         "decompress_failed",
-	RejectErrorCode:          "error_response",
-	RejectBodyLenMismatch:    "body_len_mismatch",
-	RejectShortPayload:       "short_payload",
-	RejectUnknownTranscode:   "unknown_transcode",
-	RejectRecordCountClamped: "record_count_clamped",
-	RejectPanic:              "panics_recovered",
+	RejectNone:            "",
+	RejectShortMessageLen: "framing_abandoned",
+	RejectErrorCode:       "error_response",
+	RejectShortPayload:    "short_payload",
 }
 
 // Counter returns the obs counter name this rejection increments. RejectNone

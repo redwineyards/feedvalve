@@ -85,7 +85,7 @@ func TestBatchIsTheDeliberateException(t *testing.T) {
 func TestCounterIsTotal(t *testing.T) {
 	seen := map[string]Reject{}
 
-	for r := RejectNone; r <= RejectPanic; r++ {
+	for r := RejectNone; r <= RejectShortPayload; r++ {
 		name := r.Counter()
 
 		if r == RejectNone {
@@ -107,8 +107,8 @@ func TestCounterIsTotal(t *testing.T) {
 		seen[name] = r
 	}
 
-	if len(seen) != int(RejectPanic) {
-		t.Errorf("mapped %d counters for %d rejection values", len(seen), int(RejectPanic))
+	if len(seen) != int(RejectShortPayload) {
+		t.Errorf("mapped %d counters for %d rejection values", len(seen), int(RejectShortPayload))
 	}
 }
 
