@@ -435,6 +435,16 @@ sequenceDiagram
 before it is construction on the lifecycle goroutine's own stack and everything after it is idempotent
 side effects derived from the freshly published pointer. The rejected branch touches nothing at all.*
 
+> *(Erratum, Phase 5, rulings D1, D2, D21; `internal/app/reload.go`.)* Three corrections to the figure.
+> **Two publication points, not one store:** `config.Store.Swap` assigns the generation and publishes the
+> `*Config`; `Graph.setRuntime` then publishes the `Runtime` snapshot (config, registry, destinations, mirror
+> parameters, parsed source allow-list), which is what the datapath reads. Between the two, `Store.Load()` is
+> new while `loadRuntime()` is old; this is benign because no datapath reader uses `Store.Load()`. **Validation
+> is `config.ValidateAll(ModeRun)`**, never a bare `Store.Swap`, which skips the schema and destination rules.
+> **A fresh `decodeCounters` is built with each registry** (D11); the old sink is never mutated. The generation
+> is stored in the `config_generation` gauge and the INFO line `config reloaded generation=n changed=[keys]
+> applied=[...] failed=[...]` is written at once, not at the next emission.
+
 ### 2.2 The validation rule set, complete
 
 One implementation, three call sites: startup (step 4 of §1.4), `-selfcheck`, and the SIGHUP path.
@@ -559,6 +569,20 @@ within one window" (HLD §6.9) is not true of all of them.
 4. `db.SetConnMaxLifetime(new.DB.ConnMaxLifetime)`
 5. Writer pool resize (§2.5)
 
+> *(Erratum, Phase 5, rulings D14, D19, D13; `applyLive` in `internal/app/reload.go`.)* The as-built order is
+> `GOMAXPROCS` (only if changed), `SetReadBuffer` (read back, `readbuf_effective_bytes`, logged), the database
+> setters `SetConnMaxLifetime` **and `SetConnectTimeout`** (a sixth effect beyond the five listed: the key
+> `db.connectTimeoutSec` is reloadable and would otherwise be silently ignored), then `SetLevel`,
+> `SetRatePerMin`, `DebugLogger.Set` and `Reg.SetIntervalSec`, and `Pool.Resize` **last**. Step 3 is
+> **amended**: the `database/sql` limits are not applied by a separate step before the resize. `Pool.Resize`
+> calls `SetPoolSize(n+1, n+1)` itself, first, and is called only when `writers.count` changed. `Pool.ReloadHealth()`
+> runs before any of this, right after the `Runtime` is published, so the new `statementFailWriters` is in force
+> when the new count is judged (a count below it is rejected by V-X1, not clamped). A side-effect failure is
+> listed under `failed=` in the INFO line and never rolls the swap back. The receiver does not pick up at "the
+> top of the read-loop iteration" but once per datagram, after `ReadFrom` returns, via `loadRuntime()`; the
+> guard evaluator and the circuit tick re-arm their timers from the live configuration after each firing, like
+> `stats.intervalSec`, so each takes up to one OLD period to adopt a change.
+
 They are applied **after** the swap, not before, because each one is idempotent and derived from the
 *published* pointer: there is then exactly one source of truth, and a side effect that fails can be
 re-derived by re-reading `Store.Load()`. Applying before the swap would make the published config the
@@ -587,6 +611,14 @@ flowchart TD
 **rejected wholesale**, taking the reloadable changes in the same file down with it. That is
 deliberate: a file where half the operator's edits took effect and half did not is the condition
 HLD §6.9 and ADR-010 exist to prevent.*
+
+> *(Erratum, Phase 5.)* `config.StartupOnlyKeys` has **fourteen** entries: Vol 0 §7.2's thirteen plus
+> `runtime.destinationsFile`, an implementation addition (the destination file is read once; V-R2 compares
+> the loaded set). The destination set's shape (name, table, rowKey, ordered columns) is V-R2 and is compared
+> against `Runtime.Dests`, the running set. `udp.sourceAllowList`, `udp.sourceEnforce`, `ordering.gapScope`
+> and `ordering.gapAuditPackets` remain **reloadable** as Vol 0 §7.2 marks them (ruling D9, default; see the
+> Phase 5 as-built notes): the first two through the `Runtime` snapshot, the last two through
+> `decode.GapDetector.Reconfigure`, applied by the decoder at the next datagram after a new generation.
 
 **How V-R1 is implemented, and why not a fingerprint.** The comparison is table-driven over a
 **declared list of startup-only key paths**, not a hash of the whole projection. A hash would be two
@@ -617,7 +649,8 @@ stated the HLD's wording.
 
 - **Grow** (`new.Writers.Count > old`): start the difference as fresh goroutines, each acquiring its
   own session from the already-widened pool. `writers_configured` is `Store`d by the lifecycle
-  goroutine (Vol 0 §8.2).
+  goroutine (Vol 0 §8.2). *(Erratum, Phase 5: by the **pool**, in `Start` and `Resize`. The stats sampler no
+  longer writes it; doing so overwrote the resized value with the startup count.)*
 - **Shrink**: close the per-writer `stop chan struct{}` of the highest-indexed writers. A writer
   checks `stop` **only between batches, never inside a transaction** — a writer that abandoned a
   transaction would leave row locks held until the session timed out. It holds no mirror state
@@ -682,8 +715,21 @@ var StartupOnlyKeys = []string{ /* … */ }
 // starting at 1 for the one loaded at startup. It is published as the
 // config_generation gauge and logged on every accepted reload, so an operator
 // can confirm a change took effect rather than inferring it from silence.
-func (s *Store) Generation() uint64
+func (s *Store) Generation() uint64  // as built: Gen()
 ```
+
+> *(Erratum, Phase 5, rulings D21 and D22. The sketch above is superseded by the as-built API.)*
+> `config.ValidateAll(c, dests, prevDests *destinations.Set, prev *Config, mode Mode) error` is the one entry
+> point; `prev` and `prevDests` are nil at startup and under `-selfcheck`. It returns a `*ValidationError`
+> holding every `Problem` (rule, key path, running and attempted values, detail); `ValidationError.RuleError()`
+> derives the spec's `RuleError{Rule, KeyPath, Running, Attempt, Detail}` from `Problems[0]`, so the reload
+> WARN names the first failure while `-selfcheck` prints all. There is no `Validate`/`ValidateAll` split and
+> no `[]error` return. `StartupOnlyKeys` exists as sketched but is derived from the same table V-R1 enforces
+> (fourteen entries, see §2.5). **There is no `Store.Generation()`**: the method is `Store.Gen()`
+> (`internal/config/store.go`), and the gauge reads it. V-DB3 (a password key anywhere in the file, caught by
+> a key-walk before strict decoding because `DisallowUnknownFields` would otherwise fire first and hide it)
+> and V-STRICT1 are raised by the loader; V-STRICT1 reports the **leaf** key name only, since
+> `encoding/json` does not give the path.
 
 ---
 
@@ -849,6 +895,14 @@ Three rules, each stated because each is a way to get this wrong:
    startup naming the unresolvable zone, and leaves severities at their louder setting. A timezone
    database problem must not silence a circuit alarm.
 
+> *(Erratum, Phase 5, ruling D3; OPEN for the user's decision.)* As built, **V-TZ1 rejects an unresolvable
+> zone at load, at `-selfcheck` and on reload**, so the "WARN at startup, fail open" leg cannot occur through
+> the shipped binary (`time/tzdata` is linked, so only a genuinely unknown name fails). The fail-open path
+> exists in `health.NewWindow` as defence in depth (a fail-open Window, every hour in-window, plus an error the
+> caller in `internal/app/health.go` logs once; state and counters untouched) and **G-LIVE-3 is gated at health level** (`TestG_LIVE_3_UnresolvableZoneFailsOpen`).
+> The alternative is to demote V-TZ1 to a WARN and fail open at runtime. This also qualifies OQ-L5: a missing
+> zoneinfo is now a startup refusal, not a louder alarm.
+
 ### 3.6 Interface sketch
 
 ```go
@@ -932,6 +986,14 @@ restart case (F18): after a mid-session start the very first status message of a
 the state. Gauge values 0 Unknown, 1 PreOpen, 2 PreOpenEnded, 3 Open, 4 Closed, 5 PostClose
 (Vol 0 §8.2, `session_state{market_type}`).*
 
+> *(Erratum, Phase 5, ruling D4; OPEN for the user's decision.)* The as-built edge set is Figure 4.7
+> **exactly as drawn** (`health.expectedEdge`, one table pinned by `TestSessionEdgeSetIsPinned`). Consequence:
+> an overnight process sees `Closed -6511-> Open` or `PostClose -6511-> Open` the next morning if the
+> pre-open pair 6531/6571 is not received first, and counts `session_anomalies`. The proposal is to add those
+> two edges as expected so a normal morning is not an anomaly; it would also shrink the signal §10.1 asks
+> `session_anomalies` to give next to `seq_gap_messages` (a lost 6531/6571 pair would no longer register). It
+> is a two-line change to `expectedEdge`; it needs bible §4.5 cited if taken.
+
 ### 4.3 Out-of-order and missed transitions: accept, count, never reject
 
 > **Rule:** `next = stateOf(code)`, always. The edge set of Figure 4.7 determines only whether the
@@ -945,6 +1007,14 @@ Three cases, each with a concrete reason:
 | **Missed intermediate** — e.g. `Open --6511--> Open` after a lost 6521/6531 pair, or `Closed --6511--> Open` with the re-open's 6531 and 6571 lost | Apply. Count `session_anomalies{market_type}`. WARN, rate-limited per `(market_type, from, to)` | The messages themselves can be lost, permanently, with no retransmission (bible §1, §2.8). A missing intermediate is the *expected* consequence of one lost datagram. A machine that refused to advance would convert one lost datagram into a session-long wrong state — strictly worse than the thing it was protecting against |
 | **Repeat** — the same code arriving while already in that state | Apply (idempotent). Count `session_transitions{market_type}`. No anomaly, no log | The exchange may resend; a duplicate is not information |
 | **Genuinely out of order** — a transition whose ordering value is older than the last applied | The *health* machine applies it in arrival order regardless. The *mirror* is where ordering is enforced, per contributor slot (§4.4) | Two consumers of one message with deliberately different semantics: health describes **what arrived**; the mirror decides **what is written**. Conflating them would put the ordering guard on the logging path |
+
+> *(Erratum, Phase 5, rulings D15, D16.)* The table's first row lists `Open --6511--> Open` as a missed
+> intermediate and an anomaly, which contradicts its own second row. As built, a **repeat** (the next state
+> equals the current one, whatever the cause) is applied, counted in `session_transitions`, and is **not** an
+> anomaly (G-SESS-3), so the example in row one is a repeat. A genuine missed intermediate is a change of
+> state along a non-drawn edge (for example `Closed -6511-> Open`). Anomaly WARNs are rate-limited **per
+> class** (`session_anomaly`), coarser than per `(market_type, from, to)`. A `MarketType` outside 1-4 is
+> logged (rate-limited) and counts nothing.
 
 **And it never gates the data path.** HLD §6.10 states the reason and it is worth repeating because
 the temptation is real: gating writes on a session state derived from messages that can themselves be
@@ -996,7 +1066,7 @@ and is declared here in the same form (§10, addition A-CH-1):
 
 | # | Channel | Element | Capacity | Producer | Consumer | Send semantics | Full ⇒ |
 |---|---|---|---|---|---|---|---|
-| **H** | `sessionCh` | `model.SessionEvent` **by value**, 16 B | **64**, startup-only | receiver (decode path) | stats/health (sole) | **non-blocking** `select` with `default` — never waits, never enters the stall budget | drop the event; `session_events_dropped`++ . Losing one costs a log line and a gauge update and **never costs data**: the same message has already been routed to its shard as an `UpdateUnit` and will be written |
+| **H** | `sessionCh` | `model.SessionEvent` **by value**, 16 B | **64**, startup-only | decoder side of the receive path *(erratum, Phase 5, D5)* | stats/health (sole) | **non-blocking** `select` with `default` — never waits, never enters the stall budget | drop the event; `session_events_dropped`++ . Losing one costs a log line and a gauge update and **never costs data**: the same message has already been routed to its shard as an `UpdateUnit` and will be written |
 
 **Capacity arithmetic.** The worst plausible burst is one simultaneous re-open across all four market
 types: 4 × 3 = **12 events inside one second**, drained by a 1 s health tick. Sixty-four is 5× that,
@@ -1016,6 +1086,17 @@ type SessionEvent struct {
     RecvMono   int64     // ns since process start — the ordering the health machine applies
 }
 ```
+
+> *(Erratum, Phase 5, ruling D5.)* The producer is the **decode step of the receive path**, not a separate
+> "receiver" duty: after a sub-packet's units are routed to their shards, outside the recover boundary,
+> `publishSession` (`internal/app/health.go`) calls `decode.SessionEventOf(&unit)`, which reads `MarketType`
+> from the unit's destination-2 row key (all five status codes are one structure, `vctMsgs`, whose
+> `MarketType` is the row key), so **no field was added to `UpdateUnit` and no decoder changed**. The send is
+> a non-blocking `select`; a full channel increments `session_events_dropped` and the `UpdateUnit` is still
+> delivered. The ledger names the instrument's owner `decoder` (`internal/obs/ledger.go`), not `receiver`.
+> The channel is allocated in `Build` (`sessionChCap = 64`); the stats goroutine drains it completely,
+> FIFO, on its circuit tick, and the channel survives a stats-goroutine restart, so events queued across a
+> restart are drained, not dropped.
 
 ```
 SessionEvent — align 8, size 16
@@ -1368,6 +1449,20 @@ per packet** (HLD §10.2).
 | WARN | F1 sequence gap, F5 netId mismatch, F6 oversize datagram, F8 record-count clamp, F19 unexpected source, F29 truncation, F23 clock step, F15 rejected reload, session anomalies (§4.3), a Q1 send that had to wait at all, Vol 2's `epoch_stalled` (§2.4) *(erratum, Phase 3: this and the four ERROR classes below were Vol 2 events with no class)* | token bucket **per event class**, `stats.eventRatePerMin` (10/min), with a `suppressed=N` suffix on the next emitted line of that class and a `log_events_suppressed{class}` counter |
 | ERROR | F3 decompression failure, F4 framing abandoned, F7 error response, F12/F13 write failures, F14 row rejected, F22 writer stopped, F25/F26/F28 recovered panics, a failed startup step; Vol 2's `blob_len_mismatch` (§4 step 4), `guard_disabled` (§5.5), `drain_deadline` (§2.6) and `shard_defect` (§2.7, F27 / `FatalShardInvariant`) *(erratum, Phase 3)* | token bucket per class |
 | **FATAL** | the eight terminal conditions of §1.2 exit code 4 *(erratum, Phase 3: five in the draft)* | **once**, with the full reason **and the counter snapshot that led to it** |
+
+**Phase 5 log classes *(erratum, ruling D16; `internal/obs/class.go`)*.** Three classes were added and one
+was split. `circuit_quiet` (WARN) and `circuit_down` (ERROR) carry the §3.4 transitions (a Down outside the
+trading window is emitted at WARN under the `circuit_down` class). `decode_anomaly` (in the WARN run of the
+enum) now carries what `session_anomaly` used to carry from the decode path (content a sub-packet should not
+carry: a decompressed-length mismatch, an unconfigured or unknown transcode, a decoder error, a unit-count
+overrun, a blob overrun); `session_anomaly` is session-only (§4.3). The
+Q1 stall-budget fatal (§5.4) is re-homed to `shard_defect` and, as before, deliberately takes no `Allow`.
+Rate limiting stays **per class**, coarser than §4.3's per-`(market_type, from, to)`. **Known wrinkle:**
+`Allow` and `Warnf` treat every class below the first ERROR class as WARN-gated, so the three
+`decode_anomaly` sites that call `Errorf` (a decoder error, a unit-count overrun, a blob overrun) are
+suppressed at `stats.logLevel=error`, which is not what the severity says. Follow-up: split the class by
+severity. The F28 stats-restart line uses the startup class (exempt from `Allow`) so a drained bucket cannot
+hide a stack.
 
 **Writer log classes *(erratum, Phase 4)*.** The writer logs through four of the classes above and no
 other: `write_failed` (F12/F13 batch failures at ERROR; and, at WARN, the one line for a batch that
@@ -2445,7 +2540,7 @@ by the owner. **No percentiles, no histograms.**
 | `circuit_outage_max_ns` | **M** | ns | health | — | The magnitude of the worst outage in the interval, pairing with `seq_gap_messages` for the §6.6 Q5 triage |
 | `session_transitions` | C | transitions | health | `{market_type}` | `session_state` is a gauge; the re-open's three transitions inside one second (bible §4.5) are otherwise invisible |
 | `session_anomalies` | C | transitions | health | `{market_type}` | An out-of-order or missed transition (§4.3). Correlates with `seq_gap_messages` to distinguish "we lost the message" from "the exchange sent something unexpected" |
-| `session_events_dropped` | C | events | receiver | — | The drop policy of channel **H** (§4.5). **Must remain zero**; any non-zero value falsifies ASM-A2 |
+| `session_events_dropped` | C | events | decoder *(erratum, Phase 5, D5: the ledger owner is `decoder`)* | — | The drop policy of channel **H** (§4.5). **Must remain zero**; any non-zero value falsifies ASM-A2 |
 | `writer_health_state` | G | enum 0–2 | writer | — | HLD Figure 12 defines Healthy / Degraded / FailFast and Vol 0 §8.2 has no instrument for it. Without it, `writes_failed` rising cannot be told from "retrying and recovering" (§6.6 Q8) |
 | `log_events_suppressed` | C | events | obs | `{class}` | The token bucket's suffix appears only on the *next* emitted line of that class. A counter makes suppression visible in the 60 s line, and a large value is itself a signal that something is firing thousands of times a minute |
 | `clock_step_detected` | C | steps | stats | — | Makes F23 detectable rather than merely harmless. Non-zero explains a discontinuity in log timestamps and in `updated_at` in ten seconds instead of an hour |
@@ -2464,7 +2559,7 @@ declaration and offset table in §4.5.
 
 | # | Channel | Element | Capacity | Producer | Consumer | Send semantics | Full ⇒ |
 |---|---|---|---|---|---|---|---|
-| **H** | `sessionCh` | `model.SessionEvent` by value, 16 B | **64**, startup-only | receiver (decode path) | stats/health (sole) | **non-blocking** `select` with `default`; never enters the stall budget | drop; `session_events_dropped`++. Losing one costs a log line and a gauge update and **never costs data** — the same message is already routed to its shard as an `UpdateUnit` |
+| **H** | `sessionCh` | `model.SessionEvent` by value, 16 B | **64**, startup-only | decoder side of the receive path *(erratum, Phase 5, D5)* | stats/health (sole) | **non-blocking** `select` with `default`; never enters the stall budget | drop; `session_events_dropped`++. Losing one costs a log line and a gauge update and **never costs data** — the same message is already routed to its shard as an `UpdateUnit` |
 
 Capacity arithmetic and the rejected alternative are in §4.5 and ADR-L34. This is the only addition to
 Vol 0's channel inventory, and Vol 0 §9.4's property — *"no goroutine in this diagram can block
@@ -2559,7 +2654,7 @@ Vol 0's, `OQ-L7` onward are raised here.
 | **OQ-4** *(HLD)* | Does `go-ora` report **per-row results** for an array bind inside a transaction (ASM-6)? | A half-day spike against the real instance | **G-ROW-1 and the three-valued `RowOutcome`.** If it cannot attribute a failure to a row, `OutcomeRejected` and `OutcomeFailed` collapse into one, F14's "skip the row, continue the batch" becomes inexpressible, and one permanently-bad row retries its whole batch indefinitely. Vol 0 calls this the highest-value open item for the LLD and this volume agrees |
 | **OQ-8** *(HLD)* | The Oracle session budget, and whether `db.connMaxLifetimeMinutes` (30) is under the profile's `IDLE_TIME` | The DBA | **V-X7 is explicitly un-checkable in code.** The observable is a recurring F12 (`ORA-03113` on first reuse of a dead session). Also bounds `writers.count`, which D9 makes the pool follow |
 | **OQ-L3** *(Vol 0)* | Is `hash/maphash` allocation-free and fast on `aix/ppc64`? | G-AIX-1 assertion 2 | Only the claim that the digest costs 0.15 % of a core. FNV-1a is the drop-in fallback (ADR-L02) |
-| **OQ-L5** *(Vol 0)* | Does AIX ship a zoneinfo database the Go runtime can find? | §8.7 **resolves it by importing `time/tzdata` unconditionally**; G-AIX-1 assertion 3 confirms | Nothing further. G-LIVE-3 additionally ensures the gate fails **open** if the zone is still unresolvable |
+| **OQ-L5** *(Vol 0)* | Does AIX ship a zoneinfo database the Go runtime can find? | §8.7 **resolves it by importing `time/tzdata` unconditionally**; G-AIX-1 assertion 3 confirms | Nothing further. G-LIVE-3 additionally ensures the gate fails **open** if the zone is still unresolvable *(erratum, Phase 5, D3, open: as built V-TZ1 rejects an unresolvable zone at load, so fail-open is reachable only in `health.NewWindow`, see §3.5)* |
 | **OQ-13** *(HLD)* | The three destinations, their row keys and their column lists | req §8 / the schema owner | Every gate in §7 that names a column is written against **the shipped configuration**, whatever it turns out to be, so none of them is blocked. V-D4, V-D5, V-T4 and V-T6 are what keep the eventual schema honest |
 
 ### What is complete, and what a sibling volume must not read as permission

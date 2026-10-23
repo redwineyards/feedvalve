@@ -267,10 +267,10 @@ func versionOf(opts Options) string {
 var openDB = oradb.Open
 
 // storeOf publishes a configuration into a Store so the generation gauge and
-// the Phase 5 reload path have one to swap.
+// the SIGHUP reload path have one to swap.
 //
 // The second deviation from section 1.4, and a small one: the section has the
-// Store existing from step 3. Phase 5 owns the reload; this just establishes
+// Store existing from step 3. The reload (reload.go) swaps it; this just establishes
 // generation 1 so config_generation reads 1 rather than 0 on a process that
 // never reloaded.
 //

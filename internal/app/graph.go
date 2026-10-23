@@ -247,7 +247,7 @@ type Graph struct {
 
 	// runtime is the published configuration-and-registry snapshot (ADR-L11),
 	// loaded once per datagram by the decoder goroutine. Written by Build
-	// before anything starts, and from Phase 5 by the SIGHUP path.
+	// before anything starts, and afterwards by the SIGHUP reload path (reload.go).
 	runtime atomic.Pointer[Runtime]
 
 	// readerErr is the receiver's terminal error, if it had one: written by

@@ -474,5 +474,93 @@ in that order; P5-06 and P5-07 both edit `reload.go`/`lifecycle.go` likewise. Th
 
 ## 10. As built
 
-To be filled in at close-out (P5-17): deviations from D1..D22, gate results, LPAR and live-DB
-outcomes.
+Written at close-out (P5-17) from the commits `cb96357` (P5-01..05, 09, 10, 14), `e42d7af` (P5-06..08,
+11..13) and `b251d8a` (P5-15, P5-16 and follow-ups). 71 files, about 6,000 lines added since
+`cb96357^`. Nothing in this section was run by P5-17 itself: it is a documentation card, and the test
+results below are those reported by the cards' own runs.
+
+### What landed
+
+- **Reload driver** (`internal/app/reload.go`): SIGHUP loads, runs `ValidateAll(ModeRun)`, builds a
+  fresh registry and `decodeCounters`, `Store.Swap`, one `setRuntime`, then `applyLive`. Serialised by
+  a mutex, closed for good by `stopHUP`. No config file, or a stopped lifecycle, is a logged no-op.
+- **Config** (`internal/config`): `ValidateAll`/`ValidationError`/`Problem`, V-R1/V-R2/V-R3, V-DB3,
+  V-STRICT1, V-TZ1, V-X1; fourteen `StartupOnlyKeys`.
+- **`internal/health`**: `Window`, circuit machine, session machine (Fig 4.7 as drawn). Pure, no
+  `config`/`oradb`/`writer`/`mirror`/`database/sql`.
+- **Wiring** (`internal/app`): `health.go` (circuit tick, `publishSession`, channel H, cap 64),
+  `stats.go` (three timers, F28 restart of all, clock-step detector on wall minus monotonic).
+- **obs**: atomic level, immutable debug snapshot, classes `circuit_quiet`, `circuit_down`,
+  `decode_anomaly`.
+- **`docs/runbook.md`** with the automated name check (`obs/runbook_test.go`), `docs/development/ci.md`,
+  and the SIGHUP step in `scripts/lpar-smoke.sh`.
+
+### Gates landed
+
+G-LOG-1, G-OBS-2, G-CFG-2, G-CFG-3, G-CFG-4, G-CFG-5, G-CFG-6, G-CFG-7, G-CFG-8 (SIGHUP path, plus a
+writer-level test for the epoch offset), G-SEC-3, G-SC-1 (V-R2 once, and the reload load path),
+G-LIVE-1, G-LIVE-2, G-LIVE-3 (health level), G-SESS-1..4, G-CLOCK-1, G-KEY-1, the runbook name check
+(G-OBS-3 style), G-BLD-3 scan reaching `reload.go` and `internal/health`. Also SIGHUP-while-draining,
+reload-vs-SIGTERM, the pickup audit (`TestPickupAuditEveryDepsCfgReadIsClassified`) and the full
+Fig 4.7 edge table (`TestSessionEdgeSetIsPinned`).
+
+### Deviations
+
+1. **Q1 stall-budget fatal** (`fanout.go`) is re-homed to `ClassShardDefect`, not to a decode or session
+   class; like the other fatal it takes no `Allow`. (D16.)
+2. **`ClassDecodeAnomaly` sits in the WARN run of the enum**, but three of its sites (decoder error,
+   unit-count overrun, blob overrun) call `Errorf`. `Allow` treats every class below the first ERROR
+   class as WARN-gated, so those three are suppressed at `stats.logLevel=error`. **Open follow-up:**
+   split the class by severity.
+3. **`checkRange` records the key path and the running and attempted values** (a `db.*` key records the
+   path only), because the reload WARN needs them. D21 asked for this shape; the card text did not
+   spell it out.
+4. **`ordering.gapScope` and `ordering.gapAuditPackets` stay reloadable** (D9 default), through the new
+   `decode.GapDetector.Reconfigure`, which keeps sequence state. They are applied by the decoder at the
+   next datagram after a new generation. `udp.sourceAllowList`/`sourceEnforce` stay reloadable through
+   the `Runtime` snapshot.
+5. **`ordering.guardEvalIntervalSec` is re-armed from the live config after each evaluation**
+   (follow-up in `b251d8a`), so it takes up to one OLD period to adopt a change, like `stats.intervalSec`.
+6. **`runtime.time1980UnixOffsetSec` now reaches the writer** through `writer.Params`, with cached
+   binders refreshed by the runner. This closes a Phase 4 gap: the key was loaded and validated but the
+   writer ignored it.
+7. **`writers_configured` is owned by the pool** (`Start`, `Resize`); the stats sampler no longer
+   stores it (it overwrote a resized value with the startup count).
+8. **`SetConnectTimeout`** added beside `SetConnMaxLifetime` (D19), a sixth effect.
+9. **G-CFG-7** cannot observe `MaxIdleConns` (`database/sql` does not expose it); it asserts
+   `MaxOpenConnections` and the gauges.
+10. **The real-signal SIGHUP test** (`TestARealSIGHUPReloadsTheRunningGraph`) skips on Windows (no
+    SIGHUP to deliver); `reload_signal_windows_test.go` / `reload_signal_unix_test.go` split it.
+    Every other reload test drives the reload function directly.
+11. **Session `Open -6511-> Open` is a repeat, not an anomaly** (G-SESS-3), contradicting the first row
+    of the LLD 4.3 table. Anomaly WARNs are rate-limited per class.
+12. A `MarketType` outside 1-4 is logged (rate-limited) and counts nothing (D15).
+13. `session_events_dropped` has ledger owner `decoder`; the producer is `publishSession`, which reads
+    the market type from the destination-2 row key via `decode.SessionEventOf`. No field was added to
+    `UpdateUnit`.
+14. `clock_step_detected` previously compared non-monotonic readings; it now compares wall movement
+    against monotonic movement. The `AppLogger.SetLevel` race is fixed (atomic level).
+
+### Not done, or not verified
+
+- **LPAR run** (G-AIX-1 assertions 1-5, G-ASSERT-1 on target, the `lpar-smoke.sh` SIGHUP step, i.e.
+  OQ-L7/ASM-A9) is **not done**; the operator owns it.
+- **Live-Oracle spike** (`TestDBIntegrationWriter`) not run.
+- **OQ-L7..L12** not answered (all need the target).
+- **Race.** The full `go test -race -count=20 ./internal/...` was **not run**. `go test -race
+  ./internal/app/` is not fully green because of the open `obs.Emit`/`lastParks` race (section 9, and
+  `docs/development/ci.md`). The package-by-package G-RACE-2 sweep in `ci.md` is the requirement, and
+  this document does not claim it has been completed.
+- **ADR status flips** (card P5-17 scope) were not made: nothing in this tree's docs carries per-ADR
+  status fields that P5-17 could confirm against code, so none were changed.
+- Stale comments remain in production code (`graph.go:250`, `run.go:270-273`, `writers_wiring.go:39`,
+  `mirror/quarantine.go:85`, `health/doc.go:17` "Built in Phase 5"); P5-17 may not change code.
+- Section 8's last checklist items (merge into `develop`, remove the worktree) are the orchestrator's.
+
+### Open rulings for the user
+
+- **D3** V-TZ1 hard rejection (as built) versus the spec's "WARN at startup, fail open".
+- **D4** whether to add `Closed -> Open` and `PostClose -> Open` as expected edges (as built: Fig 4.7
+  exactly; an overnight process counts a `session_anomalies` each morning unless 6531/6571 arrive first).
+- **D9** whether to reclassify the four keys as startup-only (as built: all four reloadable). Do not touch
+  `sourceEnforce` without a yes.

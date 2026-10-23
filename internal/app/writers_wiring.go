@@ -36,7 +36,7 @@ func (in *instruments) resolveWriterInstruments(reg obs.Registry, dests int) {
 
 // writerParams projects the configuration onto writer.Params -- the one place
 // the units are converted, like mirrorParams (ruling D17: loaded once per
-// batch by each writer; the SIGHUP driver is Phase 5).
+// batch by each writer; the SIGHUP driver, reload.go, publishes a new one).
 func writerParams(cfg *config.Config) *writer.Params {
 	w := &cfg.Writers
 	return &writer.Params{

@@ -82,7 +82,7 @@ func (s *Shard) quarantine(d model.DestID, r *model.BatchRow, e *model.Entry) {
 // re-enters it through quarantine. Only quarantine_released is this
 // function's to count; row_quarantined is the reject arm's (P3-09).
 //
-// Unreachable in production until Phase 5's SIGHUP moves Gen.
+// Reached in production when a SIGHUP reload moves Gen.
 func (s *Shard) releaseQuarantine() {
 	var released [model.MaxDestinations]int
 	for d := range model.MaxDestinations {

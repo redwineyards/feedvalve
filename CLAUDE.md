@@ -343,6 +343,44 @@ memory (`CC` must be the full clang path). Gate G-BLD-3 (no `os.Exit` or `Fatal*
 `cmd/feedvalve/main.go`) scans `internal/` and `cmd/`, so writer and oradb are covered, and
 `TestG_BLD_3_ScanCoversTheWriterAndOradb` proves the scan actually reaches them.
 
+## Reload and health (`internal/app`, `internal/health`, `internal/config`)
+
+- **SIGHUP reloads the configuration** (`internal/app/reload.go`); it is not a no-op. Sequence: load,
+  `config.ValidateAll(ModeRun)` (never a bare `Store.Swap`), build a fresh registry and
+  `decodeCounters`, `Store.Swap`, `setRuntime`, then `applyLive` side effects. A rejected file changes
+  nothing and is refused wholesale (a startup-only key changed, V-R1; a destination shape changed,
+  V-R2). With no `-config` file, SIGHUP is a logged "nothing to reload". Reloads are serialised, and a
+  SIGHUP while draining or after stop is a logged no-op. A side-effect failure after the swap is
+  listed under `failed=` and never rolls back.
+- **Two publication points.** `Store.Swap` publishes the `*Config` and assigns `Store.Gen()` (there is
+  no `Generation()`); `Graph.setRuntime` publishes the `Runtime` snapshot. **The datapath reads only
+  `loadRuntime()`**, never `Store.Load()`. Read reloadable settings from the `Runtime` once per
+  datagram; reading `Deps.Cfg` (the startup config) for a reloadable key is a bug, and
+  `TestPickupAuditEveryDepsCfgReadIsClassified` fails on a new read.
+- **Startup-only keys** are `config.StartupOnlyKeys` (fourteen). The four easy-to-misclassify keys
+  `udp.sourceAllowList`, `udp.sourceEnforce`, `ordering.gapScope`, `ordering.gapAuditPackets` are
+  **reloadable** (ruling D9, still open for the user).
+- **Reload ordering rule:** side effects run after the swap and are derived from the published
+  config; `Pool.ReloadHealth` runs first, `Pool.Resize` last and only when `writers.count` changed
+  (it applies the `database/sql` limits itself). Timers (`stats.intervalSec`,
+  `ordering.guardEvalIntervalSec`, the circuit tick) re-arm after each firing, so a change takes up to
+  one OLD period to land.
+- **`internal/health`** holds the pure circuit and market-session state machines. It defines its own
+  config type, imports neither `config`, `oradb`, `writer`, `mirror` nor `database/sql`, and never
+  gates the data path. `app/health.go` feeds it: the decode step calls `publishSession` (non-blocking
+  send on channel H, `sessionChCap` 64, drop counts `session_events_dropped`); the stats goroutine
+  drains it. V-TZ1 rejects an unresolvable zone at load; the health-level fail-open is defence in
+  depth only (ruling D3, open).
+- **Log classes added:** `circuit_quiet`, `circuit_down`, `decode_anomaly` (`session_anomaly` is now
+  session-only). Rate limiting is per class. **Wrinkle:** `decode_anomaly` is in the WARN run, so its
+  three `Errorf` sites are suppressed at `stats.logLevel=error`.
+- **Things that will bite you:** a `-race` run of `internal/app` is not fully green (open `obs.Emit`
+  race); `time1980UnixOffsetSec` reaches the writer through `writer.Params`; `writers_configured` is
+  owned by the pool, not the sampler; the real-signal SIGHUP test skips on Windows.
+- Operator-facing: `docs/runbook.md` (a test checks every instrument name in it against the ledger).
+  CI and race requirements: `docs/development/ci.md`. Open items and as-built:
+  `docs/development/phase5-tasks.md` section 10, `docs/development/notes-for-reviewer.md`.
+
 ## Debugging parsed data
 
 Run with `-debug` to get, per packet: a `hexdump -C`-style dump of the payload, then one line per

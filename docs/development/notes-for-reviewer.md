@@ -37,8 +37,6 @@ carried forward into them. Each item says whether it is open, accepted or fixed.
 - **`obs.Emit` race.** A race between `Emit` and `lastParks` that predates Phase 2 (P3-01 was meant to
   fix it). It did not surface in any Phase 4 race run, and is not attributed to any card. Recorded in
   the `race3_test.go` header and `phase4-tasks.md` section 9.
-- **Phase 5 owns two things:** `obs.AppLogger.SetLevel` has a racy plain `level` field, and
-  `clock_clock_step_detected` compares non-monotonic readings.
 - **Rate-limited second guard disable.** The ERROR line for a second ordering-guard disable can be
   dropped by the log rate limit. Kept; the gauge is the record.
 - **RecvMono ties within one datagram.** Units of one datagram can still tie on `RecvMono` at the same
@@ -72,8 +70,8 @@ carried forward into them. Each item says whether it is open, accepted or fixed.
   seam for the fake driver. `Deps.DB` is `*oradb.DB`.
 - `phase1.go` carries the shared `checkAffected` helper used by phase 2 (outside the card's file list).
 - Pool health thresholds (`failFastSeconds`, `failFastWrites`, statement-fail writers and window) are
-  read once at `NewPool`; everything else in `Params` is re-read per batch. The SIGHUP driver that
-  would re-read them is Phase 5.
+  read once at `NewPool`; everything else in `Params` is re-read per batch. *(Resolved in Phase 5:
+  `Pool.ReloadHealth` re-reads the thresholds on each accepted reload.)*
 - A batch whose `Shard` is outside the completion slice is logged and dropped (defect path only).
 - The deps rule for `writer` no longer forbids `net`. The writer reaches `net` only through `oradb`
   and go-ora; it never imports `net` itself. Framing, decode, mirror and oratest remain forbidden.
@@ -131,8 +129,39 @@ carried forward into them. Each item says whether it is open, accepted or fixed.
 
 ## Phase 5 as-built notes
 
-- P5-09: `health.SessionTracker.Apply` treats a repeat of the same code (for example 6511 while Open) as idempotent, never an anomaly. This follows the card and G-SESS-3 and deliberately differs from the LLD 4.3 table row that lists Open to Open on 6511 as an anomaly. Card wins; LLD erratum pending.
+- P5-09: `health.SessionTracker.Apply` treats a repeat of the same code (for example 6511 while Open) as idempotent, never an anomaly. This follows the card and G-SESS-3 and deliberately differs from the LLD 4.3 table row that lists Open to Open on 6511 as an anomaly. Card wins; LLD erratum applied (04-lifecycle-ops.md, section 4.3).
 - P5-03/P5-04: V-STRICT1 `KeyPath` is the leaf field name only (`encoding/json` does not report the full path), so a mistyped `runtime.windowMS` is reported as `windowMS`. Matches the Vol 4 table, which asks only for the unknown key.
 - P5-03/P5-04: V-DB3 (password key in the file) reports alone; any V-STRICT1 problems in the same file surface only after the credential is removed. Accepted: the credential has to be rotated first anyway.
-- P5-03/P5-04: `config.StartupOnlyKeys` has 14 entries, Vol 0 s7.2's 13 plus `runtime.destinationsFile`, an implementation addition not in the card or Vol 4 list (04-lifecycle-ops.md:677). Erratum: the LLD list should gain it.
-- P5-04: `loadForReload` has no production caller until P5-06 wires it in.
+- P5-03/P5-04: `config.StartupOnlyKeys` has 14 entries, Vol 0 s7.2's 13 plus `runtime.destinationsFile`, an implementation addition not in the card or Vol 4 list (04-lifecycle-ops.md:677). Erratum applied (section 2.5).
+- P5-04: `loadForReload` is called by the SIGHUP driver (P5-06).
+
+### Phase 5 resolved
+
+- `obs.AppLogger.SetLevel` race: `level` is atomic (P5-01); debug trace is an immutable snapshot.
+- `clock_step_detected` compared non-monotonic readings: it now compares wall movement against
+  monotonic movement (P5-13, G-CLOCK-1).
+- `runtime.time1980UnixOffsetSec` was loaded and validated but the writer ignored it: it now reaches
+  the writer through `writer.Params` and follows a reload (a Phase 4 gap).
+- SIGHUP was a no-op, so `Config.Gen` never advanced and quarantine release on reload was test-only:
+  the reload driver is live (P5-06..08).
+- `writers_configured` was overwritten by the stats sampler with the startup count after a resize:
+  the pool owns the gauge.
+- Pool health thresholds were read once: `Pool.ReloadHealth` re-reads them.
+
+### Phase 5 open
+
+- **`obs.Emit`/`lastParks` race** is still open; `go test -race ./internal/app/` is not fully green.
+  See `docs/development/ci.md`. The `ExecTx` rollback deadlock on a driver panic and the missing CI
+  config also remain.
+- **Not run:** full `go test -race -count=20 ./internal/...`; the LPAR (including the SIGHUP step for
+  OQ-L7/ASM-A9); the live-Oracle spike; OQ-L7..L12.
+- **`decode_anomaly` severity.** The class is in the WARN run but three sites use `Errorf`, so they are
+  suppressed at `stats.logLevel=error`. Follow-up: split the class by severity.
+- **Real-signal SIGHUP test skips on Windows**; only the unix build exercises a delivered signal.
+- **Stale comments** in production code still say SIGHUP/health are future work (`graph.go:250`,
+  `run.go:270-273`, `writers_wiring.go:39`, `mirror/quarantine.go:85`, `health/doc.go:17`).
+- **G-CFG-7** cannot observe `MaxIdleConns` (not exposed by `database/sql`).
+- **Rulings awaiting the user:** D3 (V-TZ1 hard rejection versus fail-open), D4 (add `Closed -> Open`
+  and `PostClose -> Open` edges), D9 (the four keys stay reloadable; `sourceEnforce` is an incident
+  lever). Details in `phase5-tasks.md` sections 6 and 10.
+- Branch state: `phase5` is not merged into `develop`; the `phase3`-named worktree still hosts it.
