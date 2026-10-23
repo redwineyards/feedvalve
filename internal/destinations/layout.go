@@ -34,13 +34,3 @@ const (
 	_ = uint(model.ImageSize - masterImageLen)
 	_ = uint(model.ImageSize - statusImageLen)
 )
-
-// shippedImageLens maps destination name to the length the build asserts, so
-// the loader test can prove mapping.json and these constants agree. Two
-// sources of truth are only safe when something checks them against each
-// other.
-var shippedImageLens = map[string]int{
-	"MD_TOKEN_QUOTE":     quoteImageLen,
-	"MD_SECURITY_MASTER": masterImageLen,
-	"MD_MARKET_STATUS":   statusImageLen,
-}

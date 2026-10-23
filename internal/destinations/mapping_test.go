@@ -217,3 +217,13 @@ func TestFullMask(t *testing.T) {
 		}
 	}
 }
+
+// shippedImageLens maps destination name to the length layout.go's build gate
+// asserts, so the loader test can prove mapping.json and those constants agree.
+// Two sources of truth are only safe when something checks them against each
+// other.
+var shippedImageLens = map[string]int{
+	"MD_TOKEN_QUOTE":     quoteImageLen,
+	"MD_SECURITY_MASTER": masterImageLen,
+	"MD_MARKET_STATUS":   statusImageLen,
+}

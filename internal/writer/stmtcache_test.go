@@ -390,3 +390,6 @@ func TestStmtCacheOnePreparePerConnection(t *testing.T) {
 		}
 	}
 }
+
+// len is the number of cached statements.
+func (c *stmtCache) len() int { return len(c.m) }

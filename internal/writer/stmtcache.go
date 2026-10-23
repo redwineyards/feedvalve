@@ -95,6 +95,3 @@ func (c *stmtCache) closeAll() {
 		c.entries.Store(0)
 	}
 }
-
-// len is the number of cached statements.
-func (c *stmtCache) len() int { return len(c.m) }

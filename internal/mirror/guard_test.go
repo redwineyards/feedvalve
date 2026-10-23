@@ -452,3 +452,14 @@ func TestNewGuardTableRejectsMiswiring(t *testing.T) {
 		t.Fatal("a well-wired table did not resolve its second code")
 	}
 }
+
+// lookup returns code's entry, or nil if code is not configured: the by-code
+// accessor the tests use. The merge does not call it -- it resolves index once
+// per unit, because it needs the position too (for blob_len_mismatch{code}),
+// and takes the entry from that.
+func (t *GuardTable) lookup(code model.TransCode) *guardEntry {
+	if i := t.index(code); i >= 0 {
+		return &t.entries[i]
+	}
+	return nil
+}
