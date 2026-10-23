@@ -2,6 +2,7 @@ package app
 
 import (
 	"hash/maphash"
+	"net/netip"
 	"time"
 
 	"feedvalve/internal/config"
@@ -38,6 +39,25 @@ type Runtime struct {
 	// atomic.Pointer, for the skew argument above: a shard loading Params must
 	// never see a generation the rest of the snapshot does not describe.
 	Mirror *mirror.Params
+
+	// SrcPrefixes is udp.sourceAllowList parsed ONCE per generation, here and
+	// not per datagram (parsing allocates; Vol 1 section 3.5). The receiver
+	// loads the snapshot once per datagram, so udp.sourceAllowList and
+	// udp.sourceEnforce are reloadable (Vol 0 section 7.2) with no allocation
+	// and no second pointer.
+	SrcPrefixes []netip.Prefix
+}
+
+// newRuntime builds one snapshot from a validated configuration and the
+// registry built from it. The only constructor, so the startup path and the
+// SIGHUP path cannot derive the snapshot differently. It fails only on an
+// unvalidated allow-list, which V-SRC1 rejects at load.
+func newRuntime(cfg *config.Config, reg decode.Registry, dests *destinations.Set) (*Runtime, error) {
+	prefixes, err := cfg.UDP.SourcePrefixes()
+	if err != nil {
+		return nil, err
+	}
+	return &Runtime{Cfg: cfg, Reg: reg, Dests: dests, Mirror: mirrorParams(cfg), SrcPrefixes: prefixes}, nil
 }
 
 // mirrorParams projects the configuration onto mirror.Params -- the ONE place

@@ -97,6 +97,10 @@ type receiver struct {
 	fatalErr error
 
 	in *instruments
+
+	// gapGen is the configuration generation the gap detector was last
+	// configured from.
+	gapGen uint64
 }
 
 // newReceiver allocates the sub-packet path's buffers once, before anything
@@ -114,6 +118,7 @@ func newReceiver(g *Graph) *receiver {
 
 	return &receiver{
 		g:          g,
+		gapGen:     cfg.Gen,
 		in:         g.inst(),
 		stallTimer: t,
 		// 4 MiB at the default expectedRows, allocated HERE rather than on the
@@ -195,6 +200,15 @@ func (r *receiver) decodeDatagram(d *model.Datagram) error {
 		return nil
 	}
 
+	// Pickup of ordering.gapScope and ordering.gapAuditPackets (P5-07): the
+	// detector is owned by THIS goroutine and has no lock, so it adopts a new
+	// generation here, at the datagram boundary, and nowhere else.
+	if gen := r.rt.Cfg.Gen; gen != r.gapGen {
+		r.gapGen = gen
+		r.gap.Reconfigure(decode.ParseGapScope(r.rt.Cfg.Ordering.GapScope),
+			r.rt.Cfg.Ordering.GapAuditPackets)
+	}
+
 	// The envelope's cNetId, checked once per datagram against the same
 	// expectation as each sub-packet's payload[0] (Vol 1 section 6.2).
 	if n := d.Bytes(); len(n) >= 2 {
@@ -262,6 +276,14 @@ func (r *receiver) SubPacket(payload []byte, compressed bool, idx, count int) {
 	// recover can see. P2-07's gap detector goes inside, between the header
 	// parse and the registry lookup.
 	r.fatalErr = r.route(r.fanoutBuf[:n], idx, count)
+
+	// Channel H (Vol 4 section 4.5): AFTER the units reached their shards, so a
+	// dropped health event can never cost data, and outside the recover
+	// boundary and the stall budget because the send never blocks. Skipped when
+	// the budget expired: the process is stopping and nothing reads it.
+	if r.fatalErr == nil {
+		r.publishSession(r.fanoutBuf[:n])
+	}
 }
 
 // decodeSubPacket is the protected region: decompress, resolve, dispatch.

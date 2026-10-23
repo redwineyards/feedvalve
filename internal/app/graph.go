@@ -5,7 +5,6 @@ import (
 	"hash/maphash"
 	"io"
 	"net"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"feedvalve/internal/decode"
 	"feedvalve/internal/destinations"
 	"feedvalve/internal/framing"
+	"feedvalve/internal/health"
 	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
@@ -139,6 +139,10 @@ type Deps struct {
 	// right shape for a decode path whose errors are either per-packet (and so
 	// handled inside, by Reject) or terminal.
 	Decode func(*model.Datagram) error
+
+	// ConfigPath is the file SIGHUP re-reads. Empty means the process runs on
+	// built-in defaults and there is nothing to reload (D7).
+	ConfigPath string
 }
 
 // Graph is the constructed process graph.
@@ -205,12 +209,13 @@ type Graph struct {
 
 	// guards is the per-transcode guard state every shard shares (ruling D2),
 	// and guardSnap the evaluator's own state, touched only by the stats
-	// goroutine under emitMu. guardEvalEvery is ordering.guardEvalIntervalSec,
-	// derived here so a test can shorten it below the configuration's 1 s
-	// floor before Run without a new key.
-	guards         *mirror.GuardTable
-	guardSnap      *mirror.GuardSnapshot
-	guardEvalEvery time.Duration
+	// goroutine under emitMu. guardEvalOverride is a test seam: when non-zero
+	// it replaces the LIVE ordering.guardEvalIntervalSec (which is reloadable),
+	// so a test can shorten it below the configuration's 1 s floor before Run
+	// without a new key. Production leaves it zero.
+	guards            *mirror.GuardTable
+	guardSnap         *mirror.GuardSnapshot
+	guardEvalOverride time.Duration
 
 	// drainExpired is the ONE shared drain deadline (Vol 4 section 1.5 step 7,
 	// ruling D4), closed by drainTimer flush.drainTimeoutMs after t_shutdown.
@@ -252,16 +257,6 @@ type Graph struct {
 	// non-nil error on a fatal condition").
 	readerErr error
 
-	// srcPrefixes is udp.sourceAllowList, parsed once by bind and read only by
-	// the receiver goroutine afterwards (Vol 1 section 3.5).
-	//
-	// Needs no lock, and the reason is the ordering rather than the type: bind
-	// writes it on the lifecycle goroutine BEFORE startReader launches the
-	// goroutine that reads it, and the go statement is the happens-before.
-	// Nothing writes it again -- udp.listen and its allow-list are
-	// startup-only (C-2, C-3).
-	srcPrefixes []netip.Prefix
-
 	// fatal carries the first terminal condition. Capacity 1 and guarded by
 	// fatalOnce, so a goroutine reporting a terminal condition never blocks
 	// even if the lifecycle has already begun draining for another reason.
@@ -282,6 +277,13 @@ type Graph struct {
 	statsStarted   bool
 
 	teardownOnce sync.Once
+
+	// reloadMu serialises SIGHUP reloads (D12) and guards reloadClosed, which
+	// stopHUP and teardown set so that a signal arriving after the lifecycle
+	// has left the running state is a logged no-op. Holding it across a whole
+	// reload is what makes stopHUP wait for an in-flight one.
+	reloadMu     sync.Mutex
+	reloadClosed bool
 
 	// emitMu serialises the two emitters: the stats goroutine's tick and
 	// logShutdownInitiated on the Run goroutine. They overlap because
@@ -317,6 +319,19 @@ type Graph struct {
 	released []string
 
 	drainStarted time.Time
+
+	// circuit is the liveness machine, owned by the stats goroutine (P5-11).
+	circuit circuitMonitor
+
+	// sessionCh is channel H (Vol 4 section 4.5): market-status observations
+	// from the decoder to the stats goroutine, by value, capacity fixed at
+	// startup. sessions is the machine it feeds, owned by the stats goroutine.
+	sessionCh chan model.SessionEvent
+	sessions  health.Sessions
+
+	// statsNow replaces the stats goroutine's clock in tests (clockNow). Nil in
+	// production. Set before Run.
+	statsNow func() (wall time.Time, mono time.Duration)
 }
 
 // Build performs the startup steps that allocate but do not yet run: Vol 4
@@ -351,6 +366,7 @@ func Build(d Deps) (*Graph, error) {
 		decoderDone:  make(chan struct{}),
 		statsDone:    make(chan struct{}),
 		statsStop:    make(chan struct{}),
+		sessionCh:    make(chan model.SessionEvent, sessionChCap),
 		tickerStop:   make(chan struct{}),
 		tickerDone:   make(chan struct{}),
 		drainExpired: make(chan struct{}),
@@ -412,9 +428,14 @@ func Build(d Deps) (*Graph, error) {
 	// load unconditional rather than a nil check it has to repeat (ADR-L11).
 	// The mirror's reloadable parameters travel in the same snapshot (ruling
 	// D1): one pointer, so no reader sees a new Config beside old Params.
-	params := mirrorParams(d.Cfg)
-	g.guardEvalEvery = params.GuardEvalInterval
-	g.setRuntime(&Runtime{Cfg: d.Cfg, Reg: reg, Dests: d.Dests, Mirror: params})
+	rt, err := newRuntime(d.Cfg, reg, d.Dests)
+	if err != nil {
+		// Unreachable on a validated Config (V-SRC1 uses the same parser); an
+		// error here means an unvalidated Config reached Build, and refusing
+		// to start is better than a source filter nobody realises is broken.
+		return nil, exitf(ExitStartup, "parsing udp.sourceAllowList: %w", err)
+	}
+	g.setRuntime(rt)
 	g.mark(&g.acquired, "derived-state")
 
 	// Step 12: pre-allocation, BEFORE any socket exists. A

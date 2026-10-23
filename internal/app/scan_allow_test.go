@@ -40,6 +40,7 @@ var receivePathFiles = []string{
 	"internal/app/fanout.go",
 	"internal/app/counters.go",
 	"internal/app/lifecycle.go",
+	"internal/app/reload.go",
 }
 
 // startupClassIdent is the alias app uses for the one class that is NOT a

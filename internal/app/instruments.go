@@ -165,7 +165,28 @@ type instruments struct {
 	// panics_recovered{stage=shard}: F26's observable (Vol 4 section 5),
 	// counted by the shard goroutine's recover in runShard.
 	panicsRecoveredShard *obs.Counter
+
+	// panics_recovered{stage=stats}: F28's observable (P5-13).
+	panicsRecoveredStats *obs.Counter
+
+	// health-owned (P5-11): the circuit machine's instruments, written only by
+	// the stats goroutine. The session ones are indexed by market type minus
+	// one, the same slot rule obs's {market_type} dimension uses; the machine
+	// is fed by channel H (P5-12), and session_events_dropped is the one the
+	// decoder side writes (ruling D5).
+	circuitState         *obs.Gauge
+	circuitQuietEvents   *obs.Counter
+	circuitDownEvents    *obs.Counter
+	circuitOutageMaxNs   *obs.Max
+	sessionState         [numMarketTypes]*obs.Gauge
+	sessionTransitions   [numMarketTypes]*obs.Counter
+	sessionAnomalies     [numMarketTypes]*obs.Counter
+	sessionEventsDropped *obs.Counter
 }
+
+// numMarketTypes is the {market_type} dimension: 1 Normal, 2 Odd Lot, 3 Spot,
+// 4 Auction (bible Appendix A). Slot = market type minus one.
+const numMarketTypes = 4
 
 // resolveInstruments performs the resolution half of startup step 9. The caller
 // freezes the registry afterwards.
@@ -198,7 +219,18 @@ func resolveInstruments(reg obs.Registry, cfg *config.Config, dests *destination
 	in.resolveShardInstruments(reg, cfg.Runtime.Shards, dests.Len())
 	in.resolveDestinationInstruments(reg, dests)
 	in.resolveWriterInstruments(reg, dests.Len())
+	in.resolveSessionInstruments(reg)
 	return in
+}
+
+// resolveSessionInstruments resolves the {market_type} family of the session
+// machine.
+func (in *instruments) resolveSessionInstruments(reg obs.Registry) {
+	for i := range numMarketTypes {
+		in.sessionState[i] = reg.GaugeAt(obs.IDSessionState, i)
+		in.sessionTransitions[i] = reg.CounterAt(obs.IDSessionTransitions, i)
+		in.sessionAnomalies[i] = reg.CounterAt(obs.IDSessionAnomalies, i)
+	}
 }
 
 // resolveDestinationInstruments resolves the {destination,column} family, whose
@@ -239,6 +271,13 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 		clockStepDetected:    reg.Counter(obs.IDClockStepDetected),
 		batchqDepth:          reg.Gauge(obs.IDBatchqDepth),
 		panicsRecoveredShard: reg.CounterAt(obs.IDPanicsRecovered, int(obs.StageShard)),
+		panicsRecoveredStats: reg.CounterAt(obs.IDPanicsRecovered, int(obs.StageStats)),
+
+		circuitState:         reg.Gauge(obs.IDCircuitState),
+		circuitQuietEvents:   reg.Counter(obs.IDCircuitQuietEvents),
+		circuitDownEvents:    reg.Counter(obs.IDCircuitDownEvents),
+		circuitOutageMaxNs:   reg.Max(obs.IDCircuitOutageMaxNs),
+		sessionEventsDropped: reg.Counter(obs.IDSessionEventsDropped),
 
 		subpacketsTotal:        reg.Counter(obs.IDSubpacketsTotal),
 		subpacketsCompressed:   reg.Counter(obs.IDSubpacketsCompressed),

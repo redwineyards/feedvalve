@@ -5,10 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
 	"time"
 
 	"feedvalve/internal/framing"
@@ -94,6 +90,10 @@ func (g *Graph) Run(ctx context.Context) error {
 	defer stopHUP()
 
 	ev, terminal := g.wait(ctx)
+	// Right after wait and BEFORE the shutdown line and the drain: the signal
+	// is unregistered and an in-flight reload finishes first, so no reload
+	// ever overlaps teardown (D12). The defer above is the error-path net.
+	stopHUP()
 	g.logShutdownInitiated(ev, terminal)
 
 	// Steps 3 to 10: the drain.
@@ -160,17 +160,10 @@ func (g *Graph) bind() error {
 		effective = n
 	}
 
-	// The allow-list is parsed ONCE, here, because parsing per datagram would
-	// allocate 2,400 times a second to learn the same answer (section 3.5).
-	// It cannot fail on a validated config -- V-SRC1 checks it with the same
-	// parser -- so a failure here means an unvalidated Config reached Run, and
-	// refusing to start is the right answer: the alternative is a source
-	// filter nobody realises is misconfigured.
-	prefixes, err := cfg.UDP.SourcePrefixes()
-	if err != nil {
-		return exitf(ExitStartup, "parsing udp.sourceAllowList: %w", err)
-	}
-	g.srcPrefixes = prefixes
+	// The allow-list is parsed ONCE per generation, by newRuntime, because
+	// parsing per datagram would allocate 2,400 times a second to learn the
+	// same answer (section 3.5). Build already refused an unparseable one.
+	prefixes := g.loadRuntime().SrcPrefixes
 
 	g.inst().readbufEffective.Store(int64(effective))
 	// Requested and effective SIDE BY SIDE. If they differ, the kernel capped
@@ -208,7 +201,6 @@ func (g *Graph) startReader(ctx context.Context) {
 		// datagram would take a lock 2,400 times a second to learn the same
 		// answer.
 		conn := g.getConn()
-		cfg := g.deps.Cfg
 		in := g.inst()
 		var lastRecv int64 // the previous datagram's RecvMono; see nextRecvMono
 
@@ -261,9 +253,15 @@ func (g *Graph) startReader(ctx context.Context) {
 			in.datagramsReceived.Add(1)
 			in.lastDatagramMonoNs.Store(d.RecvMono)
 
+			// The configuration snapshot for THIS datagram (P5-07 pickup: the
+			// receiver adopts a reload on the next datagram). One atomic load,
+			// no allocation; the allow-list is already parsed in the snapshot.
+			rt := g.loadRuntime()
+			cfg, prefixes := rt.Cfg, rt.SrcPrefixes
+
 			// Step 6, section 3.5. An empty allow-list skips the check
 			// entirely rather than matching against nothing.
-			if len(g.srcPrefixes) > 0 && !sourceAllowed(g.srcPrefixes, src) {
+			if len(prefixes) > 0 && !sourceAllowed(prefixes, src) {
 				in.datagramsUnexpectedSrc.Add(1)
 				// Allow first: src is a netip.AddrPort and boxing it into the
 				// variadic allocates, per datagram, on the receive goroutine --
@@ -272,7 +270,7 @@ func (g *Graph) startReader(ctx context.Context) {
 				if g.deps.Log.Allow(obs.ClassUnexpectedSource) {
 					g.deps.Log.Warnf(obs.ClassUnexpectedSource,
 						"datagram from unexpected source %s (allow-list has %d entries, enforce=%v)",
-						src, len(g.srcPrefixes), cfg.UDP.SourceEnforce)
+						src, len(prefixes), cfg.UDP.SourceEnforce)
 				}
 				if cfg.UDP.SourceEnforce {
 					// THE ONE PLACE FeedValve DISCARDS DATA ON PURPOSE
@@ -457,42 +455,7 @@ func (g *Graph) startStats() {
 	g.statsStarted = true
 	g.mark(&g.acquired, "stats-goroutine")
 
-	interval := g.deps.Cfg.StatsInterval()
-	guardEvery := g.guardEvalEvery
-	go func() {
-		defer close(g.statsDone)
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		// The second ticker: the ordering guard's evaluator, every
-		// ordering.guardEvalIntervalSec -- deliberately not the 60 s stats
-		// interval, because a frozen transcode's rows stop updating entirely
-		// until it runs (Vol 2 section 5.5).
-		guard := time.NewTicker(guardEvery)
-		defer guard.Stop()
-
-		last := time.Now()
-		for {
-			select {
-			case <-g.statsStop:
-				return
-			case <-guard.C:
-				g.evaluateGuards()
-			case now := <-t.C:
-				// A wall clock that jumped by much more than the interval is a
-				// step, and it makes every timestamp in the log discontinuous.
-				// Explaining that in ten seconds instead of an hour is the
-				// whole value of the counter.
-				if skew := now.Sub(last) - interval; skew > interval || skew < -interval {
-					g.inst().clockStepDetected.Add(1)
-				}
-				last = now
-
-				if err := g.emitStats(); err != nil {
-					g.deps.Log.Errorf(obsClassStartup, "emitting the stats line: %v", err)
-				}
-			}
-		}
-	}()
+	go g.statsLoop() // stats.go: the body, its F28 recover and the F23 detector
 }
 
 // emitStats samples the lifecycle-owned gauges and writes one emission, under
@@ -519,7 +482,9 @@ func (g *Graph) evaluateGuards() {
 func (g *Graph) sampleGauges() {
 	in := g.inst()
 	in.configGeneration.Store(int64(g.deps.Store.Gen()))
-	in.writersConfigured.Store(int64(g.deps.Cfg.Writers.Count))
+	// writers_configured is NOT stored here: the pool owns the gauge (Start and
+	// Resize), so a reload that changes writers.count is not overwritten by the
+	// startup value.
 	in.batchqDepth.Store(int64(len(g.batchQ)))
 	// The ring's own counters are plain numbers, not instruments: the ledger
 	// assigns qd_wake_parked to the decoder, so the decoder's handle reports
@@ -527,37 +492,6 @@ func (g *Graph) sampleGauges() {
 	if parks := g.qdConsumer.Parks(); parks > g.lastParks {
 		in.qdWakeParked.Add(parks - g.lastParks)
 		g.lastParks = parks
-	}
-}
-
-// installReloadHandler wires SIGHUP. It is a no-op until Phase 5 -- ADR-010's
-// re-read, validate and atomic swap is section 2's work -- but the handler is
-// installed now, and AFTER the graph exists, because a SIGHUP arriving
-// mid-construction would race a half-built registry against a swap. Before this
-// point SIGHUP's default disposition terminates the process, which during a
-// sub-second startup is acceptable and is stated rather than discovered.
-func (g *Graph) installReloadHandler() func() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGHUP)
-
-	stop := make(chan struct{})
-	var once sync.Once
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ch:
-				g.deps.Log.Infof("SIGHUP received; configuration reload arrives in " +
-					"Phase 5 (ADR-010). The running configuration is unchanged.")
-			}
-		}
-	}()
-	return func() {
-		once.Do(func() {
-			signal.Stop(ch)
-			close(stop)
-		})
 	}
 }
 
@@ -643,6 +577,11 @@ func detailSuffix(detail string) string {
 // Run's body on the normal path and deferred for the error paths.
 func (g *Graph) teardown() {
 	g.teardownOnce.Do(func() {
+		// No reload may start from here on, and one already running finishes
+		// first (it holds reloadMu). Idempotent with stopHUP; this is the net
+		// for error paths that reach teardown without having been through wait.
+		g.closeReload()
+
 		// Step 3: close the listener. This is the ONLY way to unblock an
 		// in-flight ReadFrom -- no SetReadDeadline, no polling. A poll loop
 		// would wake a sleeping goroutine ten times a second forever to serve

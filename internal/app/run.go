@@ -237,6 +237,7 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 	g, err := Build(Deps{
 		Cfg: cfg, Store: storeOf(cfg), DB: db, Reg: reg,
 		Log: lg, Debug: dbg, Dests: dests, Stderr: stderr, Inst: inst,
+		ConfigPath: opts.ConfigPath,
 	})
 	if err != nil {
 		return err

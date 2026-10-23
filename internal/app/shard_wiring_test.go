@@ -577,10 +577,10 @@ func TestG_ORD_2_TheGuardEvaluatorRunsInTheGraph(t *testing.T) {
 	g, buf := testGraph(t, "127.0.0.1:0", func(c *config.Config) {
 		configureTranscodes(t, c, 7208, 7305)
 	})
-	if g.guardEvalEvery != 5*time.Second {
-		t.Fatalf("Build derived a guard interval of %v, want the configured 5 s", g.guardEvalEvery)
+	if got := g.loadRuntime().Mirror.GuardEvalInterval; got != 5*time.Second {
+		t.Fatalf("Build derived a guard interval of %v, want the configured 5 s", got)
 	}
-	g.guardEvalEvery = 50 * time.Millisecond
+	g.guardEvalOverride = 50 * time.Millisecond
 
 	mt := &g.inst().mirrorTranscode
 	samples := uint64(g.loadRuntime().Mirror.GuardMinSamples) * 2

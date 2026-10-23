@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,13 +113,13 @@ func Validate(c *Config, prev *Config) error {
 
 func validateInto(p *problems, c, prev *Config) {
 	for _, r := range rangeRules {
-		checkRange(p, c, r)
+		checkRange(p, c, prev, r)
 	}
 	validateUDP(c, p)
 	validateRuntime(c, p)
 	validateFlush(c, p)
 	validateWriters(c, p)
-	validateDB(c, p)
+	validateDB(c, prev, p)
 	validateOrdering(c, p)
 	validateStats(c, p)
 	validateLiveness(c, p)
@@ -130,9 +131,21 @@ func validateInto(p *problems, c, prev *Config) {
 	}
 }
 
-func checkRange(p *problems, c *Config, r rangeRule) {
+// checkRange reports a value outside its declared range. It records the key
+// path and both values -- the attempted one and, when a running configuration
+// is known (a reload), the running one -- so the reload WARN can name them. A
+// db.* key records the path only: no db.* value is ever echoed.
+func checkRange(p *problems, c, prev *Config, r rangeRule) {
 	if v := r.get(c); v < r.lo || v > r.hi {
-		p.add(r.id(), "%s is %d, outside the valid range %d..%d", r.key, v, r.lo, r.hi)
+		running, attempt := "", strconv.Itoa(v)
+		if prev != nil {
+			running = strconv.Itoa(r.get(prev))
+		}
+		if strings.HasPrefix(r.key, "db.") {
+			running, attempt = "", ""
+		}
+		p.addKey(r.id(), r.key, running, attempt,
+			"%s is %d, outside the valid range %d..%d", r.key, v, r.lo, r.hi)
 	}
 }
 
@@ -218,12 +231,12 @@ func validateWriters(c *Config, p *problems) {
 	}
 }
 
-func validateDB(c *Config, p *problems) {
+func validateDB(c, prev *Config, p *problems) {
 	if !c.HasDB {
 		return
 	}
 	for _, r := range dbRangeRules {
-		checkRange(p, c, r)
+		checkRange(p, c, prev, r)
 	}
 
 	// V-DB2. A slice, not a map: map iteration is randomised, and these
