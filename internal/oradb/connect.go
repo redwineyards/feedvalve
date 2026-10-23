@@ -3,9 +3,7 @@ package oradb
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	go_ora "github.com/sijms/go-ora/v2"
@@ -21,29 +19,11 @@ func (s DBSettings) dsn(password string) string {
 	return go_ora.BuildUrl(s.Host, s.Port, s.Service, s.User, password, nil)
 }
 
-// redactDSN is the SECOND line of defence, not the first.
-//
-// The first is that callers build their own messages from Describe. This
-// exists because a driver error can quote the connection string back at us,
-// and on this host operational logs are append-only and long-lived, so one
-// leak is permanent.
-func redactDSN(err error, dsn, password string, s DBSettings) error {
-	if err == nil {
-		return nil
-	}
-	text := err.Error()
-	out := text
-	if dsn != "" {
-		out = strings.ReplaceAll(out, dsn, s.Describe())
-	}
-	if password != "" {
-		out = strings.ReplaceAll(out, password, "[redacted]")
-	}
-	if out == text {
-		return err
-	}
-	return errors.New(out)
-}
+// driverName is the database/sql driver Open uses. It is a variable only so a
+// test can substitute a driver whose errors quote the DSN.
+// Known interim: P4-03's OpenDriver seam replaces this. Tests that swap it
+// must not use t.Parallel.
+var driverName = "oracle"
 
 // Open connects and verifies the connection before returning it.
 //
@@ -60,7 +40,7 @@ func Open(ctx context.Context, s DBSettings) (*sql.DB, error) {
 	}
 
 	dsn := s.dsn(password)
-	db, err := sql.Open("oracle", dsn)
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", s.Describe(), redactDSN(err, dsn, password, s))
 	}
@@ -98,6 +78,11 @@ func Check(ctx context.Context, s DBSettings) (version string, err error) {
 	}
 	defer db.Close()
 
+	// Open has already read the password; reading it again is cheap and keeps
+	// Open's signature, and the redactor below is what scrubs driver errors.
+	password, _ := Password()
+	red := NewRedactor(s, password)
+
 	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(s.QueryTimeoutSec)*time.Second)
 	defer cancel()
 
@@ -105,10 +90,7 @@ func Check(ctx context.Context, s DBSettings) (version string, err error) {
 	// handshake: a ping can succeed against a session that cannot execute.
 	var one int
 	if err := db.QueryRowContext(queryCtx, "SELECT 1 FROM dual").Scan(&one); err != nil {
-		// No redactDSN here: with no dsn and no password to substitute it
-		// returns err untouched, which reads as a control while being none.
-		// Describe() is what keeps this line safe.
-		return "", fmt.Errorf("round trip to %s: %w", s.Describe(), err)
+		return "", fmt.Errorf("round trip to %s: %w", s.Describe(), red.redact(err))
 	}
 	if one != 1 {
 		return "", fmt.Errorf("round trip to %s returned %d, want 1", s.Describe(), one)
