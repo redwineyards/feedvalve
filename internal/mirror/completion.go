@@ -52,6 +52,9 @@ func (s *Shard) applyCompletion(b *model.Batch) error {
 			"a routing defect, or a batch returned twice", s.ID, b.Shard, b.Epoch, s.Epoch, i >= 0)
 	}
 	s.out[i] = false
+	for d := range s.rowsOut {
+		s.rowsOut[d] -= int(b.DestCount[d]) // the batch is home: reading it is safe again
+	}
 
 	// Steps 0b/0c -- normalise, so the walk below has exactly one shape.
 	// Err != nil: the batch never reached a per-row verdict, and every

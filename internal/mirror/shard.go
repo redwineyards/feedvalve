@@ -73,6 +73,13 @@ type Shard struct {
 	sentAt []int64
 	out    []bool
 
+	// rowsOut[d] is the rows of destination d handed to writers and not yet
+	// returned: incremented at the pump's successful batchQ send next to
+	// CohortOut++, decremented in applyCompletion. It exists so the drain
+	// deadline can count the rows an OUTSTANDING batch carries without reading
+	// that batch, which is the writer's until it is returned (P4-11).
+	rowsOut [model.MaxDestinations]int
+
 	// Quarantine[d] is the slots of destination-d rows Oracle has permanently
 	// refused (section 9). Expected empty; walked only on a reload.
 	Quarantine [model.MaxDestinations][]int32

@@ -143,7 +143,10 @@ func (w *stressWriter) serve(rng *rand.Rand) {
 		select {
 		case <-w.stop:
 			return
-		case b := <-w.g.batchQ:
+		case b, ok := <-w.g.batchQ:
+			if !ok { // teardown step 9 closed it
+				return
+			}
 			jitter(rng) // batchQ -> writer
 			w.take(b)
 			w.adjudicate(rng, b)

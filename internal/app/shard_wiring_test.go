@@ -150,7 +150,7 @@ func commitAll(b *model.Batch) {
 	}
 }
 
-// fakeWriter consumes batchQ in place of Phase 4's pool and obeys the shard
+// fakeWriter consumes batchQ in place of the real pool (a graph without a database) and obeys the shard
 // side of the boundary: it writes only Outcome, ErrCode and Err, then returns
 // the batch on completionCh[b.Shard] and never touches it again. committed
 // counts the rows it reported Committed.
@@ -176,7 +176,10 @@ func startFakeWriter(t *testing.T, g *Graph, adjudicate func(n int64, b *model.B
 			select {
 			case <-w.stop:
 				return
-			case b := <-g.batchQ:
+			case b, ok := <-g.batchQ:
+				if !ok { // teardown step 9 closed it
+					return
+				}
 				adjudicate(w.batches.Add(1), b)
 				for i := range b.Active() {
 					if b.Rows[i].Outcome == model.OutcomeCommitted {
@@ -281,7 +284,7 @@ func TestG_DRAIN_1_ShardHalf_TheDrainWritesEveryDirtyRow(t *testing.T) {
 // SETUP: four shards, flush.maxBatchSize 1, a one-minute window, two rows per
 // shard dirtied BEFORE any tick, then one tick sent by the test -- so each
 // shard's single epoch holds both rows and sends m = 2 batches. Nothing
-// consumes batchQ (ruling D10's production shape), so every shard holds both
+// consumes batchQ (this graph has no database, hence no pool; the real writers' version is the end-to-end G-DRAIN-2), so every shard holds both
 // and cannot reach quiescence. drainTimeoutMs = 200. The decoder is then
 // stalled through the Deps.Decode seam on one more datagram, and released
 // stallMs = 400 after t_shutdown -- so the shards see their channels close

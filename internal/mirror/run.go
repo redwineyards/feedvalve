@@ -166,12 +166,15 @@ func (s *Shard) quiescent() bool {
 
 // abandon is the drain deadline (section 2.6, teardown step 8): count the rows
 // that will never be written, per destination, and say so if there are any.
+// That is the accumulating and cohort rings plus rowsOut[d], the rows of
+// batches still with a writer: an outstanding batch is never read (it is the
+// writer's), so its rows are counted from the shard's own bookkeeping.
 // Returning with batches still out is safe: completionCh[k] holds m, so their
 // writers never block.
 func (s *Shard) abandon() {
 	var n [model.MaxDestinations]int
 	for d := range n {
-		n[d] = s.Accum[d].Len() + s.Cohort[d].Len()
+		n[d] = s.Accum[d].Len() + s.Cohort[d].Len() + s.rowsOut[d]
 		s.inst.DrainAbandonedRows[d].Add(uint64(n[d]))
 	}
 	if n[0]+n[1]+n[2] > 0 && s.log.Allow(obs.ClassDrainDeadline) {

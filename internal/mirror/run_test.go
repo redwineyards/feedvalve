@@ -77,6 +77,7 @@ func (l *batchLog) len() int {
 // does. The writer owns the batch while it reads it.
 func recording(l *batchLog, mode fakeMode) fakeMode {
 	return fakeMode{
+		hold: mode.hold,
 		wait: func() {
 			if mode.wait != nil {
 				mode.wait()
@@ -782,8 +783,9 @@ func TestRunDrainReturnsQuiescent(t *testing.T) {
 // STIMULUS: the shared deadline closes, then in closes.
 //
 // ASSERTION: Run returns nil (a designed outcome, not a failure);
-// drain_abandoned_rows = {2, 1, 0} -- cohort plus accumulating, per
-// destination, not A, which is still with a writer; one ERROR line.
+// drain_abandoned_rows = {3, 1, 0} -- cohort plus accumulating plus the row of
+// A's batch, which is still with a writer and is counted from rowsOut, never
+// by reading the batch (P4-11); one ERROR line.
 //
 // Non-vacuity: the deadline closed first and Run was still running, so it was
 // not reachable before in closed.
@@ -810,7 +812,7 @@ func TestRunDrainDeadlineCountsAbandonedRows(t *testing.T) {
 	if err := r.wait(); err != nil {
 		t.Fatalf("Run: %v, want nil", err)
 	}
-	want := [model.MaxDestinations]uint64{2, 1, 0}
+	want := [model.MaxDestinations]uint64{3, 1, 0}
 	for d := range model.MaxDestinations {
 		if got := r.s.inst.DrainAbandonedRows[d].Load(); got != want[d] {
 			t.Errorf("drain_abandoned_rows{%d} = %d, want %d", d, got, want[d])
@@ -821,6 +823,84 @@ func TestRunDrainDeadlineCountsAbandonedRows(t *testing.T) {
 	}
 	if got := strings.Count(r.log.String(), "ERROR drain deadline reached"); got != 1 {
 		t.Errorf("%d drain-deadline ERROR lines, want 1:\n%s", got, r.log.String())
+	}
+}
+
+// TestRunAbandonNeverReadsAnOutstandingBatch is the -race half of P4-11's drain
+// accounting.
+//
+// SETUP: the TestRunDrainDeadlineCountsAbandonedRows shape (A held; B, C in the
+// cohort; X on Accum), but the stalled writer is hostile: it scribbles on the
+// held batch's N, Epoch, DestStart and DestCount for as long as it holds it.
+//
+// STIMULUS: the deadline closes, then in closes; the writer is released only
+// after Run has returned.
+//
+// ASSERTION: drain_abandoned_rows = {3, 1, 0} -- A's row included, taken from
+// the shard's own rowsOut -- and, under -race, no data race report: a shard that
+// read the batch to count its rows would race with the scribbling writer and
+// would also count 3 + 11 rows.
+//
+// WOULD HAVE CAUGHT: abandon summing b.DestCount over the batches still out (the
+// obvious implementation of "count the stalled batch").
+func TestRunAbandonNeverReadsAnOutstandingBatch(t *testing.T) {
+	release := make(chan struct{})
+	r := newRunRig(t, rigOpts{m: 1, maxBatch: 1, mode: scribbleUntil(release)})
+	t.Cleanup(sync.OnceFunc(func() { close(release) }))
+	r.start()
+	for i := range 3 {
+		r.in <- r.quote(model.RowKey(i), uint32(i))
+	}
+	r.merged(3)
+	r.tick <- struct{}{}
+	r.w.waitHeld(t, 1)
+	r.in <- r.master(9, 9, false)
+	eventually(t, "X merged", counterIs(r.s.inst.UnitsApplied, 4))
+
+	r.closeDr()
+	r.closeIn()
+	if err := r.wait(); err != nil {
+		t.Fatalf("Run: %v, want nil", err)
+	}
+	want := [model.MaxDestinations]uint64{3, 1, 0}
+	for d := range model.MaxDestinations {
+		if got := r.s.inst.DrainAbandonedRows[d].Load(); got != want[d] {
+			t.Errorf("drain_abandoned_rows{%d} = %d, want %d", d, got, want[d])
+		}
+	}
+	if r.s.CohortOut != 1 {
+		t.Errorf("non-vacuity: CohortOut = %d, want 1: the batch was still out", r.s.CohortOut)
+	}
+}
+
+// TestRowsOutIsBalancedByCompletions: rowsOut rises at the send and falls at the
+// completion, per destination, so a healthy run ends at zero.
+//
+// SETUP: one quote, a writer that holds its batch until released. STIMULUS: one
+// tick, wait until the batch is out, release, wait until it is home, drain.
+// ASSERTION: rowsOut is all zeros at return. Non-vacuity: the batch was
+// counted out (epoch_batches) and held before the release, and the drained
+// row was written (rows_inflight back to 0), so a zero is a decrement, not a
+// rowsOut that never rose.
+func TestRowsOutIsBalancedByCompletions(t *testing.T) {
+	release := make(chan struct{})
+	r := newRunRig(t, rigOpts{m: 1, maxBatch: 1, mode: holdUntil(release)})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	r.start()
+	r.in <- r.quote(1, 1)
+	r.merged(1)
+	r.tick <- struct{}{}
+	r.w.waitHeld(t, 1)
+	eventually(t, "the batch counted out", counterIs(r.s.inst.EpochBatches, 1))
+	releaseOnce()
+	eventually(t, "the row written", func() bool { return r.s.inst.RowsInflight.Load() == 0 })
+	r.closeIn()
+	if err := r.wait(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.s.rowsOut != [model.MaxDestinations]int{} {
+		t.Errorf("rowsOut = %v after every batch came home, want zeros", r.s.rowsOut)
 	}
 }
 
@@ -853,7 +933,12 @@ func TestRunZeroDrainTimeoutStillMergesBufferedUnits(t *testing.T) {
 	if got := r.s.inst.UnitsApplied.Load(); got != n {
 		t.Fatalf("units_applied = %d, want all %d buffered units merged before the deadline", got, n)
 	}
-	accounted := r.s.inst.EpochRows.Load()
+	// EpochRows counts rows SENT; rows still out are in abandoned as well.
+	var out uint64
+	for d := range r.s.rowsOut {
+		out += uint64(r.s.rowsOut[d])
+	}
+	accounted := r.s.inst.EpochRows.Load() - out
 	for d := range model.MaxDestinations {
 		accounted += r.s.inst.DrainAbandonedRows[d].Load()
 	}
@@ -897,7 +982,7 @@ func TestRunPublishesGaugesOnEntry(t *testing.T) {
 	}
 }
 
-// TestRunDrainDeadlineWithNothingUnwrittenIsSilent is the deadline arm's
+// TestRunDrainDeadlineCountsAnOutstandingBatchWithNothingElse is the deadline arm's
 // "ERROR only if non-zero" (section 2.6, teardown step 8).
 //
 // SETUP: m = 1; one row in one epoch, its batch held for good, so the cohort
@@ -906,8 +991,8 @@ func TestRunPublishesGaugesOnEntry(t *testing.T) {
 //
 // STIMULUS: the deadline closes, then in closes.
 //
-// ASSERTION: Run returns nil; drain_abandoned_rows is 0 for every destination;
-// no drain-deadline ERROR.
+// ASSERTION: Run returns nil; drain_abandoned_rows is {1, 0, 0}: the row of
+// the held batch is unconfirmed and is counted (P4-11), with its ERROR line.
 //
 // Non-vacuity: CohortOut is still 1 when Run returns, so it left through the
 // deadline arm, not a quiescent drain.
@@ -929,13 +1014,14 @@ func TestRunDrainDeadlineWithNothingUnwrittenIsSilent(t *testing.T) {
 	if r.s.CohortOut != 1 {
 		t.Fatalf("non-vacuity: CohortOut = %d, want 1: Run did not leave through the deadline", r.s.CohortOut)
 	}
+	want := [model.MaxDestinations]uint64{1, 0, 0}
 	for d := range model.MaxDestinations {
-		if got := r.s.inst.DrainAbandonedRows[d].Load(); got != 0 {
-			t.Errorf("drain_abandoned_rows{%d} = %d, want 0", d, got)
+		if got := r.s.inst.DrainAbandonedRows[d].Load(); got != want[d] {
+			t.Errorf("drain_abandoned_rows{%d} = %d, want %d", d, got, want[d])
 		}
 	}
-	if got := strings.Count(r.log.String(), "ERROR drain deadline"); got != 0 {
-		t.Errorf("%d drain-deadline ERROR lines with nothing abandoned, want 0:\n%s", got, r.log.String())
+	if got := strings.Count(r.log.String(), "ERROR drain deadline"); got != 1 {
+		t.Errorf("%d drain-deadline ERROR lines, want 1:\n%s", got, r.log.String())
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math/rand"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,6 +39,7 @@ type fakeWriter struct {
 // fakeMode is how the fake adjudicates a batch: wait (hold or latency), then
 // adjudicate.
 type fakeMode struct {
+	hold       func(b *model.Batch) // runs first, with the batch; see scribbleUntil
 	wait       func()
 	adjudicate func(b *model.Batch)
 }
@@ -93,6 +95,37 @@ func holdUntil(release <-chan struct{}) fakeMode {
 	return fakeMode{wait: func() { <-release }, adjudicate: commitAll}
 }
 
+// scribbleUntil is a HOSTILE stalled writer, for the test that proves the
+// shard never reads an outstanding batch: until release closes it keeps
+// rewriting the fields the shard itself wrote (N, DestStart, DestCount, Epoch)
+// -- which a conforming writer never does, and which is exactly why a shard
+// that read them while the batch was out would be a data race under -race (and
+// would count the wrong rows without it). It restores the originals before it
+// lets the batch go, so the rig's own recording of the batch stays valid.
+func scribbleUntil(release <-chan struct{}) fakeMode {
+	return fakeMode{
+		hold: func(b *model.Batch) {
+			n, epoch, start, count := b.N, b.Epoch, b.DestStart, b.DestCount
+			for {
+				select {
+				case <-release:
+					b.N, b.Epoch, b.DestStart, b.DestCount = n, epoch, start, count
+					return
+				default:
+				}
+				b.N += 7
+				b.Epoch++
+				for d := range b.DestCount {
+					b.DestCount[d] += 11
+					b.DestStart[d] += 3
+				}
+				runtime.Gosched()
+			}
+		},
+		adjudicate: func(*model.Batch) {},
+	}
+}
+
 // latency commits every batch after d.
 func latency(d time.Duration) fakeMode {
 	return fakeMode{wait: func() { time.Sleep(d) }, adjudicate: commitAll}
@@ -115,6 +148,9 @@ func (w *fakeWriter) serve() {
 	for b := range w.batchQ {
 		h := w.held.Add(1)
 		for m := w.maxHeld.Load(); h > m && !w.maxHeld.CompareAndSwap(m, h); m = w.maxHeld.Load() {
+		}
+		if w.mode.hold != nil {
+			w.mode.hold(b)
 		}
 		if w.mode.wait != nil {
 			w.mode.wait()

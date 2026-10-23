@@ -58,6 +58,7 @@ func (s *Shard) pump() error {
 			b.DestCount[d] = n - b.DestStart[d]
 		}
 		b.N = n
+		sent := b.DestCount // copied BEFORE the send: after it b is the writer's
 
 		i := s.batchIndex(b)
 		select {
@@ -66,6 +67,9 @@ func (s *Shard) pump() error {
 			s.CohortOut++ // ONLY after a successful send
 			s.sentAt[i] = s.now()
 			s.out[i] = true
+			for d := range sent {
+				s.rowsOut[d] += int(sent[d])
+			}
 			s.inst.EpochBatches.Add(1)
 			s.inst.EpochRows.Add(uint64(n))
 			s.inst.RowsInflight.Add(int64(n))

@@ -185,7 +185,8 @@ type Graph struct {
 	// for every one of them, so no writer blocks on a shard that stopped
 	// reading. tickCh[k] is cap 1, fed by the flush ticker with a non-blocking
 	// send. The writer pool (Run starts it when a database is configured)
-	// is batchQ's consumer; closing it is shutdown step 9 (P4-11).
+	// is batchQ's consumer; teardown closes batchQ (step 9) once the shards have
+	// joined, then joins the pool (step 10).
 	shards       []*mirror.Shard
 	batchQ       chan *model.Batch
 	completionCh []chan *model.Batch
@@ -196,10 +197,11 @@ type Graph struct {
 	// by Run BEFORE the shards (V4 section 1.4 step 13), nil otherwise. See
 	// writers_wiring.go. poolCancel releases the pool-owned context (D13);
 	// poolWatch* run the goroutine that turns Pool.Stopped into Fatal.
-	pool          *writer.Pool
-	poolCancel    context.CancelFunc
-	poolWatchStop chan struct{}
-	poolWatchDone chan struct{}
+	pool           *writer.Pool
+	poolCancel     context.CancelFunc
+	writersStarted bool
+	poolWatchStop  chan struct{}
+	poolWatchDone  chan struct{}
 
 	// guards is the per-transcode guard state every shard shares (ruling D2),
 	// and guardSnap the evaluator's own state, touched only by the stats
@@ -325,7 +327,7 @@ type Graph struct {
 // allocation-only means a failure between Build and Run has nothing running to
 // stop, which is what makes the unwind in gate G-LIFE-3 simple enough to be
 // obviously correct. So Build allocates the shards and Run starts them, where
-// the teardown that must stop them also lives -- and Phase 4's writers the
+// the teardown that must stop them also lives -- and the writers the
 // same way.
 //
 // Step 11 -- OpenDB and its deferred Close -- happens in run before this,

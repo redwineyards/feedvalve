@@ -78,12 +78,10 @@ func (g *Graph) buildPool() error {
 // no pool and nothing starts -- the production binary has no stub writer.
 //
 // The pool runs under its own context (D13), not Run's: SIGTERM must not
-// cancel a writer that is finishing the drain's last batch. Cancelling it at
-// drainExpired and closing the pool after the shards join are P4-11.
-//
-// UNTIL P4-11 teardown neither cancels poolCancel nor closes the pool, so a
-// later startup failure (shards, decoder, bind) leaks the writer goroutines and
-// their sessions. P4-11 must cover that early-error path.
+// cancel a writer that is finishing the drain's last batch. stopWriters cancels
+// it at drainExpired and closes the pool after the shards join; teardown runs
+// on every Run exit, so a later startup failure (decoder, bind) does not leak
+// the writer goroutines and their sessions.
 func (g *Graph) startWriters() error {
 	if g.pool == nil {
 		return nil
@@ -100,8 +98,50 @@ func (g *Graph) startWriters() error {
 		return exitf(ExitStartup, "starting the writer pool: %w", err)
 	}
 	g.mark(&g.acquired, "writers")
+	g.writersStarted = true
 	g.startPoolWatch()
 	return nil
+}
+
+// stopWriters is shutdown steps 9 and 10. The caller has joined the shards, so
+// nothing sends on batchQ and it can be closed: the writers then process
+// whatever is queued, return their batches (completionCh has room for every
+// one, so a shard that already left cannot block them) and exit.
+//
+// The pool's context is cancelled only if the shared drain deadline expires
+// first (D13): a stalled database must not keep the process alive past
+// flush.drainTimeoutMs, and the cancelled batches come back Failed, uncounted,
+// their rows already counted by the shard as abandoned. The wait after the
+// cancel is unconditional because the database may be closed only once no
+// writer can touch it. A no-op without a pool; safe when the pool never
+// started (Pool.Close on one is a no-op).
+func (g *Graph) stopWriters() {
+	if g.batchQ != nil {
+		close(g.batchQ)
+	}
+	if g.pool == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		// Close only errors on its ctx, which is Background here.
+		_ = g.pool.Close(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-g.drainExpired:
+		if g.poolCancel != nil {
+			g.poolCancel()
+		}
+		<-done
+	}
+	if g.poolCancel != nil {
+		g.poolCancel() // release the context; the writers are gone
+	}
+	if g.writersStarted {
+		g.mark(&g.released, "writers")
+	}
 }
 
 // startPoolWatch launches the goroutine that turns Pool.Stopped into the fatal

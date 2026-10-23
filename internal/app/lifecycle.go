@@ -688,11 +688,15 @@ func (g *Graph) teardown() {
 		// they have returned.
 		g.armDrainDeadline()
 		g.stopShardConsumers()
+
+		// Steps 9 and 10: close batchQ, then let the writers finish what is
+		// queued and join them. Strictly after the shards have joined (they
+		// are batchQ's only senders) and strictly before the database closes,
+		// which run's defer does once Run returns. The drain timer is stopped
+		// AFTER this, not before: it is the writers' deadline too (D13).
+		g.stopWriters()
 		g.drainTimer.Stop()
 		g.stopFlushTicker()
-
-		// Steps 9 and 10 -- close batchQ, the writers' last batch -- arrive
-		// with Phase 4.
 
 		if g.statsStarted {
 			close(g.statsStop)
