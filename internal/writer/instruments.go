@@ -17,6 +17,8 @@ type Instruments struct {
 	// BindBadTime counts a non-positive time bound as NULL, by
 	// {destination, column bit}.
 	BindBadTime [model.MaxDestinations][model.MaxColumns]*obs.Counter
+
+	cache cacheInstruments // P4-06; see ResolveCache
 }
 
 // NewInstruments resolves the handles for the first `destinations`
@@ -30,6 +32,39 @@ func NewInstruments(reg *obs.Reg, destinations int) *Instruments {
 		}
 	}
 	return in
+}
+
+// --- grouping and statement cache (P4-06) ---
+
+// StmtCacheEntries is the per-writer gauge of cached statements. Resolve it
+// with ResolveCache before the registry is frozen.
+// StmtCacheUncached counts an execution that prepared, ran and closed a
+// statement because the cache was full (W-6).
+// BatchRowEmptyMask counts rows refused for an empty mask, by destination (W-4).
+type cacheInstruments struct {
+	StmtCacheEntries  []*obs.Gauge
+	StmtCacheUncached *obs.Counter
+	BatchRowEmptyMask [model.MaxDestinations]*obs.Counter
+}
+
+// ResolveCache resolves the grouping and cache handles for `writers` writers
+// and `destinations` destinations. Call it before reg.Freeze.
+func (in *Instruments) ResolveCache(reg *obs.Reg, writers, destinations int) {
+	in.cache.StmtCacheEntries = make([]*obs.Gauge, writers)
+	for w := range in.cache.StmtCacheEntries {
+		in.cache.StmtCacheEntries[w] = reg.GaugeAt(obs.IDStmtCacheEntries, w)
+	}
+	in.cache.StmtCacheUncached = reg.Counter(obs.IDStmtCacheUncached)
+	for d := 0; d < destinations && d < model.MaxDestinations; d++ {
+		in.cache.BatchRowEmptyMask[d] = reg.CounterAt(obs.IDBatchRowEmptyMask, d)
+	}
+}
+
+func (in *Instruments) entriesGauge(w int) *obs.Gauge {
+	if in == nil || w < 0 || w >= len(in.cache.StmtCacheEntries) {
+		return nil
+	}
+	return in.cache.StmtCacheEntries[w]
 }
 
 func add(c *obs.Counter) {
