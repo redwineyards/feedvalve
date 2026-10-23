@@ -58,6 +58,12 @@ func (g *Graph) Run(ctx context.Context) error {
 	// a bind failure must return an error with the database closed, not exit.
 	defer g.teardown()
 
+	// Step 13: the writers, before the shards, so a shard's first batch has a
+	// consumer. Only with a database; see startWriters.
+	if err := g.startWriters(); err != nil {
+		return err
+	}
+
 	// Step 14: the shards, Q1's consumers, BEFORE the decoder that feeds them --
 	// the same consumers-before-producers rule as below, one queue further
 	// down.
@@ -693,6 +699,10 @@ func (g *Graph) teardown() {
 			<-g.statsDone
 			g.mark(&g.released, "stats-goroutine")
 		}
+
+		// The pool watcher last: a pool that stops DURING the drain still has
+		// to reach the exit code.
+		g.stopPoolWatch()
 	})
 }
 

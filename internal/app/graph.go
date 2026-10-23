@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"hash/maphash"
 	"io"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 	"feedvalve/internal/oradb"
+	"feedvalve/internal/writer"
 )
 
 // FatalReason enumerates the terminal conditions of Vol 4 section 1.2 exit
@@ -182,13 +184,22 @@ type Graph struct {
 	// shard returning at the drain deadline with all m batches out leaves room
 	// for every one of them, so no writer blocks on a shard that stopped
 	// reading. tickCh[k] is cap 1, fed by the flush ticker with a non-blocking
-	// send. Nothing consumes batchQ until Phase 4 (ruling D10), and nothing
-	// closes it until then either.
+	// send. The writer pool (Run starts it when a database is configured)
+	// is batchQ's consumer; closing it is shutdown step 9 (P4-11).
 	shards       []*mirror.Shard
 	batchQ       chan *model.Batch
 	completionCh []chan *model.Batch
 	tickCh       []chan struct{}
 	bus          *mirror.FlushBus
+
+	// pool is the writer pool: built by Build when Deps.DB is non-nil, started
+	// by Run BEFORE the shards (V4 section 1.4 step 13), nil otherwise. See
+	// writers_wiring.go. poolCancel releases the pool-owned context (D13);
+	// poolWatch* run the goroutine that turns Pool.Stopped into Fatal.
+	pool          *writer.Pool
+	poolCancel    context.CancelFunc
+	poolWatchStop chan struct{}
+	poolWatchDone chan struct{}
 
 	// guards is the per-transcode guard state every shard shares (ruling D2),
 	// and guardSnap the evaluator's own state, touched only by the stats
@@ -436,6 +447,13 @@ func Build(d Deps) (*Graph, error) {
 	// batches -- with their channels and the one seed (Vol 2 section 1.3).
 	g.buildShards(mirrorSizing(d.Cfg, maphash.MakeSeed()))
 	g.mark(&g.acquired, "shards")
+
+	// The writer pool, allocation only like everything in Build: no goroutine
+	// and no session until Run. Absent without a database, which is what keeps
+	// the fake-writer tests honest -- and there is no stub writer in the binary.
+	if err := g.buildPool(); err != nil {
+		return nil, err
+	}
 
 	return g, nil
 }

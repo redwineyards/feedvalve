@@ -9,6 +9,7 @@ import (
 	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
+	"feedvalve/internal/writer"
 )
 
 // instruments are the lifecycle's own instrument handles, resolved once and
@@ -64,6 +65,11 @@ type instruments struct {
 	// ruling D2) and shared by every shard's copy.
 	mirrorShards    []mirror.ShardInstruments
 	mirrorTranscode mirror.TranscodeInstruments
+
+	// writer is every handle the writer pool writes (P4-10), resolved here for
+	// the same reason. Nil only if the registry is not an *obs.Reg, which the
+	// writer's concrete-typed resolvers need; NewPool accepts nil.
+	writer *writer.Instruments
 
 	// The sub-packet path (P2-05). Resolved here, before Freeze, because
 	// gate G-OBS-1's whole point is that an instrument reaches a struct field
@@ -191,6 +197,7 @@ func resolveInstruments(reg obs.Registry, cfg *config.Config, dests *destination
 	in.resolveTranscodeInstruments(reg, len(cfg.Transcodes))
 	in.resolveShardInstruments(reg, cfg.Runtime.Shards, dests.Len())
 	in.resolveDestinationInstruments(reg, dests)
+	in.resolveWriterInstruments(reg, dests.Len())
 	return in
 }
 
