@@ -139,7 +139,7 @@ var rules = []rule{
 	{
 		pkg:       "writer",
 		forbidden: []string{pkg("framing"), pkg("decode"), pkg("mirror"), pkg("oradb/oratest")},
-		why: "(net is not forbidden: the writer reaches it through oradb and go-ora, which must open database sockets; it never imports net itself.) the writer pool is stateless and sees batches, never the feed. If it could reach " +
+		why: "the writer pool is stateless and sees batches, never the feed. (go-ora and net are not listed: it reaches them only through oradb, and doc.go holds its direct imports to that.) If it could reach " +
 			"mirror it could read shard-owned state off the shard's goroutine, which is a data " +
 			"race on a platform with no race detector.",
 	},

@@ -66,7 +66,7 @@ func (r *runner) rejectEmptyMasks(b *model.Batch, d model.DestID) {
 
 // execRows runs one statement identity's rows one exec each.
 func (r *runner) execRows(ctx context.Context, tx *sql.Tx, b *model.Batch, k stmtKey, idx []int32, updatedAt time.Time) error {
-	r.where = k.String()
+	r.where = k
 	bd, err := r.binder(k)
 	if err != nil {
 		return err

@@ -51,3 +51,12 @@ func (d *DB) Classify(err error) (*Error, bool) { return d.red.Classify(err) }
 func (d *DB) Prepare(ctx context.Context, text string) (*sql.Stmt, error) {
 	return d.db.PrepareContext(ctx, text)
 }
+
+// SetPoolSize re-applies the open and idle connection limits. The writer pool
+// derives both from writers.count + 1 (V3 2.2) and calls it from Resize, before
+// it starts any goroutine that would need the extra connection. It does not
+// touch the settings the DB was opened with.
+func (d *DB) SetPoolSize(maxOpen, maxIdle int) {
+	d.db.SetMaxOpenConns(maxOpen)
+	d.db.SetMaxIdleConns(maxIdle)
+}

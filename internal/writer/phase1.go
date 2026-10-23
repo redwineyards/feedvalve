@@ -36,7 +36,7 @@ func (r *runner) phase1(ctx context.Context, tx *sql.Tx, b *model.Batch, updated
 
 // execRun runs one statement identity's rows as a single array exec.
 func (r *runner) execRun(ctx context.Context, tx *sql.Tx, b *model.Batch, k stmtKey, idx []int32, updatedAt time.Time) error {
-	r.where = k.String()
+	r.where = k
 	bd, err := r.binder(k)
 	if err != nil {
 		return err

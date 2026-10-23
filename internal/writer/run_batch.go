@@ -57,6 +57,12 @@ type attempt struct {
 	failure *oradb.Error
 	// panicked: the writer must retire its session and itself (D10).
 	panicked bool
+	// phase2 is true when the attempt reached the scalar re-run; a non-row
+	// failure after it is never retried (D6d).
+	phase2 bool
+	// key is the statement identity being bound or executed when failure
+	// occurred; only ErrStatement uses it (the pool-stop ledger).
+	key stmtKey
 }
 
 // runner is one writer's batch executor. It owns the per-writer scratch (the
@@ -86,7 +92,7 @@ type runner struct {
 	now         func() time.Time // nil means time.Now
 	afterCommit func()           // test seam, called once after a successful commit
 	skipPhase1  bool             // test seam: go straight to phase 2 (V3 self-gate)
-	where       string           // statement identity being bound or executed, for the panic line
+	where       stmtKey          // statement identity being bound or executed: the panic line and ErrStatement's identity
 }
 
 // newRunner builds the executor for writer id. ceiling is maxBatchSizeCeiling.
@@ -156,7 +162,7 @@ func (r *runner) runBatch(ctx context.Context, s *oradb.Session, b *model.Batch)
 			}
 			if r.log != nil {
 				r.log.Errorf(obs.ClassPanicRecovered, "writer: panic recovered writer=%d shard=%d epoch=%d stmt=%s: %v",
-					r.id, b.Shard, b.Epoch, r.where, p)
+					r.id, b.Shard, b.Epoch, r.where.String(), p)
 			}
 			if r.retire != nil {
 				r.retire()
@@ -210,6 +216,7 @@ func (r *runner) runBatch(ctx context.Context, s *oradb.Session, b *model.Batch)
 		}
 	}
 	if toPhase2 {
+		res.phase2 = true
 		if r.run != nil {
 			add(r.run.FallbackPerrow)
 		}
@@ -223,7 +230,7 @@ func (r *runner) runBatch(ctx context.Context, s *oradb.Session, b *model.Batch)
 			b.Err = errors.New("shutdown")
 			return res
 		}
-		b.Err, res.failure, code = cerr, cerr, cerr.Code
+		b.Err, res.failure, res.key, code = cerr, cerr, r.where, cerr.Code
 		if code > 0 && r.oracleErr != nil {
 			r.oracleErr(code)
 		}
