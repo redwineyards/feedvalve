@@ -1,47 +1,32 @@
 package obs
 
 import (
-	"io"
 	"strconv"
 	"sync/atomic"
 	"time"
 )
 
-// Registry is the resolution surface every subsystem receives.
+// Reg is the instrument registry: the whole ledger, resolved, and the
+// resolution surface every subsystem receives.
 //
-// Vol 0 section 8.4 sketches this interface with name-keyed accessors --
-// Counter(name string, labels ...Label) -- and Vol 4 section 1.7 passes it into
-// app.Build. The interface is kept, for the reason section 8.4 gives: it is
-// "the small interface HLD section 10.1 says deferred instrumentation attaches
-// behind", so a later phase can add an implementation that also records a
-// histogram or serves a scrape endpoint without the data path changing.
+// Vol 0 section 8.4 sketches a Registry INTERFACE, as "the small interface HLD
+// section 10.1 says deferred instrumentation attaches behind". It is not
+// declared: it had exactly one implementation and no test double, which
+// CLAUDE.md rules out, and every caller ended up type-asserting back to *Reg
+// for the accessors it did not carry. The day a second backend (a histogram, a
+// scrape endpoint) exists, extract the interface from this type's method set.
 //
-// The KEY changes from a name to an ID, and that is a deliberate departure
-// from the sketch. Section 8.4's own MUST says Registry.Counter is "never
-// called from the receive, shard or writer path -- a per-event map lookup and a
-// []Label allocation on the receive goroutine is exactly the cost ADR-006
-// exists to avoid". A name-keyed accessor can only honour that MUST by
-// convention; an ID-keyed one honours it by construction, and a mistyped
-// instrument becomes a compile error rather than a startup panic. What section
-// 8.4 asks to be substitutable is the BACKEND, not the naming scheme, and a
-// histogram implementation keys off the same ledger.
+// The KEY is an ID, not a name, a deliberate departure from section 8.4's
+// sketch. Its own MUST says the accessors are "never called from the receive,
+// shard or writer path -- a per-event map lookup and a []Label allocation on the
+// receive goroutine is exactly the cost ADR-006 exists to avoid". A name-keyed
+// accessor can only honour that MUST by convention; an ID-keyed one honours it
+// by construction, and a mistyped instrument becomes a compile error rather
+// than a startup panic.
 //
-// Every accessor here is startup-only and panics after Freeze (gate G-OBS-1).
+// Every accessor is startup-only and panics after Freeze (gate G-OBS-1).
 // Callers resolve once and cache the returned pointer in their own struct; the
 // hot path is Counter.Add, which is one atomic instruction.
-type Registry interface {
-	Counter(id ID) *Counter
-	CounterAt(id ID, i int) *Counter
-	CounterAt2(id ID, i, j int) *Counter
-	Max(id ID) *Max
-	MaxAt(id ID, i int) *Max
-	Gauge(id ID) *Gauge
-	GaugeAt(id ID, i int) *Gauge
-	GaugeAt2(id ID, i, j int) *Gauge
-	Emit(w io.Writer) error
-}
-
-// Reg is the one implementation: the whole ledger, resolved.
 //
 // Reg owns no goroutine and holds no context, and that is a scope boundary
 // rather than an omission. Vol 4 section 6.1 puts the 60-second ticker on the
@@ -145,11 +130,9 @@ func New(o Options) *Reg {
 
 // SetIntervalSec records the emission interval for the interval_s= field.
 //
-// Off the Registry interface deliberately: the interval is reloadable
-// (stats.intervalSec), and the lifecycle goroutine that applies a reload is the
-// owner of this value, not any subsystem that merely reports into the registry.
-// Atomic because the reload lands on the lifecycle goroutine while Emit reads
-// it on the stats goroutine.
+// The interval is reloadable (stats.intervalSec), and the lifecycle goroutine
+// that applies a reload is the owner of this value. Atomic because the reload
+// lands on the lifecycle goroutine while Emit reads it on the stats goroutine.
 func (r *Reg) SetIntervalSec(n int) {
 	if n > 0 {
 		r.intervalSec.Store(uint64(n))

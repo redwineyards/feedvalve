@@ -213,7 +213,7 @@ const numMarketTypes = 4
 // {destination,column} label's arity is the destination table's own shape, and
 // it is the same shape obsOptions gave the registry, so the resolution cannot
 // ask for an index obs never allocated.
-func resolveInstruments(reg obs.Registry, cfg *config.Config, dests *destinations.Set) instruments {
+func resolveInstruments(reg *obs.Reg, cfg *config.Config, dests *destinations.Set) instruments {
 	in := resolveStaticInstruments(reg)
 	in.resolveTranscodeInstruments(reg, len(cfg.Transcodes))
 	in.resolveShardInstruments(reg, cfg.Runtime.Shards, dests.Len())
@@ -225,7 +225,7 @@ func resolveInstruments(reg obs.Registry, cfg *config.Config, dests *destination
 
 // resolveSessionInstruments resolves the {market_type} family of the session
 // machine.
-func (in *instruments) resolveSessionInstruments(reg obs.Registry) {
+func (in *instruments) resolveSessionInstruments(reg *obs.Reg) {
 	for i := range numMarketTypes {
 		in.sessionState[i] = reg.GaugeAt(obs.IDSessionState, i)
 		in.sessionTransitions[i] = reg.CounterAt(obs.IDSessionTransitions, i)
@@ -235,7 +235,7 @@ func (in *instruments) resolveSessionInstruments(reg obs.Registry) {
 
 // resolveDestinationInstruments resolves the {destination,column} family, whose
 // arity is ragged: each destination has its own column count.
-func (in *instruments) resolveDestinationInstruments(reg obs.Registry, dests *destinations.Set) {
+func (in *instruments) resolveDestinationInstruments(reg *obs.Reg, dests *destinations.Set) {
 	all := dests.All()
 	in.messageTruncated = make([][]*obs.Counter, len(all))
 	for d := range all {
@@ -250,7 +250,7 @@ func (in *instruments) resolveDestinationInstruments(reg obs.Registry, dests *de
 
 // resolveStaticInstruments resolves everything whose arity is a vocabulary obs
 // owns rather than a number the configuration chose.
-func resolveStaticInstruments(reg obs.Registry) instruments {
+func resolveStaticInstruments(reg *obs.Reg) instruments {
 	return instruments{
 		configGeneration:     reg.Gauge(obs.IDConfigGeneration),
 		configReloads:        reg.Counter(obs.IDConfigReloads),
@@ -304,8 +304,8 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 			obs.HeaderAssetRate: reg.CounterAt(obs.IDMessageHeaderSeen, int(obs.HeaderAssetRate)),
 		},
 
-		unknownTranscode:      unknownTranscodeFunc(reg),
-		unconfiguredTranscode: unconfiguredTranscodeFunc(reg),
+		unknownTranscode:      reg.UnknownTranscode,
+		unconfiguredTranscode: reg.UnconfiguredTranscode,
 
 		seqGapEvents:   reg.Counter(obs.IDSeqGapEvents),
 		seqGapMessages: reg.Counter(obs.IDSeqGapMessages),
@@ -335,7 +335,7 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 // runtime.shards -- the same number obsOptions gave the registry -- and then
 // the mirror's per-shard instrument sets. Runs after
 // resolveTranscodeInstruments, whose per-transcode handles every shard shares.
-func (in *instruments) resolveShardInstruments(reg obs.Registry, shards, dests int) {
+func (in *instruments) resolveShardInstruments(reg *obs.Reg, shards, dests int) {
 	in.shardSendBlocked = make([]*obs.Counter, shards)
 	for k := range shards {
 		in.shardSendBlocked[k] = reg.CounterAt(obs.IDShardSendBlocked, k)
@@ -347,7 +347,7 @@ func (in *instruments) resolveShardInstruments(reg obs.Registry, shards, dests i
 // {destination} arity is the destination table's, the number obsOptions gave
 // the registry. Its own function so a test can resolve the mirror's handles,
 // and only those, against a frozen registry.
-func (in *instruments) resolveMirrorShards(reg obs.Registry, shards, dests int) {
+func (in *instruments) resolveMirrorShards(reg *obs.Reg, shards, dests int) {
 	// flush_wake_dropped{j} for every j, shared: Trigger counts a dropped wake
 	// against the shard it failed to wake, whichever shard called it.
 	wakeDropped := make([]*obs.Counter, shards)
@@ -430,7 +430,7 @@ const (
 // learns from obsOptions and the decoder registry learns from the same
 // configuration -- so the two agree by construction rather than by
 // coincidence, and Build asserts it once both exist.
-func (in *instruments) resolveTranscodeInstruments(reg obs.Registry, n int) {
+func (in *instruments) resolveTranscodeInstruments(reg *obs.Reg, n int) {
 	in.packetsByTranscode = make([]*obs.Counter, n)
 	in.bodyLenMismatch = make([]*obs.Counter, n)
 	in.decompressedLenMismatch = make([]*obs.Counter, n)
@@ -462,36 +462,6 @@ func (in *instruments) resolveTranscodeInstruments(reg obs.Registry, n int) {
 		mt.BlobLenMismatch[i] = reg.CounterAt(obs.IDBlobLenMismatch, i)
 		mt.PrevalidateRejectedTC[i] = reg.CounterAt(obs.IDPrevalidateRejectedTranscode, i)
 	}
-}
-
-// unconfiguredTranscodeFunc adapts obs's second dynamic accessor, the sibling
-// of unknownTranscodeFunc below and for the same reason.
-func unconfiguredTranscodeFunc(reg obs.Registry) func(int) (*obs.Counter, bool) {
-	type unconfiguredResolver interface {
-		UnconfiguredTranscode(code int) (*obs.Counter, bool)
-	}
-	if r, ok := reg.(unconfiguredResolver); ok {
-		return r.UnconfiguredTranscode
-	}
-	var sink obs.Counter
-	return func(int) (*obs.Counter, bool) { return &sink, true }
-}
-
-// unknownTranscodeFunc adapts the one dynamic accessor obs exposes. A closure
-// rather than holding the *obs.Reg, so instruments stays a bag of handles and
-// the receive path cannot reach anything else on the registry.
-func unknownTranscodeFunc(reg obs.Registry) func(int) (*obs.Counter, bool) {
-	type unknownResolver interface {
-		UnknownTranscode(code int) (*obs.Counter, bool)
-	}
-	if r, ok := reg.(unknownResolver); ok {
-		return r.UnknownTranscode
-	}
-	// A registry without the accessor cannot count unknown codes; counting
-	// them under a nil pointer would panic on the receive goroutine, so the
-	// fallback is a no-op counter that is discarded.
-	var sink obs.Counter
-	return func(int) (*obs.Counter, bool) { return &sink, true }
 }
 
 // transcodeSpecs projects the configured inventory into the form decode takes.

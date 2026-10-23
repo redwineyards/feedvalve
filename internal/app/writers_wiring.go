@@ -19,18 +19,10 @@ const maxWriterSlots = 32
 // resolveWriterInstruments resolves the writer pool's handles. Part of
 // resolveInstruments and so before reg.Freeze (G-OBS-1): the writer holds the
 // pointers and never looks one up.
-//
-// The writer's resolvers take the concrete *obs.Reg because OracleError is a
-// method the Registry interface does not carry. Every production registry is
-// one; a test double that is not simply gets no writer handles.
-func (in *instruments) resolveWriterInstruments(reg obs.Registry, dests int) {
-	r, ok := reg.(*obs.Reg)
-	if !ok {
-		return
-	}
-	w := writer.NewInstruments(r, dests)
-	w.ResolveCache(r, maxWriterSlots, dests)
-	w.ResolvePool(r, dests)
+func (in *instruments) resolveWriterInstruments(reg *obs.Reg, dests int) {
+	w := writer.NewInstruments(reg, dests)
+	w.ResolveCache(reg, maxWriterSlots, dests)
+	w.ResolvePool(reg, dests)
 	in.writer = w
 }
 

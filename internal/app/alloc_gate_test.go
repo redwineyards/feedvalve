@@ -41,7 +41,7 @@ import (
 // WHAT THE GATE IS HUNTING, from section 11.4's table: a fmt.Sprintf field name
 // evaluated with tracing off; a newFieldReader returning an escaping pointer; a
 // ReadFrom allocating one *net.UDPAddr per datagram; the active-token set
-// rebuilt rather than cleared; an obs.Registry.Counter(name, labels...) call on
+// rebuilt rather than cleared; an obs.Reg.Counter(id) lookup on
 // the path; a fmt.Errorf in a decoder; and a log call whose arguments are built
 // before the rate-limit check.
 

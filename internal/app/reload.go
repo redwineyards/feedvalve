@@ -292,13 +292,10 @@ func (g *Graph) applyLive(prev, next *config.Config) (applied, failed []string) 
 		ok("debug")
 	}
 	if prev.Stats.IntervalSec != next.Stats.IntervalSec {
-		// Reg.SetIntervalSec is off the Registry interface on purpose (it is
-		// the lifecycle that applies a reload); the stats timers re-arm on
-		// their own, within one old interval.
-		if r, isReg := g.deps.Reg.(interface{ SetIntervalSec(int) }); isReg {
-			r.SetIntervalSec(next.Stats.IntervalSec)
-			ok("stats.intervalSec")
-		}
+		// The stats timers re-arm on their own, within one old interval; this
+		// only updates the interval_s= field the emission line reports.
+		g.deps.Reg.SetIntervalSec(next.Stats.IntervalSec)
+		ok("stats.intervalSec")
 	}
 
 	if prev.Writers.Count != next.Writers.Count && g.pool != nil {

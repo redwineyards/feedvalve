@@ -142,7 +142,7 @@ func (r *receiver) gapSlot(code model.TransCode) int {
 	if s := r.rt.Reg.Slot(code); s >= 0 {
 		return s
 	}
-	slot, ok := r.g.unknownSlot(int(code))
+	slot, ok := r.g.deps.Reg.UnknownTranscodeSlot(int(code))
 	if !ok {
 		return -1
 	}
