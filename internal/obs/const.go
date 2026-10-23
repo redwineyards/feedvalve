@@ -70,26 +70,6 @@ const (
 	// least once every tenth interval, so a trend never has an unbounded gap
 	// and a value that has been zero all night is still visible as zero.
 	forcedEmitEvery = 10
-
-	// padStride is the slot stride, in instruments, for the label dimensions
-	// several goroutines write concurrently.
-	//
-	// The ppc64 cache line is 128 bytes, not 64 (Vol 0 section 9.5 sizes QD's
-	// head and tail against it), and an atomic.Uint64 is 8 bytes, so sixteen
-	// adjacent slots share one line. rows_created{destination} is incremented
-	// by all four shard goroutines into three adjacent words at row rate, and
-	// dirty_depth{k,destination} and shard_loop_max_ns{k} are written by the
-	// shard that owns k. Unpadded, every one of those writes invalidates the
-	// line the other three shards are using.
-	//
-	// This is an addition, not a requirement: no gate asks for it and the
-	// contract does not mention instrument padding. It is here because Vol 4
-	// section 6.7 is explicit that there is no profiler and no metrics agent
-	// on AIX, so a false-sharing stall is the class of problem that never gets
-	// found on the machine it happens on. Applied only to the three dimensions
-	// with concurrent writers; the cost is about 25 KB against a 189 MB arena
-	// budget.
-	padStride = 16
 )
 
 // Gate G-BLD-2, in the two-sided form of model/const.go and Vol 0 section 2
@@ -108,7 +88,6 @@ const (
 	_ = uint(oracleErrorSlots-24) + uint(24-oracleErrorSlots)
 	_ = uint(maxWriters-32) + uint(32-maxWriters)
 	_ = uint(forcedEmitEvery-10) + uint(10-forcedEmitEvery)
-	_ = uint(padStride-16) + uint(16-padStride)
 )
 
 // unknownTranscodeSlots must be a power of two: the open-addressed table masks

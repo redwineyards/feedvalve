@@ -108,7 +108,7 @@ func New(o Options) *Reg {
 	var nc, nm, ng uint32
 	for id := range numInstruments {
 		d := &r.dims[ledger[id].dim]
-		n := d.size * d.stride
+		n := d.size
 		switch ledger[id].shape {
 		case shapeCounter:
 			r.base[id] = nc
@@ -195,7 +195,7 @@ func (r *Reg) renderPrefixes(s shape, n int) []string {
 			continue
 		}
 		for i := range d.size {
-			out[r.base[id]+i*d.stride] = ledger[id].name + d.labels[i] + "="
+			out[r.base[id]+i] = ledger[id].name + d.labels[i] + "="
 		}
 	}
 	return out
@@ -388,7 +388,7 @@ func (r *Reg) resolve(id ID, want shape, labels, i, j int) uint32 {
 		}
 		off = uint32(i)*d.inner + uint32(j)
 	}
-	return r.base[id] + off*d.stride
+	return r.base[id] + off
 }
 
 func outOfRange(name, brace string, got int, size uint32) string {

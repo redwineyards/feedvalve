@@ -93,7 +93,7 @@ func (r *Reg) snapshot() [numGroups]bool {
 		g := row.group
 
 		for i := range d.size {
-			off := r.base[id] + i*d.stride
+			off := r.base[id] + i
 			switch row.shape {
 			case shapeCounter:
 				// curC still holds the previous emission's value until it is
@@ -173,7 +173,7 @@ func (r *Reg) appendInstrument(id ID, force bool) {
 	d := &r.dims[row.dim]
 
 	for i := range d.size {
-		off := r.base[id] + i*d.stride
+		off := r.base[id] + i
 
 		// Sparsity: a high-cardinality slot prints only when it carries data.
 		// Without this, the three {destination,column} instruments alone would

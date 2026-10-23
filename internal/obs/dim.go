@@ -249,36 +249,31 @@ type dimSpec struct {
 	brace string
 
 	kind dimKind
-
-	// stride is the number of slab entries reserved per logical slot. One
-	// everywhere except the three dimensions written by several goroutines at
-	// once, where it is padStride; see the comment on padStride.
-	stride uint32
 }
 
 var dimSpecs = [numDims]dimSpec{
-	dimNone:             {brace: "", kind: dimDense, stride: 1},
-	dimShard:            {brace: "{k}", kind: dimDense, stride: padStride},
-	dimDest:             {brace: "{destination}", kind: dimDense, stride: padStride},
-	dimShardDest:        {brace: "{k,destination}", kind: dimDense, stride: padStride},
-	dimTranscode:        {brace: "{code}", kind: dimDense, stride: 1},
-	dimUnknownCode:      {brace: "{code}", kind: dimDynamic, stride: 1},
-	dimHeaderCode:       {brace: "{code}", kind: dimDense, stride: 1},
-	dimOracleCode:       {brace: "{code}", kind: dimDynamic, stride: 1},
-	dimMarketType:       {brace: "{market_type}", kind: dimDense, stride: 1},
-	dimHypothesis:       {brace: "{hypothesis}", kind: dimDense, stride: 1},
-	dimRetryClass:       {brace: "{class}", kind: dimDense, stride: 1},
-	dimLogClass:         {brace: "{class}", kind: dimDense, stride: 1},
-	dimPanicStage:       {brace: "{stage}", kind: dimDense, stride: 1},
-	dimPayloadStage:     {brace: "{stage}", kind: dimDense, stride: 1},
-	dimDecompressReason: {brace: "{reason}", kind: dimDense, stride: 1},
-	dimRecycleReason:    {brace: "{reason}", kind: dimDense, stride: 1},
-	dimDestReason:       {brace: "{destination,reason}", kind: dimDense, stride: 1},
-	dimProbeResult:      {brace: "{result}", kind: dimDense, stride: 1},
+	dimNone:             {brace: "", kind: dimDense},
+	dimShard:            {brace: "{k}", kind: dimDense},
+	dimDest:             {brace: "{destination}", kind: dimDense},
+	dimShardDest:        {brace: "{k,destination}", kind: dimDense},
+	dimTranscode:        {brace: "{code}", kind: dimDense},
+	dimUnknownCode:      {brace: "{code}", kind: dimDynamic},
+	dimHeaderCode:       {brace: "{code}", kind: dimDense},
+	dimOracleCode:       {brace: "{code}", kind: dimDynamic},
+	dimMarketType:       {brace: "{market_type}", kind: dimDense},
+	dimHypothesis:       {brace: "{hypothesis}", kind: dimDense},
+	dimRetryClass:       {brace: "{class}", kind: dimDense},
+	dimLogClass:         {brace: "{class}", kind: dimDense},
+	dimPanicStage:       {brace: "{stage}", kind: dimDense},
+	dimPayloadStage:     {brace: "{stage}", kind: dimDense},
+	dimDecompressReason: {brace: "{reason}", kind: dimDense},
+	dimRecycleReason:    {brace: "{reason}", kind: dimDense},
+	dimDestReason:       {brace: "{destination,reason}", kind: dimDense},
+	dimProbeResult:      {brace: "{result}", kind: dimDense},
 	// {writer} is sized to the reloadable maximum, so most slots are empty on
 	// any given run; sparse is the only sensible kind for it.
-	dimWriter:     {brace: "{writer}", kind: dimSparse, stride: 1},
-	dimDestColumn: {brace: "{destination,column}", kind: dimSparse, stride: 1},
+	dimWriter:     {brace: "{writer}", kind: dimSparse},
+	dimDestColumn: {brace: "{destination,column}", kind: dimSparse},
 }
 
 // Options is everything obs needs from the rest of the process, as plain

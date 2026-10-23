@@ -126,10 +126,10 @@ func TestSameKeyResolvesToTheSamePointer(t *testing.T) {
 // TestEveryLabelledSlotIsDistinct walks the whole ledger and proves no two
 // slots alias.
 //
-// Slab offsets are computed arithmetic over runtime arities and a padding
-// stride, which is exactly the kind of code that is subtly wrong rather than
-// obviously wrong: an off-by-one in the stride would make shard 3's counter
-// land on shard 0's, and every individual value would still look plausible.
+// Slab offsets are computed arithmetic over runtime arities, which is exactly
+// the kind of code that is subtly wrong rather than obviously wrong: an
+// off-by-one in a base would make shard 3's counter land on shard 0's, and
+// every individual value would still look plausible.
 func TestEveryLabelledSlotIsDistinct(t *testing.T) {
 	r := New(testOptions())
 	seenC := map[*Counter]string{}
@@ -140,7 +140,7 @@ func TestEveryLabelledSlotIsDistinct(t *testing.T) {
 		row := &ledger[id]
 		d := &r.dims[row.dim]
 		for i := range d.size {
-			off := r.base[id] + i*d.stride
+			off := r.base[id] + i
 			where := row.name + "[" + itoa(int(i)) + "]"
 			switch row.shape {
 			case shapeCounter:
@@ -210,28 +210,6 @@ func TestLabelOutOfRangePanics(t *testing.T) {
 	})
 	if !strings.Contains(msg, "0..3") {
 		t.Errorf("the panic does not state the valid range: %q", msg)
-	}
-}
-
-// TestPaddedDimensionsAreSpacedAcrossCacheLines pins the false-sharing
-// decision, because it is invisible in behaviour and would otherwise be
-// "tidied" away by someone reading the stride as redundant.
-func TestPaddedDimensionsAreSpacedAcrossCacheLines(t *testing.T) {
-	r := New(testOptions())
-	for _, id := range []ID{IDFlushOnTick, IDRowsCreated} {
-		d := &r.dims[ledger[id].dim]
-		if d.stride != padStride {
-			t.Errorf("%s is labelled %s, which several goroutines write concurrently, "+
-				"but its stride is %d rather than padStride. Sixteen atomic.Uint64s "+
-				"share one 128-byte ppc64 cache line, and Vol 4 section 6.7 says there "+
-				"is no profiler on that platform to find the stall with",
-				ledger[id].name, d.brace, d.stride)
-		}
-	}
-	// And the unpadded ones stay unpadded: padding every dimension would waste
-	// the slab for no benefit, since most labels have a single writer.
-	if got := r.dims[dimPanicStage].stride; got != 1 {
-		t.Errorf("{stage} stride = %d, want 1", got)
 	}
 }
 
