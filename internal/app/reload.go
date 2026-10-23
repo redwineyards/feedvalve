@@ -167,13 +167,13 @@ func (g *Graph) reload() reloadOutcome {
 		return g.rejectReload(registryError(err))
 	}
 	if reg.Len() != len(next.Transcodes) {
-		return g.rejectReload(errors.New("internal: the registry resolved "+strconv.Itoa(reg.Len())+" of "+
-			strconv.Itoa(len(next.Transcodes))+" configured transcodes"))
+		return g.rejectReload(errors.New("internal: the registry resolved " + strconv.Itoa(reg.Len()) + " of " +
+			strconv.Itoa(len(next.Transcodes)) + " configured transcodes"))
 	}
 	cnt.setRegistry(reg)
 	rt, err := newRuntime(next, reg, dests)
 	if err != nil {
-		return g.rejectReload(errors.New("parsing udp.sourceAllowList: "+err.Error()))
+		return g.rejectReload(errors.New("parsing udp.sourceAllowList: " + err.Error()))
 	}
 
 	// Step 4: ONE publication sequence (D1). Swap assigns the generation, so
@@ -269,11 +269,11 @@ func (g *Graph) applyLive(prev, next *config.Config) (applied, failed []string) 
 
 	if db := g.deps.DB; db != nil {
 		if prev.DB.ConnMaxLifetimeMinutes != next.DB.ConnMaxLifetimeMinutes {
-			db.SetConnMaxLifetime(time.Duration(next.DB.ConnMaxLifetimeMinutes)*time.Minute)
+			db.SetConnMaxLifetime(time.Duration(next.DB.ConnMaxLifetimeMinutes) * time.Minute)
 			ok("db.connMaxLifetimeMinutes")
 		}
 		if prev.DB.ConnectTimeoutSec != next.DB.ConnectTimeoutSec {
-			db.SetConnectTimeout(time.Duration(next.DB.ConnectTimeoutSec)*time.Second)
+			db.SetConnectTimeout(time.Duration(next.DB.ConnectTimeoutSec) * time.Second)
 			ok("db.connectTimeoutSec")
 		}
 	}

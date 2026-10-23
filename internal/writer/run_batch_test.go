@@ -19,13 +19,13 @@ import (
 
 // rig is a runner wired to an oratest fake, a frozen registry and a session.
 type rig struct {
-	t       *testing.T
-	f       *oratest.Fake
-	db      *oradb.DB
-	reg     *obs.Reg
-	r       *runner
-	s       *oradb.Session
-	unrep   *obs.Counter
+	t     *testing.T
+	f     *oratest.Fake
+	db    *oradb.DB
+	reg   *obs.Reg
+	r     *runner
+	s     *oradb.Session
+	unrep *obs.Counter
 
 	clockCalls int // calls made to the runner's clock
 }
