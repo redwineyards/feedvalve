@@ -13,8 +13,9 @@ import "math/bits"
 // phase (ADR-006). A destination whose natural key does not fit 64 bits is
 // rejected by -selfcheck rather than silently truncated.
 //
-// Build one with SingleKey or CompositeKey. Converting directly is how the
-// sign-extension bug gets in; see SingleKey.
+// Build one with SingleKey. Converting directly is how the sign-extension bug
+// gets in; see SingleKey. No destination declares a composite key, so there is
+// no constructor for one.
 type RowKey uint64
 
 // SingleKey encodes a single 32-bit key -- a token, a market type -- into the
@@ -28,15 +29,7 @@ type RowKey uint64
 // section 3.2 requires.
 func SingleKey(v uint32) RowKey { return RowKey(v) }
 
-// CompositeKey encodes two 32-bit components, a in the high half and b in the
-// low half. Same zero-extension rule as SingleKey.
-func CompositeKey(a, b uint32) RowKey { return RowKey(a)<<32 | RowKey(b) }
-
-// Hi returns the high 32 bits -- the first component of a composite key.
-func (k RowKey) Hi() uint32 { return uint32(k >> 32) }
-
-// Lo returns the low 32 bits: the whole of a single key, or the second
-// component of a composite one.
+// Lo returns the low 32 bits: the whole of a single key.
 func (k RowKey) Lo() uint32 { return uint32(k) }
 
 // ColMask is a bitset over one destination's maskable fields.

@@ -215,13 +215,8 @@ func TestRowKeyIsZeroExtended(t *testing.T) {
 			"sign-extension hazard this constructor exists for has gone away, " +
 			"or the test is wrong")
 	}
-
-	if got := CompositeKey(0xDEADBEEF, 0x0000002A); got != 0xDEADBEEF0000002A {
-		t.Errorf("CompositeKey = %#016x, want 0xdeadbeef0000002a", uint64(got))
-	}
-	k := CompositeKey(7, 9)
-	if k.Hi() != 7 || k.Lo() != 9 {
-		t.Errorf("Hi/Lo round trip = (%d, %d), want (7, 9)", k.Hi(), k.Lo())
+	if got := SingleKey(uint32(token)).Lo(); got != 0xFFFFFFFF {
+		t.Errorf("SingleKey(...).Lo() = %#x, want 0xffffffff", got)
 	}
 }
 

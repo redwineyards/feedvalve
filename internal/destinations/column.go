@@ -149,8 +149,7 @@ func (r RowKeyRule) String() string {
 // parseRowKey resolves a mapping-file row-key rule.
 //
 // Vol 0 section 7.2 also allows "a declared composite". None of the three
-// destinations needs one, and RowKey already encodes the two-component form
-// (model.CompositeKey), so the parser rejects anything else by name rather
+// destinations needs one, so the parser rejects anything else by name rather
 // than guessing -- a row key silently defaulting to the wrong field is exactly
 // the ASM-15 failure.
 func parseRowKey(s string) (RowKeyRule, error) {
