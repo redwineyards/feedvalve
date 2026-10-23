@@ -86,8 +86,6 @@ type runner struct {
 	// oracleErr counts oracle_error{code}; the caller passes a func taken
 	// from the concrete registry. nil is fine.
 	oracleErr func(code int)
-	// retire is called when a panic means the session's state is unknown.
-	retire func()
 
 	now         func() time.Time // nil means time.Now
 	afterCommit func()           // test seam, called once after a successful commit
@@ -133,8 +131,9 @@ func (r *runner) binder(k stmtKey) (*Binder, error) {
 //   - context.Canceled: shutdown, not a failure. Err "shutdown", Failed rows,
 //     nothing counted;
 //   - a panic: recovered here, outside ExecTx, which has already rolled back
-//     and re-panicked. Err "writer panic", the session retired, the panic
-//     counted, Pending rows Failed. A row already Committed stays so.
+//     and re-panicked. Err "writer panic", panicked reported so the caller
+//     retires the writer and its session, the panic counted, Pending rows
+//     Failed. A row already Committed stays so.
 //
 // N == 0 is a no-op success: nothing is bound, no transaction is begun and an
 // Err already on b is left as it was. N outside Rows sets Err and fails the
@@ -164,9 +163,6 @@ func (r *runner) runBatch(ctx context.Context, s *oradb.Session, b *model.Batch)
 			if r.log != nil {
 				r.log.Errorf(obs.ClassPanicRecovered, "writer: panic recovered writer=%d shard=%d epoch=%d stmt=%s: %v",
 					r.id, b.Shard, b.Epoch, r.where.String(), p)
-			}
-			if r.retire != nil {
-				r.retire()
 			}
 		}
 		if b.Err == nil {

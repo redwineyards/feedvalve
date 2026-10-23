@@ -25,7 +25,6 @@ type rig struct {
 	reg     *obs.Reg
 	r       *runner
 	s       *oradb.Session
-	retired int
 	unrep   *obs.Counter
 
 	clockCalls int // calls made to the runner's clock
@@ -48,7 +47,6 @@ func newRig(t *testing.T) *rig {
 	g.r = newRunner(0, db, destSet(t), cache, rigCeiling, 30*time.Second)
 	g.r.inst, g.r.run = in, run
 	g.r.oracleErr = func(code int) { reg.OracleError(code).Add(1) }
-	g.r.retire = func() { g.retired++ }
 	g.r.now = func() time.Time {
 		g.clockCalls++
 		return testUpdatedAt.Add(time.Duration(g.clockCalls-1) * time.Second)
@@ -162,8 +160,8 @@ func TestG_ROW_1_RunBatchCommitsEveryRowOnce(t *testing.T) {
 			t.Errorf("rows_written{%d} = %d, want %d", d, got, want)
 		}
 	}
-	if g.panics() != 0 || g.retired != 0 {
-		t.Errorf("panics=%d retired=%d on a clean batch", g.panics(), g.retired)
+	if g.panics() != 0 || res.panicked {
+		t.Errorf("panics=%d panicked=%v on a clean batch", g.panics(), res.panicked)
 	}
 	if g.r.run.Busy.Load() != 0 {
 		t.Errorf("writers_busy = %d after the batch", g.r.run.Busy.Load())
@@ -255,6 +253,7 @@ func TestRunBatchPanicSweep(t *testing.T) {
 			tc.setup(g)
 			b := standard()
 			calls := 0
+			var res attempt
 			func() {
 				defer func() {
 					if p := recover(); p != nil {
@@ -262,7 +261,7 @@ func TestRunBatchPanicSweep(t *testing.T) {
 					}
 				}()
 				calls++
-				g.r.runBatch(context.Background(), g.s, b)
+				res = g.r.runBatch(context.Background(), g.s, b)
 			}()
 			if calls != 1 {
 				t.Fatalf("runBatch ran %d times", calls)
@@ -273,8 +272,8 @@ func TestRunBatchPanicSweep(t *testing.T) {
 			if got, want := outcomes(b), all(7, model.OutcomeFailed); !reflect.DeepEqual(got, want) {
 				t.Errorf("outcomes %v, want all failed", got)
 			}
-			if g.panics() != 1 || g.retired != 1 {
-				t.Errorf("panics=%d retired=%d, want 1/1", g.panics(), g.retired)
+			if g.panics() != 1 || !res.panicked {
+				t.Errorf("panics=%d panicked=%v, want 1/true", g.panics(), res.panicked)
 			}
 			if g.r.run.Busy.Load() != 0 {
 				t.Errorf("writers_busy = %d after a panic", g.r.run.Busy.Load())
@@ -297,7 +296,7 @@ func TestRunBatchPanicAfterCommitKeepsCommitted(t *testing.T) {
 	g := newRig(t)
 	g.r.afterCommit = func() { panic("after commit") }
 	b := standard()
-	g.r.runBatch(context.Background(), g.s, b)
+	res := g.r.runBatch(context.Background(), g.s, b)
 
 	if b.Err == nil || b.Err.Error() != "writer panic" {
 		t.Errorf("Err = %v, want writer panic", b.Err)
@@ -305,8 +304,8 @@ func TestRunBatchPanicAfterCommitKeepsCommitted(t *testing.T) {
 	if got, want := outcomes(b), all(7, model.OutcomeCommitted); !reflect.DeepEqual(got, want) {
 		t.Errorf("outcomes %v, want all committed", got)
 	}
-	if g.panics() != 1 || g.retired != 1 {
-		t.Errorf("panics=%d retired=%d, want 1/1", g.panics(), g.retired)
+	if g.panics() != 1 || !res.panicked {
+		t.Errorf("panics=%d panicked=%v, want 1/true", g.panics(), res.panicked)
 	}
 }
 
@@ -416,8 +415,8 @@ func TestRunBatchCanceledIsShutdownNotFailure(t *testing.T) {
 					t.Errorf("row %d ErrCode %d on shutdown", i, r.ErrCode)
 				}
 			}
-			if g.panics() != 0 || g.retired != 0 {
-				t.Errorf("panics=%d retired=%d", g.panics(), g.retired)
+			if g.panics() != 0 {
+				t.Errorf("panics=%d", g.panics())
 			}
 			for d := 0; d < 3; d++ {
 				if g.rowsWritten(d) != 0 {
