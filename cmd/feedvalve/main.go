@@ -11,8 +11,10 @@
 //	            Does NOT connect and does NOT require FEEDVALVE_DB_PASSWORD,
 //	            so it is usable from a build host that has neither.
 //	-dbcheck    Connect, prove a round trip with SELECT 1 FROM dual, report
-//	            the server version, then exit. Read-only. Requires the
-//	            password.
+//	            the server version, then compare the destination tables'
+//	            catalogue with the field map (Vol 0 section 7.6) and exit
+//	            non-zero on any mismatch, NOT NULL data columns included.
+//	            Read-only. Requires the password.
 //
 // There is no password flag and there will never be one: flags are visible in
 // ps to every user on the host. The password comes only from

@@ -9,7 +9,7 @@ CREATE TABLE md_market_status (
   transcode NUMBER(5),
   message_len NUMBER(5),
   message_text VARCHAR2(128),
-  bcast_destination NUMBER(5),
+  bcast_destination VARCHAR2(2),
   token NUMBER(10),
   effective_ts TIMESTAMP,
   updated_at TIMESTAMP NOT NULL,

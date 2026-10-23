@@ -148,7 +148,7 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 	case opts.SelfCheck:
 		return selfCheck(cfg, dests, out)
 	case opts.DBCheck:
-		return dbCheck(ctx, cfg, out)
+		return dbCheck(ctx, cfg, dests, out)
 	}
 
 	return relay(ctx, opts, cfg, dests)
@@ -228,6 +228,9 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 			}
 		}()
 		lg.Infof("database connected %s", cfg.DB.Describe())
+		// Vol 0 7.6: one ERROR per mismatch, then proceed. A DBA fix must
+		// not need a redeploy.
+		logCatalogue(ctx, lg, db, dests)
 	}
 
 	// Steps 10 and 12: the derived state and the pre-allocation.
@@ -390,19 +393,44 @@ func passwordState() string {
 	return "not set -- required by -dbcheck and at startup, not by -selfcheck"
 }
 
-// dbCheck connects, proves a round trip and reports the server version. It
-// writes nothing to the database.
-func dbCheck(ctx context.Context, cfg *config.Config, out io.Writer) error {
+// checkDB is oradb.Check behind a variable, for the same reason as openDB:
+// tests substitute an oratest-backed round trip.
+var checkDB = oradb.Check
+
+// dbCheck connects, proves a round trip, reports the server version and runs
+// the catalogue check (Vol 0 7.6). It writes nothing to the database. Unlike
+// startup, any catalogue finding fails it: it is the pre-deployment gate.
+func dbCheck(ctx context.Context, cfg *config.Config, dests *destinations.Set, out io.Writer) error {
 	// No "is a db configured?" check here: rule V-DB1 in ModeDBCheck has
 	// already rejected that case during load, and a second check would be
 	// a second place for the answer to change.
 	fmt.Fprintf(out, "dbcheck: connecting to %s\n", cfg.DB.Describe())
 
-	version, err := oradb.Check(ctx, cfg.DB)
+	version, err := checkDB(ctx, cfg.DB)
 	if err != nil {
 		return &ExitError{Code: ExitStartup, Err: err}
 	}
+	fmt.Fprintf(out, "dbcheck: round trip OK\ndbcheck: server %s\n", version)
 
-	fmt.Fprintf(out, "dbcheck: round trip OK\ndbcheck: server %s\ndbcheck: PASSED\n", version)
+	db, err := openDB(ctx, cfg.DB)
+	if err != nil {
+		return &ExitError{Code: ExitStartup, Err: err}
+	}
+	defer db.Close()
+
+	findings, err := catalogueFindings(ctx, db, dests)
+	if err != nil {
+		return &ExitError{Code: ExitStartup, Err: err}
+	}
+	for _, f := range findings {
+		fmt.Fprintf(out, "dbcheck: catalogue: %s\n", f)
+	}
+	if len(findings) > 0 {
+		return &ExitError{Code: ExitStartup, Reported: true,
+			Err: fmt.Errorf("dbcheck: FAILED: %d catalogue mismatch(es) against the field map", len(findings))}
+	}
+
+	fmt.Fprintln(out, "dbcheck: catalogue matches the field map")
+	fmt.Fprintln(out, "dbcheck: PASSED")
 	return nil
 }

@@ -2040,6 +2040,57 @@ Startup behaviour: if a `db` object is present and `FEEDVALVE_DB_PASSWORD` is un
 cleanup intact, because startup returns errors rather than calling `Fatalf` (CLAUDE.md;
 `poc/gobrdclnt.go:19-28`). `-selfcheck` does not require the variable; `-dbcheck` does.
 
+### 7.6 Catalogue check
+
+The DDL in Vol 3 §10 is documentation: the application never issues `CREATE` (ruling D8). So the
+mapping (§4) and the real tables can drift, and the drift is silent until a row is refused. The
+catalogue check compares the one against the other **before** that happens. It is the check §5A.5
+refers to when it calls `rows_rejected_by_oracle_unpredicted` "a gap the catalogue check should have
+caught".
+
+**Where it runs.** `-dbcheck` (after the round trip) and relay startup (after the database opens,
+before the writers start). It reads only; it needs `SELECT` on `ALL_TAB_COLUMNS`, which every
+account has for the objects it can see.
+
+**Query.** One per destination table, a fixed text with a positional bind:
+
+```sql
+SELECT table_name, column_name, data_type, data_precision, data_length, nullable
+  FROM all_tab_columns
+ WHERE owner = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AND table_name = :1
+ ORDER BY column_id
+```
+
+The owner filter is not optional. `ALL_TAB_COLUMNS` lists every table the account can *see*, so
+without it a same-named table in another schema, granted to the writer, would be compared and could
+make a wrong table pass. `CURRENT_SCHEMA` rather than the login name, because that is the schema an
+unqualified `md_token_quote` in a MERGE resolves to. Table names are passed upper-case; column
+names are compared case-insensitively.
+
+**Layering.** `oradb` returns neutral rows (`CatalogColumn`: table, column, data type, precision,
+byte length, nullable) and does not import `destinations`. The comparison is a pure function in
+`app`, the only package that sees both. A missing table is a table with no rows.
+
+**What is compared**, for the key column, `updated_at` and every SQL name of every mapped column:
+
+| Finding | Rule |
+|---|---|
+| missing table | the query returned no rows for it |
+| missing column | the name is absent from the table |
+| type family | `NUMBER` column (`sqlPrecision` > 0, a `long`/`short`/`double` kind, any ladder group column) must be `NUMBER`; character (`sqlMaxBytes` > 0) must be `VARCHAR2` or `CHAR`; `time1980` and `updated_at` must be `TIMESTAMP*` |
+| short precision | catalogue `DATA_PRECISION` is less than `sqlPrecision` (NULL precision, i.e. a bare `NUMBER`, passes) |
+| short varchar | catalogue `DATA_LENGTH` (bytes) is less than `sqlMaxBytes` |
+| NOT NULL data column | any data column that is not nullable (Vol 3 §10.4: a NOT NULL data column turns the first partial-mask insert into `ORA-01400`, permanently). The key and `updated_at` are the only columns allowed to be NOT NULL and are not flagged |
+
+Not compared: scale, `CHECK` domains, grants, indexes. Ladder group columns are checked for family
+and nullability only, because the mapping carries one `sqlPrecision` for the group, not one per
+element.
+
+**Outcome.** Every finding is one line naming table, column and the fault. `-dbcheck` exits
+non-zero (`ExitStartup`) if there is any finding or if the catalogue could not be read. Startup
+logs **one ERROR per finding and proceeds**: the fix is DDL by a DBA, and it must not need a
+redeploy. A failure to read the catalogue at startup is one ERROR, also non-fatal.
+
 ---
 
 ## 8. Instrument ledger

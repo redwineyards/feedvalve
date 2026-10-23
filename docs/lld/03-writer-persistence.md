@@ -1697,7 +1697,7 @@ erDiagram
         NUMBER transcode "NUMBER(5): which of 6511 6521 6522 6531 6571 wrote last"
         NUMBER message_len "NUMBER(5), BroadcastMessageLength, clamped to 128"
         VARCHAR2 message_text "VARCHAR2(128), valid prefix only, bible 4.5"
-        NUMBER bcast_destination "NUMBER(5)"
+        VARCHAR2 bcast_destination "VARCHAR2(2), raw 2-byte text, as bound"
         NUMBER token "NUMBER(10), msg offset 40 - kept to settle OQ-L2"
         TIMESTAMP effective_ts "FR11"
         TIMESTAMP updated_at "writer clock"
@@ -1772,7 +1772,7 @@ CREATE TABLE md_market_status (
   transcode             NUMBER(5),
   message_len           NUMBER(5),
   message_text          VARCHAR2(128),
-  bcast_destination     NUMBER(5),
+  bcast_destination     VARCHAR2(2),
   token                 NUMBER(10),
   effective_ts          TIMESTAMP,
   updated_at            TIMESTAMP      NOT NULL,
