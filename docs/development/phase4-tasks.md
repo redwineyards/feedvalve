@@ -1,6 +1,6 @@
 # Phase 4: the writer and persistence (Vol 3)
 
-Status: plan, not started. Branch `phase4`, cut from `phase3` (`9df2ed3`).
+Status: complete (all fifteen cards; see section 9, "As built"). Branch `phase4`, cut from `phase3` (`9df2ed3`).
 Spec: `docs/lld/03-writer-persistence.md`. Gates: `docs/lld/04-lifecycle-ops.md` §7.
 Shape follows `phase3-tasks.md`.
 
@@ -376,6 +376,11 @@ Critical path: 04 → 05 → 06 → 07a → 07b → 09 → 10 → 11 → 14.
 - `-selfcheck` generates every statement with no DB; the catalogue check runs in `-dbcheck`.
 - No password, DSN, bind value or statement text in writer logs.
 - `poc` still builds; its `-debug` line format is untouched.
+- One recorded `-race -tags feedvalve_assert` run of `TestG_RACE_3_WholePipeline...` with
+  `-feedvalve.race3 60s` (G-RACE-3's stated duration; the default 10 s run does not meet it). Done
+  2026-10-23 (section 9).
+- Phase close-out commit (not a card) owns the errata that touch no `docs/lld` file: author Vol 0 §7.6,
+  and correct the `oradb/doc.go` and `writer/doc.go` import claims. Open until that commit.
 - CLAUDE.md updated (writer, oradb, oratest, `db/schema`); errata applied in one commit; the
   integration test skips cleanly without a DSN.
 
@@ -389,3 +394,60 @@ sits in P4-09; the B-V3b test is deterministic; a post-send no-touch test and a 
 were added; the catalogue query is owner-filtered; AIX is checked per card; assert files live in
 P4-09; `oracle_error` uses an injected method value; `keyColumn` sits beside `RowKeyRule`; the
 D13 versus V3 §7.1 erratum is recorded.
+
+## 9. As built
+
+Deviations accepted during the phase. None changes a gate's claim; each is recorded so the next reader
+does not rediscover it.
+
+- **`RunInstruments` is held in `Instruments.Run`** (a `*RunInstruments` field resolved by
+  `ResolvePool`), not as a separate argument to `NewPool`. One struct of handles, ruling D5, at the cost
+  of the batch-execution handles being reachable from the pool-level set.
+- **G-CFG-7 does not assert `MaxIdle`.** It pins the pool size (`writers+1` open) and its live
+  reapplication; the idle limit is set from the same call and is not read back by the test.
+- **The dead-database test uses `failFastSeconds = 1`** rather than the default 30, so the
+  fail-fast path runs in a second of wall time. The budget logic is clock-injected elsewhere; this test
+  proves the wiring, not the 30 s figure.
+- **A retry double-counts `batch_row_empty_mask` and `bind_bad_time`.** A retried batch is grouped and
+  bound again, so a row with an empty mask, or a bad time, is counted once per attempt. The counters are
+  diagnostics of a defect, not accounting; an exact count would need a per-batch latch the card did not
+  ask for.
+- **`ExecTx` rollback has a deadlock risk if a driver call panics.** The writer's recover sits outside
+  `ExecTx` (D10) and the oratest driver cannot reproduce a panic inside the real driver's own state, so
+  the path is reasoned about and not tested. Accepted; recorded here as a known risk.
+- **G-LIFE-3 ordering is indirect.** "Writers join before `db.Close`" is asserted through the fake's
+  connection-close counter sampled by each operation (no operation begins after the first close), not
+  through a direct ordering hook, because `db.Close` is deferred in `run`.
+- **P4-14: the pipeline stress is 10 s by default, not 60 s.** `-feedvalve.race3 60s` runs the gate's
+  figure (as `-feedvalve.stress` does for G-RACE-3); `-short` takes 2 s. A 60 s default would add a
+  minute to every `go test ./internal/app`. A 60 s `-race -tags feedvalve_assert` run passed (2026-10-23).
+- **P4-14: the utilisation figure.** The card says a 5 ms commit stub gives "about 11% busy". V3 §1.2's
+  arithmetic gives 10.7% for a **20 ms** commit (20 batches/s x (1.4 + 20) ms / 4 writers); with 5 ms it
+  is 3.2%. `TestPoolUtilisationAt5000RowsPerSecond` runs both and checks each against its own arithmetic
+  (measured 4.7% and 12.5% against 3.5% and 11.3%).
+- **P4-14: G-MASK-1 and G-ORD-1 end to end compare `last_traded_price` only**, the one column the stress
+  feed varies; every other column is constant, so a lost column other than that one would not show.
+  The fake database keeps its own books from the statements (value durable at COMMIT, dropped at
+  ROLLBACK), read from the statement text and not from the code under test's `BindPlan`.
+- **P4-14: jitter sites and G-RACE-2 coverage.** Explicit 0-100 us jitter is at socket send and QD to
+  decoder only; the shard to `batchQ` and return boundaries are perturbed by the database's per-statement
+  delay and latency, not by explicit jitter. Only `TestG_LIFE_4_Repeated...` is run at `-count=20`; the
+  rest of G-RACE-2's `-count=20` set (G-FLUSH-*, G-EPOCH-*, G-INFL-*, G-ROW-*, G-CFG-3) is not run by
+  this card. G-ROW-2 end to end is covered indirectly (requeue non-vacuity, quiescence, accounting).
+- **`obs.Emit` race (known, predates this phase): did not surface.** `stats.intervalSec` is 1 in the
+  P4-14 tests so the stats goroutine is emitting while SIGTERM arrives. `go test -race -tags
+  feedvalve_assert` on `internal/app` for the pipeline stress at 10 s and at 60 s, the utilisation test,
+  and `TestG_LIFE_4_Repeated... -count=20` all passed with no race report. That is not evidence of
+  absence (the defect is intermittent); it is not attributed to, or fixed by, this phase.
+
+### Errata applied to `docs/lld/`
+
+V3 §2.5 (ADR-W08 cite), §2.6 (signatures), §3.2 (ladder bind order, record by record), §4.2 (permutation
+sort), §5.4 (no upper time bound), §7.1 (pool context cancelled by `drainExpired`), §7.4 (panic retires
+the writer, `panics_recovered`), §7.5 (`ErrCode` filling), §8.1 (`ErrSpace` and retry classes), §8.2
+(24381 Unknown, 01722 phase 2 trigger), §9.3 (FailFast writers keep receiving), §14.3 (`oracle_error`
+first-come, `writer_panic` withdrawn, `rows_affected_mismatch` unit), W-5; V4 F14 and §6.2 (writer log
+classes) and G-DRAIN-2 (held batches); Vol 0 `ErrClass` comment. G-ROW-1's "`row_rejected` is the
+writer's" was already applied in Phase 3. **Not done:** Vol 0 §7.6 (cited, absent; a section to author,
+not a correction) and the `oradb/doc.go` and `writer/doc.go` import claims (source files, not
+`docs/lld`).

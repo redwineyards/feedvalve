@@ -969,7 +969,7 @@ func (e *Error) Unwrap() error
 type ErrClass uint8
 
 const (
-    ErrRowData    ErrClass = iota // ORA-00001, ORA-01438, ORA-12899 — no retry, skip the row
+    ErrRowData    ErrClass = iota // ORA-00001, ORA-01438, ORA-12899, ORA-01722 — no retry, skip the row (Phase 4 as built: ErrUnknown is the zero value, ErrSpace is added, ORA-24381 is Unknown)
     ErrSession                    // ORA-03113, ORA-03114, ORA-12541, ORA-12170 — retire and retry
     ErrStatement                  // ORA-00936, ORA-00942 — deployment defect, stop the writer
     ErrDeadlock                   // ORA-00060 — should be unreachable (HLD §8.4); retry once
