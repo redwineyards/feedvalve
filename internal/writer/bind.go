@@ -154,13 +154,37 @@ func NewBinder(d *destinations.Destination, mask model.ColMask, ceiling int) (*B
 // next Bind. The boxed slice headers are reused while len(rows) repeats, so a
 // steady-state call allocates only for text values.
 func (b *Binder) Bind(rows []model.BatchRow, updatedAt time.Time) ([]any, error) {
-	n := len(rows)
+	return b.bind(rows, nil, len(rows), updatedAt)
+}
+
+// BindIdx is Bind over the rows of a batch named by idx, in idx order: the
+// form the writer uses, because the grouper returns absolute indices into
+// Batch.Rows and Rows is never copied or reordered (D7). Same arenas, same
+// mask check, same W-3 length assertion. An index outside rows is an error,
+// not a panic.
+func (b *Binder) BindIdx(rows []model.BatchRow, idx []int32, updatedAt time.Time) ([]any, error) {
+	for _, i := range idx {
+		if i < 0 || int(i) >= len(rows) {
+			return nil, fmt.Errorf("writer: bind index %d outside %d rows", i, len(rows))
+		}
+	}
+	return b.bind(rows, idx, len(idx), updatedAt)
+}
+
+// bind is the shared body: row r is rows[r], or rows[idx[r]] when idx is set.
+func (b *Binder) bind(rows []model.BatchRow, idx []int32, n int, updatedAt time.Time) ([]any, error) {
 	if n == 0 || n > b.ceiling {
 		return nil, fmt.Errorf("writer: bind of %d rows outside 1..%d", n, b.ceiling)
 	}
-	for r := range rows {
-		if rows[r].Mask != b.mask {
-			return nil, fmt.Errorf("writer: row %d has mask %#x, statement is %#x", r, uint64(rows[r].Mask), uint64(b.mask))
+	at := func(r int) *model.BatchRow {
+		if idx != nil {
+			return &rows[idx[r]]
+		}
+		return &rows[r]
+	}
+	for r := 0; r < n; r++ {
+		if m := at(r).Mask; m != b.mask {
+			return nil, fmt.Errorf("writer: row %d has mask %#x, statement is %#x", r, uint64(m), uint64(b.mask))
 		}
 	}
 	for i := range b.cols {
@@ -169,13 +193,14 @@ func (b *Binder) Bind(rows []model.BatchRow, updatedAt time.Time) ([]any, error)
 			return nil, fmt.Errorf("writer: bind arena for %s holds fewer than %d rows", b.cols[i].bind.Name, n)
 		}
 	}
-	for r := range rows {
-		img := &rows[r].Image
+	for r := 0; r < n; r++ {
+		row := at(r)
+		img := &row.Image
 		for i := range b.cols {
 			c := &b.cols[i]
 			switch {
 			case c.bind.Role == destinations.RoleKey:
-				c.i64[r] = int64(rows[r].Row.Lo())
+				c.i64[r] = int64(row.Row.Lo())
 			case c.bind.Role == destinations.RoleUpdatedAt:
 				c.tm[r] = sql.NullTime{Time: updatedAt, Valid: true}
 			case c.i64 != nil:
