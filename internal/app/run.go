@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -216,7 +215,7 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 	// The deferred Close is registered HERE, at open time, and therefore runs
 	// after the drain in Graph.Run's body. That ordering is the whole reason
 	// the drain is not itself a defer (section 1.1).
-	var db *sql.DB
+	var db *oradb.DB
 	if cfg.HasDB {
 		var err error
 		db, err = openDB(ctx, cfg.DB)
@@ -252,10 +251,10 @@ func versionOf(opts Options) string {
 	return opts.Version
 }
 
-// openDB is oradb.Open behind a variable, so gate G-LIFE-3 -- "OpenDB
-// succeeds; the socket bind is rigged to fail; run returns a non-nil error AND
-// db.Close() was called" -- can be exercised without an Oracle instance. Tests
-// replace it; nothing else may.
+// openDB is oradb.Open (which returns the *oradb.DB wrapper) behind a
+// variable, so gate G-LIFE-3 -- "OpenDB succeeds; the socket bind is rigged to
+// fail; run returns a non-nil error AND db.Close() was called" -- can be
+// exercised without an Oracle instance. Tests replace it; nothing else may.
 //
 // The seam is here rather than in oradb because what G-LIFE-3 tests is the
 // LIFECYCLE's ordering: that the deferred Close registered at step 11 still

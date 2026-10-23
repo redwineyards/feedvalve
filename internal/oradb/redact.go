@@ -60,6 +60,10 @@ func NewRedactor(s DBSettings, password string) Redactor {
 	return Redactor{dsn: s.dsn(password), password: password, s: s}
 }
 
+// String and GoString: see DB.String. A Redactor holds the password.
+func (Redactor) String() string   { return "oradb.Redactor" }
+func (Redactor) GoString() string { return "oradb.Redactor" }
+
 // redact returns err with the DSN and password removed from its text.
 func (r Redactor) redact(err error) error {
 	return redactDSN(err, r.dsn, r.password, r.s)

@@ -3,10 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"regexp"
@@ -23,6 +20,7 @@ import (
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 	"feedvalve/internal/oradb"
+	"feedvalve/internal/oradb/oratest"
 )
 
 // testGraph builds a graph the way relay does, but with no database and with
@@ -266,22 +264,30 @@ func TestG_LIFE_2_SigtermReturnsPromptlyAndQuietly(t *testing.T) {
 // process that failed to start and will be restarted immediately by the
 // supervisor.
 func TestG_LIFE_3_BindFailureUnwindsWithTheDatabaseClosed(t *testing.T) {
-	closed := make(chan struct{})
-	stub := newStubDB(t, func() { close(closed) })
-	// sql.Open is lazy, so force one driver connection into the pool:
-	// otherwise sql.DB.Close has nothing to close and the observation would
+	// A counting fake from oratest, opened through the real OpenDriver, so the
+	// handle the lifecycle closes is the production *oradb.DB over a driver
+	// that counts. OpenDriver's ping forces one connection into the pool:
+	// otherwise Close would have nothing to close and the observation would
 	// pass vacuously whether the lifecycle closed the handle or not.
-	if err := stub.Ping(); err != nil {
-		t.Fatalf("priming the stub pool: %v", err)
-	}
+	fake := oratest.New()
+	t.Cleanup(fake.Close)
 
 	// The seam: the database opens, so the bind is the only thing that fails.
 	old := openDB
-	openDB = func(context.Context, oradb.DBSettings) (*sql.DB, error) { return stub, nil }
+	openDB = func(ctx context.Context, s oradb.DBSettings) (*oradb.DB, error) {
+		return oradb.OpenDriver(ctx, oratest.DriverName, fake.DSN(), s)
+	}
 	t.Cleanup(func() { openDB = old })
 
 	cfg := config.Defaults()
 	cfg.HasDB = true
+	// Defaults() leaves db unset; OpenDriver pings under ConnectTimeoutSec,
+	// and a zero timeout would fail the open before the bind is reached.
+	cfg.DB = oradb.DBSettings{
+		Host: "h", Port: 1521, Service: "s", User: "u",
+		ConnectTimeoutSec: 10, QueryTimeoutSec: 30, ConnMaxLifetimeMinutes: 30,
+		MaxOpenConns: 5, MaxIdleConns: 5,
+	}
 	// An address ListenPacket cannot bind, which is what rigs step 16 to fail.
 	cfg.UDP.Listen = "198.51.100.1:65000"
 
@@ -299,13 +305,13 @@ func TestG_LIFE_3_BindFailureUnwindsWithTheDatabaseClosed(t *testing.T) {
 	if got := ExitCode(runErr); got != ExitStartup {
 		t.Errorf("exit code = %d, want %d for a startup failure", got, ExitStartup)
 	}
-	select {
-	case <-closed:
-	default:
-		t.Error("db.Close() was NOT called after the bind failed.\n" +
-			"The Close deferred at startup step 11 must still run when step 16 fails, " +
-			"or a process that could not start leaves an Oracle session open -- and the " +
-			"supervisor restarts it immediately, so the leak compounds.")
+	if c := fake.Counts(); c.Opens != 1 {
+		t.Fatalf("non-vacuity: driver connections opened = %d, want 1", c.Opens)
+	} else if c.Closes != 1 {
+		t.Errorf("driver connections closed = %d, want 1: db.Close() was NOT called after the bind failed.\n"+
+			"The Close deferred at startup step 11 must still run when step 16 fails, "+
+			"or a process that could not start leaves an Oracle session open -- and the "+
+			"supervisor restarts it immediately, so the leak compounds.", c.Closes)
 	}
 }
 
@@ -539,42 +545,6 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-}
-
-// newStubDB returns a *sql.DB over a driver that does nothing but record its
-// Close. The same approach oradb's own tests use, so go test needs no database.
-func newStubDB(t *testing.T, onClose func()) *sql.DB {
-	t.Helper()
-	// Unique per call, not per test name: sql.Register panics on a duplicate,
-	// and -count=N runs the same test name N times. That is exactly how a
-	// repeated run of a scheduling-sensitive gate -- which is what G-RACE-2
-	// asks for -- would otherwise fail for a reason that has nothing to do
-	// with the thing under test.
-	name := fmt.Sprintf("appstub-%s-%d", t.Name(), stubSeq.Add(1))
-	sql.Register(name, &stubDriver{onClose: onClose})
-	db, err := sql.Open(name, "")
-	if err != nil {
-		t.Fatalf("sql.Open(%s): %v", name, err)
-	}
-	return db
-}
-
-// stubSeq makes each registered driver name unique.
-var stubSeq atomic.Int64
-
-type stubDriver struct{ onClose func() }
-
-func (d *stubDriver) Open(string) (driver.Conn, error) { return &stubConn{d: d}, nil }
-
-type stubConn struct{ d *stubDriver }
-
-func (c *stubConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("no statements") }
-func (c *stubConn) Begin() (driver.Tx, error)           { return nil, errors.New("no transactions") }
-func (c *stubConn) Close() error {
-	if c.d.onClose != nil {
-		c.d.onClose()
-	}
-	return nil
 }
 
 // TestTheQDDrainStageAbandonsNothing is the card's "shutdown order, including

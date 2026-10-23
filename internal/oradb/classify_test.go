@@ -166,15 +166,6 @@ func init() {
 	sql.Register("oradb-leak-query", leakQuery)
 }
 
-// useDriver swaps the package-level driverName; tests using it must not call
-// t.Parallel.
-func useDriver(t *testing.T, name string) {
-	t.Helper()
-	old := driverName
-	driverName = name
-	t.Cleanup(func() { driverName = old })
-}
-
 // assertNoSecret renders err every way the codebase does and fails if the
 // given password appears in any rendering.
 func assertNoSecret(t *testing.T, label, secret string, err error) {
@@ -235,8 +226,7 @@ func TestG_SEC_2_1_DriverErrorsNeverLeakThePassword(t *testing.T) {
 	for _, pw := range []string{probe, odd} {
 		t.Setenv(PasswordEnv, pw)
 
-		useDriver(t, "oradb-leak-connect")
-		_, err := Open(context.Background(), s)
+		_, err := open(context.Background(), "oradb-leak-connect", s)
 		if err == nil || !strings.Contains(err.Error(), "dial failed") {
 			t.Fatalf("Open: want dial error, got %v", err)
 		}
@@ -248,8 +238,7 @@ func TestG_SEC_2_1_DriverErrorsNeverLeakThePassword(t *testing.T) {
 			t.Errorf("Open: want Describe() in redacted text, got %q", err)
 		}
 
-		useDriver(t, "oradb-leak-query")
-		_, err = Check(context.Background(), s)
+		_, err = check(context.Background(), "oradb-leak-query", s)
 		if err == nil || !strings.Contains(err.Error(), "query failed") {
 			t.Fatalf("Check: want round-trip error, got %v", err)
 		}

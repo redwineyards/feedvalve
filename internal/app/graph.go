@@ -1,7 +1,6 @@
 package app
 
 import (
-	"database/sql"
 	"hash/maphash"
 	"io"
 	"net"
@@ -17,6 +16,7 @@ import (
 	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
+	"feedvalve/internal/oradb"
 )
 
 // FatalReason enumerates the terminal conditions of Vol 4 section 1.2 exit
@@ -102,12 +102,10 @@ type fatalEvent struct {
 type Deps struct {
 	Cfg   *config.Config
 	Store *config.Store
-	// DB is nil when the configuration declares no db object. It is a
-	// *sql.DB and not an oradb-specific handle: section 1.7's sketch writes
-	// *oradb.DB, but oradb exposes Open(ctx, DBSettings) (*sql.DB, error) --
-	// the package is the connection POLICY (pool sizes, timeouts, DSN
-	// hygiene), not a wrapper type.
-	DB    *sql.DB
+	// DB is nil when the configuration declares no db object. It is the
+	// oradb wrapper (section 1.7's *oradb.DB), which owns the redactor and
+	// hands out sessions; app owns its Close.
+	DB    *oradb.DB
 	Reg   obs.Registry
 	Log   *obs.AppLogger
 	Debug *obs.DebugLogger

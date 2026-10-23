@@ -3,6 +3,7 @@ package oradb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -19,11 +20,8 @@ func (s DBSettings) dsn(password string) string {
 	return go_ora.BuildUrl(s.Host, s.Port, s.Service, s.User, password, nil)
 }
 
-// driverName is the database/sql driver Open uses. It is a variable only so a
-// test can substitute a driver whose errors quote the DSN.
-// Known interim: P4-03's OpenDriver seam replaces this. Tests that swap it
-// must not use t.Parallel.
-var driverName = "oracle"
+// realDriver is the go-ora driver's registered name.
+const realDriver = "oracle"
 
 // Open connects and verifies the connection before returning it.
 //
@@ -33,55 +31,78 @@ var driverName = "oracle"
 // fails.
 //
 // The password is read here, from the environment, and never stored.
-func Open(ctx context.Context, s DBSettings) (*sql.DB, error) {
+func Open(ctx context.Context, s DBSettings) (*DB, error) {
+	return open(ctx, realDriver, s)
+}
+
+// open is Open over a named driver; the tests that need a driver whose errors
+// quote the DSN go through it.
+func open(ctx context.Context, name string, s DBSettings) (*DB, error) {
 	password, err := Password()
 	if err != nil {
 		return nil, err
 	}
+	return openDriver(ctx, name, s.dsn(password), password, s)
+}
 
-	dsn := s.dsn(password)
-	db, err := sql.Open(driverName, dsn)
+// OpenDriver is Open for a caller-chosen database/sql driver and DSN. It is the
+// documented substitutability seam: the writer and app tests live in other
+// packages and open an oratest fake through it, and everything past this call
+// (pool settings, ping under ConnectTimeout, redaction, sessions) behaves the
+// same for the fake as for go-ora.
+//
+// The password, if the environment supplies one, is used only to build the
+// redactor; a fake's DSN carries none and the variable may be unset.
+func OpenDriver(ctx context.Context, driverName, dsn string, s DBSettings) (*DB, error) {
+	password, err := Password()
+	if err != nil && !errors.Is(err, ErrNoPassword) {
+		return nil, err
+	}
+	return openDriver(ctx, driverName, dsn, password, s)
+}
+
+func openDriver(ctx context.Context, driverName, dsn, password string, s DBSettings) (*DB, error) {
+	red := Redactor{dsn: dsn, password: password, s: s}
+	sdb, err := sql.Open(driverName, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", s.Describe(), redactDSN(err, dsn, password, s))
+		return nil, fmt.Errorf("open %s: %w", s.Describe(), red.redact(err))
 	}
 
 	// The pool is deliberately small and derived from the writer count:
 	// Oracle caps concurrent sessions through the instance's sessions and
 	// processes parameters, so an unbounded pool fails as ORA-00020 under
 	// load rather than queueing.
-	db.SetMaxOpenConns(s.MaxOpenConns)
-	db.SetMaxIdleConns(s.MaxIdleConns)
+	sdb.SetMaxOpenConns(s.MaxOpenConns)
+	sdb.SetMaxIdleConns(s.MaxIdleConns)
 
 	// Oracle profiles (IDLE_TIME) and stateful firewalls kill idle sessions
 	// silently; the first reuse of a dead one surfaces as ORA-03113 or
 	// ORA-03114. Retiring connections before that turns an error into a
 	// reconnect.
-	db.SetConnMaxLifetime(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute)
+	sdb.SetConnMaxLifetime(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute)
 
-	pingCtx, cancel := context.WithTimeout(ctx, time.Duration(s.ConnectTimeoutSec)*time.Second)
-	defer cancel()
-
-	if err := db.PingContext(pingCtx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("connect to %s: %w", s.Describe(), redactDSN(err, dsn, password, s))
+	d := &DB{db: sdb, red: red, s: s}
+	if err := d.PingContext(ctx); err != nil {
+		sdb.Close()
+		return nil, fmt.Errorf("connect to %s: %w", s.Describe(), err)
 	}
-	return db, nil
+	return d, nil
 }
 
 // Check is -dbcheck: connect, prove a round trip, report the server version,
 // and close. Read-only, and the way to prove credentials and reachability
 // from a deployment host before the relay is ever started.
 func Check(ctx context.Context, s DBSettings) (version string, err error) {
-	db, err := Open(ctx, s)
+	return check(ctx, realDriver, s)
+}
+
+func check(ctx context.Context, name string, s DBSettings) (version string, err error) {
+	d, err := open(ctx, name, s)
 	if err != nil {
 		return "", err
 	}
-	defer db.Close()
-
-	// Open has already read the password; reading it again is cheap and keeps
-	// Open's signature, and the redactor below is what scrubs driver errors.
-	password, _ := Password()
-	red := NewRedactor(s, password)
+	defer d.Close()
+	db, red := d.db, d.red
 
 	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(s.QueryTimeoutSec)*time.Second)
 	defer cancel()
