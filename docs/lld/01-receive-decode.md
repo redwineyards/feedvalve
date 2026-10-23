@@ -2182,7 +2182,7 @@ Per unit, the decoder fills every field of Vol 0 §3.5's `UpdateUnit`:
 | `Flags` | `FlagGeneral` per the inventory; `FlagNonRateLimited` from `entry.Class`; `FlagOrderingUnusable` if no usable ordering value | inventory + §10.3 |
 | `Seq` | `h.BCSeqNo` **as read**, compared serially, never with `>` (Vol 0 §3.5, ASM-11) | header, `BCAST_HEADER` only |
 | `LogTime` | `h.LogTime`, seconds since 1 Jan 1980 (bible §2.5) | header |
-| `RecvMono` | `time.Since(processStart).Nanoseconds()` — **always**, never a fallback | §10.3 |
+| `RecvMono` | `time.Since(processStart).Nanoseconds()`, made strictly increasing per datagram as `max(now, last+1)` — **always**, never a fallback *(erratum, Phase 3, seam 9)* | §10.3 |
 | `Contribs[d]` | `{Row, Mask: spec.Mask, BlobOff, BlobLen: spec.Width, Slot: entry.Slots[d]}`; `Mask == 0` means "does not touch destination *d*" | `RegistryEntry` + row-key rule |
 | `BlobLen` | total bytes written; asserted `≤ unitBlobSize` | running |
 | `Blob` | the packed contribution values, **wire form**, ascending bit order | `Copy` |
@@ -2209,6 +2209,11 @@ Vol 0 §10.2, and it is the receiver that must get this right because nothing do
 - `LogTime` is the exchange's clock, **seconds** since 1 Jan 1980 (bible §2.5). One-second resolution.
 - `RecvMono` is **ours**: `int64` nanoseconds since process start, from `time.Since(processStart)`, never
   `UnixNano()`. Monotonic by construction, so an NTP step cannot perturb the ordering tiebreak.
+  *(erratum, Phase 3, seam 9: and **strictly increasing** from one datagram to the next. The stamp is
+  `nextRecvMono(now, last)` = `max(now, last+1)` (`internal/app/clock.go`): on a timer-tick monotonic
+  clock (windows/amd64) two datagrams read in one tick otherwise share a value, and Vol 2 §5.3 step 8
+  discards the second's contribution to a row the first touched as a re-delivery. One reader goroutine
+  owns `last`, so it costs nothing. Vol 2 B-V1b carries the same obligation.)*
 
 `RecvMono` is recorded on **every** unit, unconditionally, and HLD §3.4(a) is explicit that this is a
 strengthening of FR11 rather than a fallback. The case that forces it: destination 2's five codes share

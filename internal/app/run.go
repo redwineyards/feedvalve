@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -149,7 +148,7 @@ func Run(ctx context.Context, opts Options, out io.Writer) error {
 	case opts.SelfCheck:
 		return selfCheck(cfg, dests, out)
 	case opts.DBCheck:
-		return dbCheck(ctx, cfg, out)
+		return dbCheck(ctx, cfg, dests, out)
 	}
 
 	return relay(ctx, opts, cfg, dests)
@@ -216,7 +215,7 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 	// The deferred Close is registered HERE, at open time, and therefore runs
 	// after the drain in Graph.Run's body. That ordering is the whole reason
 	// the drain is not itself a defer (section 1.1).
-	var db *sql.DB
+	var db *oradb.DB
 	if cfg.HasDB {
 		var err error
 		db, err = openDB(ctx, cfg.DB)
@@ -229,12 +228,16 @@ func relay(ctx context.Context, opts Options, cfg *config.Config, dests *destina
 			}
 		}()
 		lg.Infof("database connected %s", cfg.DB.Describe())
+		// Vol 0 7.6: one ERROR per mismatch, then proceed. A DBA fix must
+		// not need a redeploy.
+		logCatalogue(ctx, lg, db, dests)
 	}
 
 	// Steps 10 and 12: the derived state and the pre-allocation.
 	g, err := Build(Deps{
 		Cfg: cfg, Store: storeOf(cfg), DB: db, Reg: reg,
 		Log: lg, Debug: dbg, Dests: dests, Stderr: stderr, Inst: inst,
+		ConfigPath: opts.ConfigPath,
 	})
 	if err != nil {
 		return err
@@ -252,10 +255,10 @@ func versionOf(opts Options) string {
 	return opts.Version
 }
 
-// openDB is oradb.Open behind a variable, so gate G-LIFE-3 -- "OpenDB
-// succeeds; the socket bind is rigged to fail; run returns a non-nil error AND
-// db.Close() was called" -- can be exercised without an Oracle instance. Tests
-// replace it; nothing else may.
+// openDB is oradb.Open (which returns the *oradb.DB wrapper) behind a
+// variable, so gate G-LIFE-3 -- "OpenDB succeeds; the socket bind is rigged to
+// fail; run returns a non-nil error AND db.Close() was called" -- can be
+// exercised without an Oracle instance. Tests replace it; nothing else may.
 //
 // The seam is here rather than in oradb because what G-LIFE-3 tests is the
 // LIFECYCLE's ordering: that the deferred Close registered at step 11 still
@@ -264,10 +267,10 @@ func versionOf(opts Options) string {
 var openDB = oradb.Open
 
 // storeOf publishes a configuration into a Store so the generation gauge and
-// the Phase 5 reload path have one to swap.
+// the SIGHUP reload path have one to swap.
 //
 // The second deviation from section 1.4, and a small one: the section has the
-// Store existing from step 3. Phase 5 owns the reload; this just establishes
+// Store existing from step 3. The reload (reload.go) swaps it; this just establishes
 // generation 1 so config_generation reads 1 rather than 0 on a process that
 // never reloaded.
 //
@@ -287,6 +290,22 @@ func storeOf(cfg *config.Config) *config.Store {
 // transcode's contributed column widths, which only the field map knows.
 // Validating each half alone would pass a pair that cannot work.
 func loadAll(path string, mode config.Mode) (*config.Config, *destinations.Set, error) {
+	return loadChecked(path, mode, nil, nil)
+}
+
+// loadForReload is loadAll for the SIGHUP path: ModeRun, validated against the
+// running configuration and field map so the reload-only rules (V-R1..V-R4)
+// apply. An empty path is a caller error on this path (D7: with no config
+// file there is nothing to reload) and is rejected rather than silently
+// loading defaults over a running configuration.
+func loadForReload(path string, prev *config.Config, prevDests *destinations.Set) (*config.Config, *destinations.Set, error) {
+	if path == "" {
+		return nil, nil, errors.New("no configuration file to reload")
+	}
+	return loadChecked(path, config.ModeRun, prev, prevDests)
+}
+
+func loadChecked(path string, mode config.Mode, prev *config.Config, prevDests *destinations.Set) (*config.Config, *destinations.Set, error) {
 	var (
 		cfg *config.Config
 		err error
@@ -312,7 +331,7 @@ func loadAll(path string, mode config.Mode) (*config.Config, *destinations.Set, 
 		return nil, nil, err
 	}
 
-	if err := config.ValidateAll(cfg, dests, nil, mode); err != nil {
+	if err := config.ValidateAll(cfg, dests, prevDests, prev, mode); err != nil {
 		return nil, nil, err
 	}
 	return cfg, dests, nil
@@ -344,6 +363,16 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 	} else {
 		fmt.Fprintln(out, "selfcheck: no database configured")
 	}
+
+	// V3 section 11: every statement the writer could ever generate, at every
+	// single-bit mask and the full mask, with every identifier checked. Pure:
+	// no database, no password, no network.
+	nStmts, err := destinations.CheckStatements(dests)
+	if err != nil {
+		return exitf(ExitSelfCheckFailed, "statement generation: %w", err)
+	}
+	fmt.Fprintf(out, "selfcheck: %d statements generated (every destination, every single-bit mask, full mask); "+
+		"identifiers match [A-Za-z][A-Za-z0-9_]{0,29}\n", nStmts)
 
 	// The catalogue, printed because Vol 1 section 8.2 asks for it: "which
 	// codes does this build know?" should be answerable from a log rather than
@@ -380,6 +409,14 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 		"Oracle profile's IDLE_TIME. Un-checkable from here by nature; the observable "+
 		"is a recurring ORA-03113 on first reuse of a session the server already closed")
 
+	// Reload-only rules need a running configuration to compare against, so
+	// -selfcheck cannot evaluate them; it says so rather than imply they
+	// passed. V-R2 is the destination set (name, table, rowKey, ordered
+	// columns); startup-only keys are listed so the output matches the table.
+	fmt.Fprintf(out, "selfcheck: reload-only rules V-R1..V-R4 apply on SIGHUP, not here -- "+
+		"V-R2: the destination set (name, table, rowKey, ordered columns) is startup-only in its entirety; "+
+		"V-R1: %d startup-only keys\n", len(config.StartupOnlyKeys))
+
 	fmt.Fprintln(out, "selfcheck: PASSED")
 	return nil
 }
@@ -391,19 +428,44 @@ func passwordState() string {
 	return "not set -- required by -dbcheck and at startup, not by -selfcheck"
 }
 
-// dbCheck connects, proves a round trip and reports the server version. It
-// writes nothing to the database.
-func dbCheck(ctx context.Context, cfg *config.Config, out io.Writer) error {
+// checkDB is oradb.Check behind a variable, for the same reason as openDB:
+// tests substitute an oratest-backed round trip.
+var checkDB = oradb.Check
+
+// dbCheck connects, proves a round trip, reports the server version and runs
+// the catalogue check (Vol 0 7.6). It writes nothing to the database. Unlike
+// startup, any catalogue finding fails it: it is the pre-deployment gate.
+func dbCheck(ctx context.Context, cfg *config.Config, dests *destinations.Set, out io.Writer) error {
 	// No "is a db configured?" check here: rule V-DB1 in ModeDBCheck has
 	// already rejected that case during load, and a second check would be
 	// a second place for the answer to change.
 	fmt.Fprintf(out, "dbcheck: connecting to %s\n", cfg.DB.Describe())
 
-	version, err := oradb.Check(ctx, cfg.DB)
+	version, err := checkDB(ctx, cfg.DB)
 	if err != nil {
 		return &ExitError{Code: ExitStartup, Err: err}
 	}
+	fmt.Fprintf(out, "dbcheck: round trip OK\ndbcheck: server %s\n", version)
 
-	fmt.Fprintf(out, "dbcheck: round trip OK\ndbcheck: server %s\ndbcheck: PASSED\n", version)
+	db, err := openDB(ctx, cfg.DB)
+	if err != nil {
+		return &ExitError{Code: ExitStartup, Err: err}
+	}
+	defer db.Close()
+
+	findings, err := catalogueFindings(ctx, db, dests)
+	if err != nil {
+		return &ExitError{Code: ExitStartup, Err: err}
+	}
+	for _, f := range findings {
+		fmt.Fprintf(out, "dbcheck: catalogue: %s\n", f)
+	}
+	if len(findings) > 0 {
+		return &ExitError{Code: ExitStartup, Reported: true,
+			Err: fmt.Errorf("dbcheck: FAILED: %d catalogue mismatch(es) against the field map", len(findings))}
+	}
+
+	fmt.Fprintln(out, "dbcheck: catalogue matches the field map")
+	fmt.Fprintln(out, "dbcheck: PASSED")
 	return nil
 }

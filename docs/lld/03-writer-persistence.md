@@ -290,7 +290,7 @@ a goroutine in `Acquiring`. Both re-apply `SetMaxOpenConns`/`SetMaxIdleConns` fi
 The asymmetry: **a database that is down when FeedValve starts prevents it from starting, while a
 database that goes down while FeedValve is running is tolerated for 30 seconds** (HLD §9.2's
 fail-fast budget). That is deliberate but it is not obvious, and it is the kind of thing discovered at
-03:00 during a maintenance window. ADR-W05 records the decision and the alternative.
+03:00 during a maintenance window. ADR-W08 records the decision and the alternative.
 
 ### 2.6 Interfaces
 
@@ -309,25 +309,43 @@ type Pool struct { /* unexported */ }
 // dests supplies the immutable column table (Vol 0 §4.2); statement text for
 // every (destination, mask) is generated lazily but from an immutable source,
 // so a statement's text never changes for the life of the process (§4.4).
-func NewPool(db *oradb.DB, cfg *config.Store, dests *destinations.Table, m *obs.WriterMetrics) (*Pool, error)
+//
+// As built (ruling D5): cfg is the writer's own value struct (Config: Writers,
+// Ceiling), params is called once here for the health thresholds and once per
+// batch by each writer, so reloadable keys take effect on the next batch, and
+// inst is a plain struct of metric handles defined in this package, not an
+// obs-side type. inst and log may be nil.
+func NewPool(db *oradb.DB, dests *destinations.Set, cfg Config, params func() *Params, inst *Instruments, log *obs.AppLogger) (*Pool, error)
 
 // Start launches writers.count goroutines. Each acquires a session lazily, so
 // Start does not block on the database; startup reachability is already proven
 // by OpenDB's ping (§2.5).
+//
+// completion is one send-only channel per shard, each BUFFERED: a writer's send
+// is blocking, and an unbuffered channel would couple it to the shard's loop.
+// ctx is the POOL's context, which app cancels at drainExpired and not on
+// SIGTERM (ruling D13, §7.1).
 func (p *Pool) Start(ctx context.Context, batchQ <-chan *model.Batch, completion []chan<- *model.Batch) error
 
 // Resize changes the number of running writers, growing by starting goroutines
 // and shrinking by signalling members to exit after their current batch. It
 // re-applies SetMaxOpenConns/SetMaxIdleConns to writers+1 first (Vol 0 D9).
-// Rejects n < cfg.Writers.StatementFailWriters (Vol 0 §7.3 C6).
+// Rejects n < cfg.Writers.StatementFailWriters (Vol 0 §7.3 C6). n is compared
+// with the CONFIGURED writer count, not the number running, so the pool regrows
+// after members have retired themselves (ruling D4).
 func (p *Pool) Resize(ctx context.Context, n int) error
 
-// Stopped is closed when the pool has stopped itself — the fail-fast budget or
-// the statement pool-stop rule (§9). app (Volume 4) selects on it and turns it
-// into a drain and a non-zero exit; this package never calls os.Exit.
+// Stopped is closed when the pool has stopped itself: the fail-fast budget, the
+// statement pool-stop rule (§9), or its running count reaching zero (ruling
+// D4). Closing it does not make the writers leave: after FailFast they keep
+// receiving and fail every batch at once so the shards' in-flight slots drain
+// (ruling D2, V4 §1.6). app (Volume 4) selects on it and turns it into a drain
+// and a non-zero exit; this package never calls os.Exit.
 func (p *Pool) Stopped() <-chan struct{}
 
-// StopReason returns why Stopped was closed. Nil before it closes.
+// StopReason returns why Stopped was closed, as a *StopError{Kind, Identity,
+// Cause} (ruling D3): FailFast maps to F13 and a statement pool stop to F20,
+// both exit 4. Nil before it closes.
 func (p *Pool) StopReason() error
 
 // Close stops every writer after its current batch, closes cached statements
@@ -432,6 +450,15 @@ Row key `token` (Vol 0 §4.3, bible §4.8). Sixteen image fields; bit 14 is the 
 sides — `BbBuySellFlag` is discarded because the side is positional, Vol 0 §4.3). Forty-five data
 columns plus `updated_at` plus the key: **47 bind positions.**
 
+**Ladder bind order (erratum, applied in Phase 4).** The ladder binds go **record by record**, not
+attribute by attribute: `bid_qty_1, bid_px_1, bid_ord_1, bid_qty_2, bid_px_2, bid_ord_2, …` for the
+five bid levels (`:16`-`:30`), then the same for the five ask levels (`:31`-`:45`). That is the order
+`mapping.json` declares them in, which `destinations.BindPlan` follows and the binder reads in. An
+earlier draft of this volume printed it attribute-major (all `bid_qty_*`, then all `bid_px_*`, …);
+that text was wrong and the mapping was right. The `SET` and `INSERT` lists below name their columns,
+so their order, and the DDL's, is irrelevant to binds; they are left in the attribute-major reading
+order.
+
 ```sql
 MERGE INTO md_token_quote t
 USING (SELECT :1  AS token,
@@ -442,12 +469,16 @@ USING (SELECT :1  AS token,
               :10 AS last_trade_quantity, :11 AS last_trade_time,
               :12 AS average_trade_price, :13 AS total_buy_quantity,
               :14 AS total_sell_quantity, :15 AS book_type,
-              :16 AS bid_qty_1, :17 AS bid_qty_2, :18 AS bid_qty_3, :19 AS bid_qty_4, :20 AS bid_qty_5,
-              :21 AS bid_px_1,  :22 AS bid_px_2,  :23 AS bid_px_3,  :24 AS bid_px_4,  :25 AS bid_px_5,
-              :26 AS bid_ord_1, :27 AS bid_ord_2, :28 AS bid_ord_3, :29 AS bid_ord_4, :30 AS bid_ord_5,
-              :31 AS ask_qty_1, :32 AS ask_qty_2, :33 AS ask_qty_3, :34 AS ask_qty_4, :35 AS ask_qty_5,
-              :36 AS ask_px_1,  :37 AS ask_px_2,  :38 AS ask_px_3,  :39 AS ask_px_4,  :40 AS ask_px_5,
-              :41 AS ask_ord_1, :42 AS ask_ord_2, :43 AS ask_ord_3, :44 AS ask_ord_4, :45 AS ask_ord_5,
+              :16 AS bid_qty_1, :17 AS bid_px_1, :18 AS bid_ord_1,
+              :19 AS bid_qty_2, :20 AS bid_px_2, :21 AS bid_ord_2,
+              :22 AS bid_qty_3, :23 AS bid_px_3, :24 AS bid_ord_3,
+              :25 AS bid_qty_4, :26 AS bid_px_4, :27 AS bid_ord_4,
+              :28 AS bid_qty_5, :29 AS bid_px_5, :30 AS bid_ord_5,
+              :31 AS ask_qty_1, :32 AS ask_px_1, :33 AS ask_ord_1,
+              :34 AS ask_qty_2, :35 AS ask_px_2, :36 AS ask_ord_2,
+              :37 AS ask_qty_3, :38 AS ask_px_3, :39 AS ask_ord_3,
+              :40 AS ask_qty_4, :41 AS ask_px_4, :42 AS ask_ord_4,
+              :43 AS ask_qty_5, :44 AS ask_px_5, :45 AS ask_ord_5,
               :46 AS effective_ts,
               :47 AS updated_at
          FROM dual) s
@@ -656,16 +687,22 @@ The procedure, per batch:
 
 ```
 for d := DestID(0); d < 3; d++ {                 // FIXED global order, §7.2
-    seg := b.Rows[b.DestStart[d] : b.DestStart[d]+b.DestCount[d]]
-    sort seg by (Mask ascending, Row ascending)  // writer scratch, no allocation
-    for each maximal run of equal Mask in seg {
-        key  := stmtKey{Dest: d, Mask: run[0].Mask}
+    perm := writer.perm[:0]                      // []int32 scratch, sized at the ceiling
+    for i := DestStart[d]; i < DestStart[d]+DestCount[d]; i++ { perm = append(perm, i) }
+    sort perm by (Rows[i].Mask, Rows[i].Row, i)  // a PERMUTATION; Batch.Rows is never reordered
+    for each maximal run of equal Mask in perm {
+        key  := stmtKey{Dest: d, Mask: Rows[run[0]].Mask}
         stmt := writer.stmtCache.get(key)        // prepare on miss, §4.4
-        bind  arrays from run                    // §5, rows already ascending by key
+        bind  arrays from Rows[run[k]]           // §5 (BindIdx), rows ascending by key
         exec  once with len(run) array iterations
     }
 }
 ```
+
+**As built (ruling D7).** The sort is over the permutation, never over `Batch.Rows`: `Rows` keeps the
+order the shard gave it, the binder reads through the index (`BindIdx`), and ties break on the index
+so the order is deterministic. A row with an empty mask is marked `OutcomeRejected`, counted in
+`batch_row_empty_mask{d}` and left out of the permutation.
 
 Two properties follow and both are load-bearing:
 
@@ -674,7 +711,7 @@ Two properties follow and both are load-bearing:
   per-destination one.
 - **Runs are walked in ascending `ColMask`.** That is not cosmetic either: see §7.2.
 
-**The sort is a comparison sort on ≤ 1,000 rows** — `O(n log n)`, microseconds, against a 5–20 ms
+**The sort is a comparison sort on ≤ 1,000 indices** — `O(n log n)`, microseconds, against a 5–20 ms
 commit (ADR-L05). It runs on the writer, never on the shard, which is the point: the shard's stalls
 propagate back to the receive path and the writer's do not (HLD §6.6, §7.8). The scratch is a
 `[]int32` of permutation indices sized at `maxBatchSizeCeiling` and allocated once per writer, so the
@@ -914,7 +951,11 @@ is failing a whole batch over one field the exchange sent oddly.
 |---|---|---|---|
 | `KindDouble` value is NaN or ±Inf | `math.IsNaN \|\| math.IsInf` | bind `NULL` | `bind_nonfinite{destination,column}` (new, §14) |
 | `KindTime1980` seconds `<= 0` | `s <= 0` | bind `NULL` — `s == 0` is R6's "never set" and `s < 0` is pre-1980 and cannot be a real `LogTime` | `bind_bad_time{destination,column}` (new, §14) |
-| `KindTime1980` seconds absurdly large (year > 2100) | `s > 3_786_912_000` | bind `NULL`, log once per interval | `bind_bad_time{…}` |
+
+**There is no upper bound on a time (ruling D12).** An earlier draft also nulled seconds above
+`3_786_912_000` (year 2100). The wire field is read as a signed 32-bit value, so its maximum is
+`2_147_483_647`, which is year 2048: the check could never fire and was dropped rather than carried as
+untestable code.
 
 Everything else is a load and a byte swap and **cannot fail**: the image is a fixed-width array, the
 offsets come from the immutable column table, and Vol 0 §4.7's `-selfcheck` gate has already proven
@@ -1117,7 +1158,7 @@ Entry into phase 2 is decided **only** by the error class of phase 1's failure (
 
 | Phase 1 failure class | Phase 2? | Why |
 |---|---|---|
-| `ErrRowData` (`ORA-00001`, `ORA-01438`, `ORA-12899`, `ORA-01400`, `ORA-02290`, `ORA-02291`) | **yes** | This is the only class where a *single row* is the culprit and the rest of the batch would have committed. F14's "skip the row, continue the batch" is unreachable without it |
+| `ErrRowData` (`ORA-00001`, `ORA-01438`, `ORA-12899`, `ORA-01400`, `ORA-01722`, `ORA-02290`, `ORA-02291`) | **yes** | This is the only class where a *single row* is the culprit and the rest of the batch would have committed. F14's "skip the row, continue the batch" is unreachable without it |
 | `ErrSession`, `ErrSpace`, `ErrDeadlock`, `ErrStatement`, `ErrUnknown` | no | The failure is not a property of any row. Retrying row by row would make `rows` attempts at the same failure and burn the query timeout |
 
 **Why the whole batch and not only the failing group.** `ExecTx` rolled the transaction back, so every
@@ -1200,10 +1241,14 @@ Boundaries, in order:
 | rollback | `tx.Rollback()` on `fn` returning an error **or panicking** | `poc/db.go:278-294`. On a rollback that itself fails, both errors are reported: the rollback failure explains why locks may still be held, the original explains why we rolled back |
 | timeout | `db.queryTimeoutSec` = 30 s, applied by `withTimeout` unless the caller already set a deadline (`poc/db.go:228-233`) | 1,500× the 20 ms worst-case commit, and ~15× phase 2's 2 s worst case (§6.4) |
 
-The context passed in is the writer's, derived from the pool's, derived from `app`'s. **Cancellation
-during a transaction rolls back**, which is correct for shutdown: an in-flight batch at SIGTERM is
-abandoned, every row returns `OutcomeFailed`, and Vol 2 re-dirties them for the drain (HLD §6.10).
-§8.3 says why `context.Canceled` must not be counted as a write failure.
+The context passed in is the writer's, derived from the pool's. **The pool's context is cancelled by
+`drainExpired`, not by SIGTERM (ruling D13)**: SIGTERM starts the drain, during which the writers must
+keep writing so the shards can flush every dirty row (G-DRAIN-1); only when the drain deadline passes
+does `app` cancel it, and `Pool.Close` never cancels before the shards have joined. **Cancellation
+during a transaction rolls back**, which is correct at that point: an in-flight batch at the deadline is
+abandoned, every row returns `OutcomeFailed`, and the shard counts it in `drain_abandoned_rows`.
+`db.queryTimeoutSec` is per batch. §8.3 says why `context.Canceled` must not be counted as a write
+failure.
 
 ### 7.2 Why two transactions cannot deadlock — two layers, and a correction to the second
 
@@ -1313,17 +1358,21 @@ The deferred function that carries the postcondition does three things in this o
 
 1. `recover()`. A panic means a defect in the binder or the column table, not bad data — the image is
    fixed-width and its offsets are `-selfcheck`ed (Vol 0 §4.7). Set
-   `b.Err = fmt.Errorf("writer panic: %v", r)`, count `writer_panic`, log at ERROR with the statement
+   `b.Err = fmt.Errorf("writer panic: %v", r)`, count `panics_recovered{stage=writer}` (ruling D10:
+   `writer_panic` is withdrawn, one panic counter serves every stage), log at ERROR with the statement
    identity, the destination and the row index being bound.
-2. **Retire the connection.** `ExecTx`'s rollback has already run, but if the panic happened inside
-   go-ora mid-packet the rollback itself may have failed and the session's protocol state is unknown.
-   A session in an unknown state is worse than a reconnect, and a reconnect costs one logon.
+2. **Retire the connection, and the writer.** `ExecTx`'s rollback has already run, but if the panic
+   happened inside go-ora mid-packet the rollback itself may have failed and the session's protocol
+   state is unknown. A session in an unknown state is worse than a reconnect, and a defect in the
+   binder or the column table will recur on the next batch, so the writer returns the batch **once**
+   (the sweep below, then the send on its completion channel) and then leaves the pool, counted in
+   `writers_stopped`. A pool whose running count reaches zero stops itself (ruling D4).
 3. Sweep `b.Rows[:b.N]` and set every `OutcomePending` to `OutcomeFailed` when `b.Err != nil`.
 
 The panic is **not** re-raised past this point. One malformed batch must not take down a writer, and
 it certainly must not take down the process while the receive path is still decoding a feed that
-cannot be replayed (bible §1). `writer_panic` is the instrument; any non-zero value is a defect to
-fix, not a condition to tune.
+cannot be replayed (bible §1). `panics_recovered{stage=writer}` is the instrument; any non-zero value
+is a defect to fix, not a condition to tune.
 
 ### 7.5 What the outcome vector obliges Volume 2 to do
 
@@ -1337,6 +1386,12 @@ outcome:
 | `OutcomeRejected` | phase 2 classified this row's own error as `ErrRowData` (§6.4, §8.2) | leave `Digest`, `Written` and `ColMask` alone; **do not requeue**; count `row_rejected` |
 | `OutcomeFailed` | the batch was abandoned (`b.Err != nil`) or this row was still pending when it was | `ColMask \|= BatchRow.Mask`, requeue at the ring **head**, count `retry_requeued` |
 | `OutcomePending` on return | **never.** §7.4's postcondition | if it ever happens, count `batch_row_unreported` and stop loudly — it is a Volume 3 defect |
+
+**`BatchRow.ErrCode` filling (ruling D9).** The writer sets `ErrCode` to the **bare ORA number** on
+every `OutcomeRejected` row and on every `OutcomeFailed` row of a *classified* failure (`ORA-03113`
+gives 3113); it is 0 on `Committed` rows and on failures that carried no ORA number (a context
+deadline, a panic). `oradb.ErrClass` never enters `model`: the class is the writer's, the number is
+the only thing the shard sees.
 
 ---
 
@@ -1352,6 +1407,14 @@ outcome:
 > (`network/oracle_error.go:74-76`), with `" error occur at position: N"` appended when `errPos >= 0`
 > (`oracle_error.go:22-25`). A substring match on `"ORA-00060"` would never fire, because the driver
 > renders code 60 as `"ORA-60"`.
+
+The closed set of classes is `ErrUnknown` (the zero value, so an uninitialised `Error` never reads as
+the lenient class), `ErrRowData`, `ErrSession`, `ErrDeadlock`, **`ErrSpace`** and `ErrStatement`.
+The retry classes, as built: `ErrSession`, `ErrSpace`, `ErrDeadlock` and `ErrUnknown` retry (session
+and space with backoff; deadlock and unknown **once**); `ErrRowData` never retries and goes to phase 2;
+`ErrStatement` never retries and retires the writer. A successful retry counts `write_retry{class}` and
+writes one WARN, and changes no health state (ruling D6c); there is no retry after a phase 2 failure
+that was not a row's own (D6d).
 
 Classification order, because three of the four steps are not Oracle errors at all:
 
@@ -1390,7 +1453,7 @@ whose runbook entry is "wait".
 | **00001** | unique constraint violated | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | **ERROR.** See §8.4 — under ADR-008 this is *not* an expected error |
 | **01400** | cannot insert NULL into | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR. A `NOT NULL` column was not in the mask — a schema/config disagreement, not a data problem |
 | **01438** | value larger than specified precision | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR with the row key. Usually a scaling mismatch — bible §2.4's v3.5 (6,4)→(7,2) change is the named cause (HLD F14) |
-| **01722** | invalid number | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR. A bind/column type disagreement; behaves per row but is really a statement defect |
+| **01722** | invalid number | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR. **A phase 2 trigger (ruling D6b).** A bind/column type disagreement; behaves per row but is really a statement defect |
 | **02290** | check constraint violated | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR |
 | **02291** | integrity constraint, parent key not found | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR. We declare no foreign keys (§10.4); if this fires, the DBA added one |
 | **12899** | value too large for column | `ErrRowData` | row | no | `Rejected` | `row_rejected{d}` | ERROR with the column name from the message |
@@ -1415,7 +1478,7 @@ whose runbook entry is "wait".
 | **00942** | table or view does not exist | `ErrStatement` | batch | no | `Failed` | `writers_stopped` | as above. Wrong schema, missing grant, or the DDL was never run |
 | **00917 / 00920 / 00933 / 00947** | syntax | `ErrStatement` | batch | no | `Failed` | `writers_stopped` | as above — a generator bug, caught on the first execution after deployment |
 | **01031** | insufficient privileges | `ErrStatement` | batch | no | `Failed` | `writers_stopped` | as above. Missing `INSERT`/`UPDATE` grant |
-| **24381** | error(s) in array DML | `ErrUnknown` | batch | via phase 2 | `Failed` then per-row | `write_retry{unknown}` | ERROR. **Should never be observed**: go-ora rewrites it to `bindErrors[0].errorCode` (`network/summary_object.go:259-262`). Seeing it means `bindErrors` was empty, so the batch enters phase 2 to obtain attribution the hard way (§6.4) |
+| **24381** | error(s) in array DML | `ErrUnknown` | batch | yes, once; **never phase 2** (ruling D6a) | `Failed` | `write_retry{unknown}` | ERROR. **Should never be observed**: go-ora rewrites it to `bindErrors[0].errorCode` (`network/summary_object.go:259-262`). It carries no row attribution, so it is Unknown like any unclassified code: one retry, then the batch is `Failed` and requeued. An earlier draft sent it to phase 2; that is withdrawn |
 | *anything else* | — | `ErrUnknown` | batch | yes, once | `Failed` | `write_retry{unknown}` | ERROR with the ORA number and `%T` of the wrapped error, so an unclassified code shows up as a table gap rather than as silence |
 
 ### 8.3 `context.Canceled` is not a failure
@@ -1572,8 +1635,11 @@ and the count is a backstop against a misconfigured near-zero backoff.
 > the pool to Healthy. For `ErrSpace` a probe proves nothing — the listener is fine and the tablespace
 > is still full — so only a committed batch clears it. Counted as `write_probe{result}` (§14).
 
-On `FailFast` the pool closes `Stopped()`, sets `StopReason()`, stops taking batches, and returns
-every in-flight batch with `Err` set. **`app` (Volume 4) owns what happens next** — drain what can be
+On `FailFast` the pool closes `Stopped()` and sets `StopReason()` (a `*StopError`, ruling D3). **The
+writers do not stop taking batches (ruling D2, V4 §1.6 wins over this volume's first draft):** they keep
+receiving and return every batch at once with `Err` set and every row `Failed`, so the shards'
+in-flight slots keep draining and the drain can run to its deadline rather than hanging on slots that
+will never come back. **`app` (Volume 4) owns what happens next** — drain what can be
 drained, log the reason, exit non-zero (HLD F13, req §10.2). Nothing in this package calls
 `os.Exit`: it would skip every `defer` and could leave a transaction open holding row locks
 (CLAUDE.md, Vol 0 §10.4).
@@ -1697,7 +1763,7 @@ erDiagram
         NUMBER transcode "NUMBER(5): which of 6511 6521 6522 6531 6571 wrote last"
         NUMBER message_len "NUMBER(5), BroadcastMessageLength, clamped to 128"
         VARCHAR2 message_text "VARCHAR2(128), valid prefix only, bible 4.5"
-        NUMBER bcast_destination "NUMBER(5)"
+        VARCHAR2 bcast_destination "VARCHAR2(2), raw 2-byte text, as bound"
         NUMBER token "NUMBER(10), msg offset 40 - kept to settle OQ-L2"
         TIMESTAMP effective_ts "FR11"
         TIMESTAMP updated_at "writer clock"
@@ -1772,7 +1838,7 @@ CREATE TABLE md_market_status (
   transcode             NUMBER(5),
   message_len           NUMBER(5),
   message_text          VARCHAR2(128),
-  bcast_destination     NUMBER(5),
+  bcast_destination     VARCHAR2(2),
   token                 NUMBER(10),
   effective_ts          TIMESTAMP,
   updated_at            TIMESTAMP      NOT NULL,
@@ -1897,7 +1963,7 @@ flowchart TD
 
     CL -->|"context.Canceled"| CAN["SHUTDOWN, not a failure (§8.3)<br/>rollback, rows OutcomeFailed, Vol 2 re-dirties for the drain<br/>OBSERVABLE: INFO shutdown line only —<br/>NOT writes_failed, NOT the fail-fast budget"]
 
-    CL -->|"ErrRowData<br/>00001 01438 12899 01400 02290 02291"| P2["PHASE 2: rollback, re-run the whole batch per row (§6.4)<br/>OBSERVABLE: batch_fallback_perrow"]
+    CL -->|"ErrRowData<br/>00001 01438 12899 01400 01722 02290 02291"| P2["PHASE 2: rollback, re-run the whole batch per row (§6.4)<br/>OBSERVABLE: batch_fallback_perrow"]
     P2 --> P2R{"per-row verdict"}
     P2R -->|"this row fails ErrRowData"| REJ["row OutcomeRejected, batch continues, health stays Healthy<br/>OBSERVABLE: row_rejected{d}, ERROR with row key + ORA code<br/>Vol 2: do NOT requeue; the row self-heals on its next genuine change"]
     P2R -->|"any other class"| ABORT
@@ -1942,7 +2008,7 @@ Extends HLD §9.1 rows F12, F13 and F14 with the ones this volume introduces. `W
 | **W-2** | Statement re-parsed on every execution (finding W2) | `stmt_cache_entries` looks right while Oracle's `parse count (total)` tracks the batch rate | none functionally; library-cache latch traffic | §4.4's `DB.PrepareContext` + `Tx.StmtContext` | Nothing at runtime. Detectable only from the server side, which is why it is written down |
 | **W-3** | A bind arena shorter than the others | **none from the driver** — `arrayBindCount` is the minimum and the surplus rows are silently not written (`command.go:1621-1627`) | **silent write loss** for part of a batch, reported as success | the `Binder` asserts every arena is exactly `len(rows)` before the exec (§5.6 note 2) | Non-zero `rows_affected_mismatch{d}` is the only external symptom. Treat it as a defect, not load |
 | **W-4** | `BatchRow.Mask == 0` | the generator refuses to build an empty `SET` list (§3.5) | one row | `OutcomeRejected` + `batch_row_empty_mask{d}`, batch continues | A Volume 2 defect: the pump batched a clean row |
-| **W-5** | Panic while binding | `recover()` outside `ExecTx` (§7.4) | one batch, plus one reconnect | `Batch.Err`, all rows `Failed`, connection retired, `writer_panic` | Always a defect. The column table and the image disagree |
+| **W-5** | Panic while binding | `recover()` outside `ExecTx` (§7.4) | one batch, and that writer | `Batch.Err`, all rows `Failed`, connection retired, writer retired (ruling D10), `panics_recovered{stage=writer}` | Always a defect. The column table and the image disagree |
 | **W-6** | Statement cache full | `stmt_cache_entries` at `writers.stmtCacheSize` | none functionally; one soft parse per execution | prepare-use-close without caching, `stmt_cache_uncached` | The mask space is not behaving as §4.3 predicts. Look at whether a decoder is clearing bits |
 | **W-7** | Phase 2 itself fails | second classification is not `ErrRowData` | whole batch | abandon; no phase 3 | Read the second error — it is usually the real one, with the row error a symptom |
 | **W-8** | Tablespace full | `ErrSpace` | whole process after 30 s | retry, then FailFast | **Page the DBA.** Unlike every other `Degraded` cause, this one never self-heals |
@@ -2066,12 +2132,12 @@ Shapes per Vol 0 §8.1. All are written by the writer goroutines unless noted.
 | **A13** | `stmt_cache_entries` | **G** | statements | `{writer}` | §4.3 predicts 3. A value above ~20 means the mask space is not what the analysis assumed — not broken, but not understood either |
 | **A14** | `stmt_cache_uncached` | **C** | executions | — | Executions that ran without a cached statement because the cap was hit (§4.3) |
 | **A15** | `batch_fallback_perrow` | **C** | batches | — | Entries into phase 2 (§6.4). Rising means a schema or scaling defect is producing bad rows continuously, and the response is to read the logged row keys, not to add writers |
-| **A16** | `rows_affected_mismatch` | **C** | executions | `{destination}` | `RowsAffected() != len(run)` (§6.5). Also the only external symptom of W-3, the short-arena silent write loss |
+| **A16** | `rows_affected_mismatch` | **C** | rows | `{destination}` | `RowsAffected() != len(run)` (§6.5). Also the only external symptom of W-3, the short-arena silent write loss |
 | **A17** | `batch_row_empty_mask` | **C** | rows | `{destination}` | A `BatchRow` with `Mask == 0` (§3.5). A Volume 2 defect; without the counter it looks like a token that stopped updating |
-| **A18** | `writer_panic` | **C** | batches | — | §7.4. Any non-zero value is a defect; without it a recovered panic is invisible |
+| **A18** | ~~`writer_panic`~~ → `panics_recovered{stage=writer}` | **C** | batches | `{stage}` | §7.4 (ruling D10). `writer_panic` is withdrawn; the shared panic counter carries the writer stage. Any non-zero value is a defect; without it a recovered panic is invisible |
 | **A19** | `writer_conn_recycled` | **C** | connections | `{reason}` = hold \| idle \| error | §2.3's two release rules plus session retirement. Distinguishes "working as designed" from "the database keeps dropping us" |
 | **A20** | `write_probe` | **C** | probes | `{result}` = ok \| fail | §9.3. Without it the degraded-state probe is invisible and "why did it FailFast on a healthy database?" is unanswerable |
-| **A21** | `oracle_error` | **C** | errors | `{code}`, a **fixed 24-slot** table over §8.2's codes plus `other` | `write_retry{class}` is too coarse for a runbook: `ORA-12541` and `ORA-02396` are both `session` and mean entirely different things. Fixed slots, not a dynamic label — the taxonomy is closed |
+| **A21** | `oracle_error` | **C** | errors | `{code}`, **first-come** (ruling D16): the registry hands a slot to each distinct ORA number as it first appears, up to a fixed table, then `other`; it is not a table pre-declared over §8.2's codes | `write_retry{class}` is too coarse for a runbook: `ORA-12541` and `ORA-02396` are both `session` and mean entirely different things. The table is fixed in size, so the label set cannot grow without bound |
 | **A22** | `bind_nonfinite` | **C** | values | `{destination,column}` | §5.4. A NaN reaching a price column means the decoder or the image is wrong |
 | **A23** | `bind_bad_time` | **C** | values | `{destination,column}` | §5.4. Also the first thing to look at if OQ-W2 resolves badly |
 

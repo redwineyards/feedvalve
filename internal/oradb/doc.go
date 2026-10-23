@@ -1,5 +1,6 @@
 // Package oradb is the Oracle connection layer: DBConfig, the DSN builder,
-// describe, redactDSN, OpenDB, the pool settings and oracleErrCode.
+// Describe, redactDSN and Redactor, Open and Check, the pool settings and the
+// error classification.
 //
 // oradb MUST NOT import framing, decode, mirror or destinations.
 //
@@ -27,8 +28,18 @@
 // reuse of a dead one surfaces as ORA-03113 or ORA-03114; retiring connections
 // first turns that error into a reconnect.
 //
-// Classify errors with oracleErrCode rather than by matching strings, so an
-// expected ORA-00001 is distinguishable from an operational ORA-12541.
+// Classify errors with Redactor.Classify, which finds the ORA number through
+// the unexported oracleErrCode (errors.As on the driver's *network.OracleError)
+// and never by matching strings. The result is an *Error carrying an ErrClass
+// from the V3 §8.2 table and an already-redacted cause; context.Canceled is
+// not a failure and classifies as ok == false.
+//
+// The package also holds the DB wrapper (OpenDriver is the seam that lets a
+// scripted driver stand in for Oracle), Session (one pinned connection and its
+// transactions) and Catalog, the read-only query -dbcheck compares against the
+// field map. Its tests run against internal/oradb/oratest, a fake driver that
+// imports nothing of ours, so oradb's tests may import it and it may never
+// import oradb.
 //
 // Carried over from poc/db.go.
 //

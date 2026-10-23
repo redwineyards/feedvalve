@@ -165,7 +165,7 @@ distinguishable from a failure, or every planned shutdown becomes a restart.
 | **1** | Startup failure | restart; a loop is the correct visible symptom | invalid configuration, `ErrNoPassword` (Vol 0 §3.11), Oracle unreachable at open, socket bind refused, arena allocation failure |
 | **2** | **RESERVED — do not use.** The Go runtime exits with status 2 on an **unrecovered panic** | restart | a panic outside the contained regions of §5.5. Seeing 2 means "read the stack trace on stderr", which is a different instruction from either 1 or 4 |
 | **3** | `-selfcheck` failed | n/a — CI branches on it | any validation rule in §2.2 |
-| **4** | Terminal runtime condition | restart | Q1 overflow (F9), database fail-fast (F13), writer-pool self-stop (F20), an impossible `batchQ` send failing (F21), shard panic (F26) |
+| **4** | Terminal runtime condition | restart | Q1 overflow (F9), database fail-fast (F13), writer-pool self-stop (F20), an impossible `batchQ` send failing (F21), shard panic (F26), persistent UDP read failure (V7, Vol 1 §3.7), a batch row never adjudicated (F27), a non-panic shard construction defect (`FatalShardInvariant`) — eight in all *(erratum, Phase 3, ruling D9: the draft listed five)* |
 
 Codes 1, 2 and 4 are all "restart" to a supervisor and differ only diagnostically. That is the point:
 `echo $?` at 03:00 answers "did it fail to start, did it panic, or did it hit a terminal condition?"
@@ -185,7 +185,7 @@ stateDiagram-v2
     Reloading --> Running: valid, Store.Swap then side effects,\nconfig_reloads++ and config_generation++
     Reloading --> Running: invalid, rejected wholesale,\nold config keeps running, config_reload_rejected++
     Running --> Draining: SIGINT or SIGTERM, ctx cancelled, exit 0
-    Running --> Draining: terminal on fatalCh — Q1 overflow F9,\nDB fail-fast F13, pool self-stop F20,\nbatchQ send F21, shard panic F26 — exit 4
+    Running --> Draining: terminal on fatalCh — Q1 overflow F9,\nDB fail-fast F13, pool self-stop F20,\nbatchQ send F21, shard panic F26, UDP read V7,\nunreported row F27, shard invariant — exit 4
     Draining --> Stopped: socket closed, receiver returned, shardCh closed,\nfinal flush-all under ONE shared 5000 ms deadline,\nbatchQ closed, writers returned, pool closed
     Stopped --> [*]
 ```
@@ -252,7 +252,7 @@ Ten steps. Steps 3–10 are the drain and live in `run`'s **body**; steps 11–1
 | # | Step | Why here, and what bounds it |
 |---|---|---|
 | 1 | `ctx.Done()` fires, **or** a terminal condition is delivered on `fatalCh` | One entry point for both, so there is one drain implementation (§1.3) |
-| 2 | Log `INFO shutdown initiated reason=<signal\|F9\|F13\|F20\|F21>` **with the counter snapshot** | HLD §10.2: a terminal message must carry the counters that led to it. R12 — "operators do not read the 60 s line" — is mitigated only if the last line is self-contained |
+| 2 | Log `INFO shutdown initiated reason=<signal\|F9\|F13\|F20\|F21\|F26\|V7\|F27\|shard-invariant>` **with the counter snapshot** *(erratum, Phase 3: the eight `FatalReason`s of §1.2)* | HLD §10.2: a terminal message must carry the counters that led to it. R12 — "operators do not read the 60 s line" — is mitigated only if the last line is self-contained |
 | 3 | **Close the UDP listener** | The **only** way to unblock an in-flight `ReadFrom` (`poc/gobrdclnt.go:135-145`). No deadline, no `SetReadDeadline`, no polling |
 | 4 | Receiver observes the read error, sees `ctx.Err() != nil`, returns **without logging it as a failure** | A read error during shutdown is shutdown, not a fault (`poc/gobrdclnt.go:152-154`) |
 | 5 | `app` waits for the receiver's `done` channel | Bounded: the receiver's only wait is a Q1 send at ≤ 50 ms (Vol 0 §9.2 Q1), plus one datagram's decode. Worst case well under 100 ms |
@@ -348,7 +348,7 @@ func (g *Graph) Run(ctx context.Context) error
 // is what reaches the shutdown log line. It never calls os.Exit (Vol 0 §10.4).
 func (g *Graph) Fatal(reason FatalReason, detail string)
 
-// FatalReason enumerates the five conditions of §1.2 exit code 4, so the
+// FatalReason enumerates the eight conditions of §1.2 exit code 4, so the
 // shutdown line and the exit path cannot disagree about which one fired.
 type FatalReason uint8
 
@@ -358,6 +358,9 @@ const (
     FatalWriterPoolStop                    // F20 — the two-writer statement rule, HLD §9.2
     FatalBatchQSendFail                    // F21 — impossible by construction, HLD §7.3
     FatalShardPanic                        // F26 — arena mid-mutation, §5.5
+    FatalUDPReadFailure                    // V7  — persistent read failure, Vol 1 §3.7
+    FatalBatchRowUnreported                // F27 — Vol 2 §2.7 S3            [erratum, Phase 3, D9]
+    FatalShardInvariant                    // non-panic shard defect, Vol 2 §2.7  [erratum, Phase 3, D9]
 )
 ```
 
@@ -418,7 +421,7 @@ sequenceDiagram
         LC->>LC: "WARN config reload rejected key=<path> reason=<rule id><br/>config_reload_rejected++ ; NOTHING is applied"
         Note over LC,WRP: "the previous configuration keeps running, unchanged.<br/>A partially applied configuration is worse than a stale one (HLD §6.9, F15)"
     else "all rules pass"
-        LC->>LC: "rebuild derived state: decoder registry entries with new ColSpecs,<br/>CARRYING FORWARD each surviving code's *atomic.Bool GuardOff (§2.4 R-GUARD)"
+        LC->>LC: "rebuild derived state: decoder registry entries with new ColSpecs,<br/>the GuardOff bits are NOT rebuilt: they live in mirror.GuardTable (§2.4 R-GUARD)"
         LC->>CFG: "Store.Swap(new) — ONE store; readers see all-old or all-new"
         LC->>LC: "apply live side effects IN ORDER: GOMAXPROCS,<br/>SetReadBuffer, SetMaxOpenConns/Idle = writers.count+1,<br/>SetConnMaxLifetime, writer pool resize"
         LC->>LC: "config_reloads++ ; config_generation = n+1<br/>INFO config reloaded generation=n+1 changed=[keys]"
@@ -431,6 +434,16 @@ sequenceDiagram
 *Figure 4.4 — The SIGHUP path. The only write to shared state is the single `Store.Swap`; everything
 before it is construction on the lifecycle goroutine's own stack and everything after it is idempotent
 side effects derived from the freshly published pointer. The rejected branch touches nothing at all.*
+
+> *(Erratum, Phase 5, rulings D1, D2, D21; `internal/app/reload.go`.)* Three corrections to the figure.
+> **Two publication points, not one store:** `config.Store.Swap` assigns the generation and publishes the
+> `*Config`; `Graph.setRuntime` then publishes the `Runtime` snapshot (config, registry, destinations, mirror
+> parameters, parsed source allow-list), which is what the datapath reads. Between the two, `Store.Load()` is
+> new while `loadRuntime()` is old; this is benign because no datapath reader uses `Store.Load()`. **Validation
+> is `config.ValidateAll(ModeRun)`**, never a bare `Store.Swap`, which skips the schema and destination rules.
+> **A fresh `decodeCounters` is built with each registry** (D11); the old sink is never mutated. The generation
+> is stored in the `config_generation` gauge and the INFO line `config reloaded generation=n changed=[keys]
+> applied=[...] failed=[...]` is written at once, not at the next emission.
 
 ### 2.2 The validation rule set, complete
 
@@ -518,6 +531,9 @@ invisible until it corrupts a row.
    different `maxBatchSize` values inside one epoch.
 
 > **R-GUARD — the one piece of mutable state a rebuilt registry must carry forward.**
+> *(erratum, Phase 3, ruling D2: satisfied structurally. The bit is not in `RegistryEntry`; it lives in
+> `mirror.GuardTable`, built once by `app`, shared by every shard and never rebuilt, so a reload cannot
+> reset it. The rule below stands as the reason that table is outside the registry.)*
 > `RegistryEntry.GuardOff` is a `*atomic.Bool` (Vol 0 §3.9) written solely by the stats goroutine when
 > `ordering.guard: auto` disables the guard for a transcode (HLD §6.5). It is **state, not
 > configuration**. A rebuilt registry that allocates a fresh `atomic.Bool` per code silently
@@ -553,6 +569,20 @@ within one window" (HLD §6.9) is not true of all of them.
 4. `db.SetConnMaxLifetime(new.DB.ConnMaxLifetime)`
 5. Writer pool resize (§2.5)
 
+> *(Erratum, Phase 5, rulings D14, D19, D13; `applyLive` in `internal/app/reload.go`.)* The as-built order is
+> `GOMAXPROCS` (only if changed), `SetReadBuffer` (read back, `readbuf_effective_bytes`, logged), the database
+> setters `SetConnMaxLifetime` **and `SetConnectTimeout`** (a sixth effect beyond the five listed: the key
+> `db.connectTimeoutSec` is reloadable and would otherwise be silently ignored), then `SetLevel`,
+> `SetRatePerMin`, `DebugLogger.Set` and `Reg.SetIntervalSec`, and `Pool.Resize` **last**. Step 3 is
+> **amended**: the `database/sql` limits are not applied by a separate step before the resize. `Pool.Resize`
+> calls `SetPoolSize(n+1, n+1)` itself, first, and is called only when `writers.count` changed. `Pool.ReloadHealth()`
+> runs before any of this, right after the `Runtime` is published, so the new `statementFailWriters` is in force
+> when the new count is judged (a count below it is rejected by V-X1, not clamped). A side-effect failure is
+> listed under `failed=` in the INFO line and never rolls the swap back. The receiver does not pick up at "the
+> top of the read-loop iteration" but once per datagram, after `ReadFrom` returns, via `loadRuntime()`; the
+> guard evaluator and the circuit tick re-arm their timers from the live configuration after each firing, like
+> `stats.intervalSec`, so each takes up to one OLD period to adopt a change.
+
 They are applied **after** the swap, not before, because each one is idempotent and derived from the
 *published* pointer: there is then exactly one source of truth, and a side effect that fails can be
 re-derived by re-reading `Store.Load()`. Applying before the swap would make the published config the
@@ -581,6 +611,14 @@ flowchart TD
 **rejected wholesale**, taking the reloadable changes in the same file down with it. That is
 deliberate: a file where half the operator's edits took effect and half did not is the condition
 HLD §6.9 and ADR-010 exist to prevent.*
+
+> *(Erratum, Phase 5.)* `config.StartupOnlyKeys` has **fourteen** entries: Vol 0 §7.2's thirteen plus
+> `runtime.destinationsFile`, an implementation addition (the destination file is read once; V-R2 compares
+> the loaded set). The destination set's shape (name, table, rowKey, ordered columns) is V-R2 and is compared
+> against `Runtime.Dests`, the running set. `udp.sourceAllowList`, `udp.sourceEnforce`, `ordering.gapScope`
+> and `ordering.gapAuditPackets` remain **reloadable** as Vol 0 §7.2 marks them (ruling D9, default; see the
+> Phase 5 as-built notes): the first two through the `Runtime` snapshot, the last two through
+> `decode.GapDetector.Reconfigure`, applied by the decoder at the next datagram after a new generation.
 
 **How V-R1 is implemented, and why not a fingerprint.** The comparison is table-driven over a
 **declared list of startup-only key paths**, not a hash of the whole projection. A hash would be two
@@ -611,7 +649,8 @@ stated the HLD's wording.
 
 - **Grow** (`new.Writers.Count > old`): start the difference as fresh goroutines, each acquiring its
   own session from the already-widened pool. `writers_configured` is `Store`d by the lifecycle
-  goroutine (Vol 0 §8.2).
+  goroutine (Vol 0 §8.2). *(Erratum, Phase 5: by the **pool**, in `Start` and `Resize`. The stats sampler no
+  longer writes it; doing so overwrote the resized value with the startup count.)*
 - **Shrink**: close the per-writer `stop chan struct{}` of the highest-indexed writers. A writer
   checks `stop` **only between batches, never inside a transaction** — a writer that abandoned a
   transaction would leave row locks held until the session timed out. It holds no mirror state
@@ -676,8 +715,21 @@ var StartupOnlyKeys = []string{ /* … */ }
 // starting at 1 for the one loaded at startup. It is published as the
 // config_generation gauge and logged on every accepted reload, so an operator
 // can confirm a change took effect rather than inferring it from silence.
-func (s *Store) Generation() uint64
+func (s *Store) Generation() uint64  // as built: Gen()
 ```
+
+> *(Erratum, Phase 5, rulings D21 and D22. The sketch above is superseded by the as-built API.)*
+> `config.ValidateAll(c, dests, prevDests *destinations.Set, prev *Config, mode Mode) error` is the one entry
+> point; `prev` and `prevDests` are nil at startup and under `-selfcheck`. It returns a `*ValidationError`
+> holding every `Problem` (rule, key path, running and attempted values, detail); `ValidationError.RuleError()`
+> derives the spec's `RuleError{Rule, KeyPath, Running, Attempt, Detail}` from `Problems[0]`, so the reload
+> WARN names the first failure while `-selfcheck` prints all. There is no `Validate`/`ValidateAll` split and
+> no `[]error` return. `StartupOnlyKeys` exists as sketched but is derived from the same table V-R1 enforces
+> (fourteen entries, see §2.5). **There is no `Store.Generation()`**: the method is `Store.Gen()`
+> (`internal/config/store.go`), and the gauge reads it. V-DB3 (a password key anywhere in the file, caught by
+> a key-walk before strict decoding because `DisallowUnknownFields` would otherwise fire first and hide it)
+> and V-STRICT1 are raised by the loader; V-STRICT1 reports the **leaf** key name only, since
+> `encoding/json` does not give the path.
 
 ---
 
@@ -843,6 +895,14 @@ Three rules, each stated because each is a way to get this wrong:
    startup naming the unresolvable zone, and leaves severities at their louder setting. A timezone
    database problem must not silence a circuit alarm.
 
+> *(Erratum, Phase 5, ruling D3; OPEN for the user's decision.)* As built, **V-TZ1 rejects an unresolvable
+> zone at load, at `-selfcheck` and on reload**, so the "WARN at startup, fail open" leg cannot occur through
+> the shipped binary (`time/tzdata` is linked, so only a genuinely unknown name fails). The fail-open path
+> exists in `health.NewWindow` as defence in depth (a fail-open Window, every hour in-window, plus an error the
+> caller in `internal/app/health.go` logs once; state and counters untouched) and **G-LIVE-3 is gated at health level** (`TestG_LIVE_3_UnresolvableZoneFailsOpen`).
+> The alternative is to demote V-TZ1 to a WARN and fail open at runtime. This also qualifies OQ-L5: a missing
+> zoneinfo is now a startup refusal, not a louder alarm.
+
 ### 3.6 Interface sketch
 
 ```go
@@ -926,6 +986,14 @@ restart case (F18): after a mid-session start the very first status message of a
 the state. Gauge values 0 Unknown, 1 PreOpen, 2 PreOpenEnded, 3 Open, 4 Closed, 5 PostClose
 (Vol 0 §8.2, `session_state{market_type}`).*
 
+> *(Erratum, Phase 5, ruling D4; OPEN for the user's decision.)* The as-built edge set is Figure 4.7
+> **exactly as drawn** (`health.expectedEdge`, one table pinned by `TestSessionEdgeSetIsPinned`). Consequence:
+> an overnight process sees `Closed -6511-> Open` or `PostClose -6511-> Open` the next morning if the
+> pre-open pair 6531/6571 is not received first, and counts `session_anomalies`. The proposal is to add those
+> two edges as expected so a normal morning is not an anomaly; it would also shrink the signal §10.1 asks
+> `session_anomalies` to give next to `seq_gap_messages` (a lost 6531/6571 pair would no longer register). It
+> is a two-line change to `expectedEdge`; it needs bible §4.5 cited if taken.
+
 ### 4.3 Out-of-order and missed transitions: accept, count, never reject
 
 > **Rule:** `next = stateOf(code)`, always. The edge set of Figure 4.7 determines only whether the
@@ -939,6 +1007,14 @@ Three cases, each with a concrete reason:
 | **Missed intermediate** — e.g. `Open --6511--> Open` after a lost 6521/6531 pair, or `Closed --6511--> Open` with the re-open's 6531 and 6571 lost | Apply. Count `session_anomalies{market_type}`. WARN, rate-limited per `(market_type, from, to)` | The messages themselves can be lost, permanently, with no retransmission (bible §1, §2.8). A missing intermediate is the *expected* consequence of one lost datagram. A machine that refused to advance would convert one lost datagram into a session-long wrong state — strictly worse than the thing it was protecting against |
 | **Repeat** — the same code arriving while already in that state | Apply (idempotent). Count `session_transitions{market_type}`. No anomaly, no log | The exchange may resend; a duplicate is not information |
 | **Genuinely out of order** — a transition whose ordering value is older than the last applied | The *health* machine applies it in arrival order regardless. The *mirror* is where ordering is enforced, per contributor slot (§4.4) | Two consumers of one message with deliberately different semantics: health describes **what arrived**; the mirror decides **what is written**. Conflating them would put the ordering guard on the logging path |
+
+> *(Erratum, Phase 5, rulings D15, D16.)* The table's first row lists `Open --6511--> Open` as a missed
+> intermediate and an anomaly, which contradicts its own second row. As built, a **repeat** (the next state
+> equals the current one, whatever the cause) is applied, counted in `session_transitions`, and is **not** an
+> anomaly (G-SESS-3), so the example in row one is a repeat. A genuine missed intermediate is a change of
+> state along a non-drawn edge (for example `Closed -6511-> Open`). Anomaly WARNs are rate-limited **per
+> class** (`session_anomaly`), coarser than per `(market_type, from, to)`. A `MarketType` outside 1-4 is
+> logged (rate-limited) and counts nothing.
 
 **And it never gates the data path.** HLD §6.10 states the reason and it is worth repeating because
 the temptation is real: gating writes on a session state derived from messages that can themselves be
@@ -990,7 +1066,7 @@ and is declared here in the same form (§10, addition A-CH-1):
 
 | # | Channel | Element | Capacity | Producer | Consumer | Send semantics | Full ⇒ |
 |---|---|---|---|---|---|---|---|
-| **H** | `sessionCh` | `model.SessionEvent` **by value**, 16 B | **64**, startup-only | receiver (decode path) | stats/health (sole) | **non-blocking** `select` with `default` — never waits, never enters the stall budget | drop the event; `session_events_dropped`++ . Losing one costs a log line and a gauge update and **never costs data**: the same message has already been routed to its shard as an `UpdateUnit` and will be written |
+| **H** | `sessionCh` | `model.SessionEvent` **by value**, 16 B | **64**, startup-only | decoder side of the receive path *(erratum, Phase 5, D5)* | stats/health (sole) | **non-blocking** `select` with `default` — never waits, never enters the stall budget | drop the event; `session_events_dropped`++ . Losing one costs a log line and a gauge update and **never costs data**: the same message has already been routed to its shard as an `UpdateUnit` and will be written |
 
 **Capacity arithmetic.** The worst plausible burst is one simultaneous re-open across all four market
 types: 4 × 3 = **12 events inside one second**, drained by a 1 s health tick. Sixty-four is 5× that,
@@ -1010,6 +1086,17 @@ type SessionEvent struct {
     RecvMono   int64     // ns since process start — the ordering the health machine applies
 }
 ```
+
+> *(Erratum, Phase 5, ruling D5.)* The producer is the **decode step of the receive path**, not a separate
+> "receiver" duty: after a sub-packet's units are routed to their shards, outside the recover boundary,
+> `publishSession` (`internal/app/health.go`) calls `decode.SessionEventOf(&unit)`, which reads `MarketType`
+> from the unit's destination-2 row key (all five status codes are one structure, `vctMsgs`, whose
+> `MarketType` is the row key), so **no field was added to `UpdateUnit` and no decoder changed**. The send is
+> a non-blocking `select`; a full channel increments `session_events_dropped` and the `UpdateUnit` is still
+> delivered. The ledger names the instrument's owner `decoder` (`internal/obs/ledger.go`), not `receiver`.
+> The channel is allocated in `Build` (`sessionChCap = 64`); the stats goroutine drains it completely,
+> FIFO, on its circuit tick, and the channel survives a stats-goroutine restart, so events queued across a
+> restart are drained, not dropped.
 
 ```
 SessionEvent — align 8, size 16
@@ -1048,7 +1135,7 @@ row an operator could look up.
 | **F11** | Database transiently slow | `epoch_duration_max_ns` > `W`; `tick_skipped_epoch_open` and `dirty_depth` rise | Freshness only | The epoch outlasts the window, the next tick is skipped, its rows join a larger cohort. **Intended automatic degradation** (req §9 step 2) | `epoch_duration_max_ns{k}`, `tick_skipped_epoch_open{k}`, `dirty_depth{k,destination}` | Usually nothing. If sustained, **raise `writers`** (live lever), widen `W`, or raise `maxBatchSize`. If writers are idle while one shard's epoch climbs, `maxInFlightPerShard` is binding — **startup-only**, so it needs a restart (OQ-14) |
 | **F12** | Dead Oracle session — `ORA-03113`, `ORA-03114` | `oracleErrCode` classification ⇒ `ErrSession` (Vol 0 §3.11) | **One batch.** The affected writer's batch returns failed, its rows are re-dirtied at the ring **head**, every other writer keeps serving every shard | Retire the connection, retry once on a fresh session, then backoff | `write_retry{class=session}`, `writes_failed`, `retry_requeued{k}` | None if it self-heals. **Recurring means the Oracle profile's `IDLE_TIME` is shorter than `db.connMaxLifetimeMinutes` (30)** — the one thing V-X7 cannot validate. Lower the key or raise the profile (OQ-8) |
 | **F13** | **Database hard outage** — `ORA-12541` no listener, connect refused, sustained | Consecutive failures past the fail-fast budget: `writers.failFastSeconds` (30) **or** `writers.failFastWrites` (20), whichever first | **Whole process**, by design (req §10.2) | Retry with backoff until the budget expires, then FATAL → `Fatal(FatalDBFailFast)` → drain (which will abandon everything, §1.6) → **exit 4**. No spooling, no catch-up (ADR-014) | `writes_failed`, `write_retry{class=session}`, `writer_health_state`=2 | Fix the database. §5.3 has the full hour-long-outage analysis **and the one lever that changes the answer** |
-| **F14** | Row-level data error — `ORA-00001`, `ORA-01438`, `ORA-12899` | `oracleErrCode` ⇒ `ErrRowData` | **One row.** `OutcomeRejected`: the batch continues and the writer stays Healthy | Log the key and ORA code, count, **continue the batch**. The row's `Digest` is left unchanged, so its next genuine change is not suppressed and the row self-heals on its next tick (Vol 0 §5.4) | `row_rejected{destination}` | Investigate the value. Usually a scaling or column-width mismatch — **bible §2.4: v3.5 changed price precision from (6,4) to (7,2)**, which is exactly an `ORA-01438` generator |
+| **F14** | Row-level data error — `ORA-00001`, `ORA-01438`, `ORA-12899`, `ORA-01722` *(erratum, Phase 4: 01722 is a row-data code and a phase 2 trigger, ruling D6b; `ORA-24381` is not one, it is Unknown with one retry, D6a)* | `oracleErrCode` ⇒ `ErrRowData` | **One row.** `OutcomeRejected`: the batch continues and the writer stays Healthy | Log the key and ORA code, count, **continue the batch**. The row's `Digest` is left unchanged, so its next genuine change is not suppressed and the row self-heals on its next tick (Vol 0 §5.4) | `row_rejected{destination}` | Investigate the value. Usually a scaling or column-width mismatch — **bible §2.4: v3.5 changed price precision from (6,4) to (7,2)**, which is exactly an `ORA-01438` generator |
 | **F15** | Invalid configuration on SIGHUP | Validation before the swap (§2.2) | **None** | Reject wholesale, log the first failing rule with key and both values, keep the previous configuration running. The process does not stop | `config_reload_rejected`; `config_generation` does **not** advance | Fix the file, re-send SIGHUP, **confirm `config_generation` advanced** — absence of an error is not confirmation (§2.6) |
 | **F16** | Disk fills | The platform's own monitoring; in-process, log writes begin failing silently (`log.Printf` discards its write error) | **Operational logging only. The data path writes no files at all** — no packet log (deleted, Vol 0 §1.2), no spool, no WAL, no checkpoint (ADR-014) | Log volume is bounded by design: counters plus rate-limited events. The relay keeps decoding and writing to Oracle while blind | none in-process — this is the honest limit | Rotate via the platform's normal mechanism. `poc`'s `-maxout` cap and `packetLogger` do **not** exist here, so the `poc` failure mode of a packet log filling the disk cannot recur |
 | **F17** | Circuit silent — no data and no 6541 pulse | Liveness machine (§3, bible §4.12) | **All data, for the duration, permanently** | WARN at `heartbeatWarnSec`, ERROR at `heartbeatDownSec`, outage duration logged on recovery. Severity downgraded outside the trading window (§3.5) | `circuit_state`, `circuit_quiet_events`, `circuit_down_events`, `circuit_outage_max_ns` | Check the circuit with the exchange. **FeedValve cannot request a resend** (bible §1). On recovery, read `seq_gap_messages` for the size of the hole |
@@ -1061,7 +1148,8 @@ row an operator could look up.
 | **F24** | **Shard stall** — a shard's loop pass takes orders of magnitude longer than budgeted | `shard_loop_max_ns{k}` and `shard_depth_max{k}` rising; `shard_send_blocked` non-zero | Rising: freshness on that partition. If it continues, **F9** | No automatic response. This is the **early warning for the one fatal condition**, and it is the only one there is | `shard_loop_max_ns{k}`, `shard_depth_max{k}`, `shard_send_blocked{k}` | Investigate **before** F9 fires. Likely causes: arena chunk allocation (`arenaChunkRows`), index rehash (`expectedRows` under-sized), or a completion path doing work it should not |
 | **F25** | **Panic inside framing or decode of one sub-packet** | `recover()` at the sub-packet boundary, as `poc/gobrdclnt.go:178-183` | **That sub-packet.** The datagram's remaining sub-packets are still framed and processed | Recover, ERROR with the transcode and packet index, count, continue the loop. **This is HLD §9.5's layer 4 — the last line, not the first** | `panics_recovered{stage=decode}` — **an addition to the Vol 0 ledger** (§10); without it, a decoder bug degrades to one silently lost message per packet forever | Any non-zero value is a decoder bug. Capture the payload with `debug.traceTranscodes` for that code and re-derive the layout against bible Part V |
 | **F26** | **Panic inside a shard goroutine** | Deferred `recover()` in the shard's own top frame | **Whole process** | **Terminal.** The arena and the index are mid-mutation, so every later read of that partition is undefined — and Q1 would fill and go fatal a second later anyway, with a worse message. FATAL with the stack → `Fatal(FatalShardPanic)` → drain the **other** shards → **exit 4** | `panics_recovered{stage=shard}` (counted once, then terminal) | File a bug with the stack. Then restart: the mirror is rebuilt from the feed (F18) |
-| **F27** | **A batch returns with a row still `OutcomePending`** | The owning shard's completion path checks every row (Vol 0 §5.4) | **Whole process** | A writer returned a batch it never adjudicated — a **writer defect, not a load condition**. Count and stop loudly | `batch_row_unreported{k}` — **zero or the process stops** | File a bug. This is the failure mode of HLD's L3/L4 defects and it is invisible without this counter (Vol 0 §8.3 G6) |
+| **F27** | **A batch returns with a row still `OutcomePending`** | The owning shard's completion path checks every row (Vol 0 §5.4) | **Whole process** | A writer returned a batch it never adjudicated — a **writer defect, not a load condition**. Count, requeue the rows at the ring head, and stop loudly: `Fatal(FatalBatchRowUnreported)` → drain → **exit 4**. The shard does **not** return; it keeps running into the normal drain, which may still write the requeued rows *(erratum, Phase 3, ruling D9; Vol 2 §2.7 S3)* | `batch_row_unreported{k}` — **zero or the process stops** | File a bug. This is the failure mode of HLD's L3/L4 defects and it is invisible without this counter (Vol 0 §8.3 G6) |
+| **—** `FatalShardInvariant` *(erratum, Phase 3, ruling D9)* | **A shard construction defect that is not a panic** — a row in two batches (S2), a non-empty cohort at epoch open, a misrouted or twice-returned batch (step 0a) | The shard's own checks (Vol 2 §2.7); `Run` returns the error | **Whole process** | The partition's state can no longer be trusted. ERROR `shard stopped on a construction defect` naming the counter, then `Fatal(FatalShardInvariant)` → drain the **other** shards → **exit 4**. Not F26: there is no panic and no stack | `inflight_desync{k}`, `cohort_not_empty{k}`, or none (step 0a) — named in the FATAL line as `counter=` | File a bug with the counter snapshot and the line. Then restart: the mirror is rebuilt from the feed (F18) |
 | **F28** | **Panic inside the stats/health goroutine** | Deferred `recover()` in its own top frame | **Observability only** — but that is the whole safety story (R12) | Recover, ERROR directly via `appLogger` (which never depends on the registry), count, **restart the goroutine** | `panics_recovered{stage=stats}` | Non-zero means observability was blind for up to one interval. File a bug; the process is otherwise healthy |
 | **F29** | A variable-width value exceeds its declared image width and is cut | Length check at merge; `message_len` clamped to 128 (Vol 0 §4.5) | One column of one row. **Two market-status messages agreeing in their first 128 bytes digest identically and the second is suppressed** (Vol 0 §5.2) | Truncate, store, count. Correct behaviour for the declared schema | `message_truncated{destination,column}` | Non-zero means the cap is too tight **or** ASM-16b needs revisiting. Both are schema decisions, so this is what keeps OQ-13 honest after the fact |
 
@@ -1134,15 +1222,19 @@ flowchart TD
         C -->|"no — the EARLY WARNING window"| D["no action; freshness only.<br/>THIS is the only warning there is"]
         C -->|"yes, ONCE"| E["F9 Fatal(FatalQ1Overflow)<br/>nothing discarded, anywhere"]
         P1["F26 panic in a shard goroutine<br/>arena mid-mutation"] --> E2["Fatal(FatalShardPanic)"]
+        P2["S2 / cohort_not_empty / step 0a<br/>shard Run returns an error"] --> E3["Fatal(FatalShardInvariant)"]
+        V["V7 persistent UDP read failure"] --> E4["Fatal(FatalUDPReadFailure)"]
     end
     subgraph WRT["Write side"]
         F["F13 FailFast, budget spent"] --> G["Fatal(FatalDBFailFast)"]
         H["F20 pool self-stop,<br/>same (dest, mask) on 2 writers"] --> G2["Fatal(FatalWriterPoolStop)"]
         I["F21 batchQ send fails<br/>— impossible by construction"] --> G3["Fatal(FatalBatchQSendFail)"]
-        J["F27 row returned OutcomePending<br/>— writer defect"] --> G4["shard stops loudly"]
+        J["F27 row returned OutcomePending<br/>— writer defect"] --> G4["rows requeued at the head;<br/>Fatal(FatalBatchRowUnreported),<br/>the shard keeps running into the drain"]
     end
     E --> DR["Draining — the SAME sequence as a requested stop (§1.5):<br/>close socket, close shardCh, final flush-all under ONE 5 s deadline,<br/>close batchQ, writers return, close pool"]
     E2 --> DR
+    E3 --> DR
+    E4 --> DR
     G --> DR
     G2 --> DR
     G3 --> DR
@@ -1150,7 +1242,8 @@ flowchart TD
     DR --> X(["exit 4 — supervisor restarts<br/>drain_abandoned_rows{destination} records what was lost"])
 ```
 
-*Figure 4.10 — The six terminal paths and the one drain they share. The left branch's value is the
+*Figure 4.10 — The eight terminal paths and the one drain they share *(erratum, Phase 3, ruling D9:
+six in the draft, with F27 stopping the shard; V7 and `FatalShardInvariant` added)*. The left branch's value is the
 node marked **early warning**: F24 is observable for as long as the stall lasts, and F9 is the cliff
 at the end of it. After a **F13** or **F20** stop the drain will abandon everything, because the
 database is the thing that failed — that is expected and is counted, not an additional error (§1.6).*
@@ -1353,9 +1446,30 @@ per packet** (HLD §10.2).
 | Level | Emitted for | Rate control |
 |---|---|---|
 | INFO | startup with the effective configuration; socket bind with the **effective** receive-buffer size; Oracle server version; accepted config reload with `generation=` and the changed keys; circuit and session transitions; the interval emission; shutdown with the drain summary | naturally bounded — all are per-process or per-event-at-human-rate |
-| WARN | F1 sequence gap, F5 netId mismatch, F6 oversize datagram, F8 record-count clamp, F19 unexpected source, F29 truncation, F23 clock step, F15 rejected reload, session anomalies (§4.3), a Q1 send that had to wait at all | token bucket **per event class**, `stats.eventRatePerMin` (10/min), with a `suppressed=N` suffix on the next emitted line of that class and a `log_events_suppressed{class}` counter |
-| ERROR | F3 decompression failure, F4 framing abandoned, F7 error response, F12/F13 write failures, F14 row rejected, F22 writer stopped, F25/F26/F28 recovered panics, a failed startup step | token bucket per class |
-| **FATAL** | the five terminal conditions of §1.2 exit code 4 | **once**, with the full reason **and the counter snapshot that led to it** |
+| WARN | F1 sequence gap, F5 netId mismatch, F6 oversize datagram, F8 record-count clamp, F19 unexpected source, F29 truncation, F23 clock step, F15 rejected reload, session anomalies (§4.3), a Q1 send that had to wait at all, Vol 2's `epoch_stalled` (§2.4) *(erratum, Phase 3: this and the four ERROR classes below were Vol 2 events with no class)* | token bucket **per event class**, `stats.eventRatePerMin` (10/min), with a `suppressed=N` suffix on the next emitted line of that class and a `log_events_suppressed{class}` counter |
+| ERROR | F3 decompression failure, F4 framing abandoned, F7 error response, F12/F13 write failures, F14 row rejected, F22 writer stopped, F25/F26/F28 recovered panics, a failed startup step; Vol 2's `blob_len_mismatch` (§4 step 4), `guard_disabled` (§5.5), `drain_deadline` (§2.6) and `shard_defect` (§2.7, F27 / `FatalShardInvariant`) *(erratum, Phase 3)* | token bucket per class |
+| **FATAL** | the eight terminal conditions of §1.2 exit code 4 *(erratum, Phase 3: five in the draft)* | **once**, with the full reason **and the counter snapshot that led to it** |
+
+**Phase 5 log classes *(erratum, ruling D16; `internal/obs/class.go`)*.** Three classes were added and one
+was split. `circuit_quiet` (WARN) and `circuit_down` (ERROR) carry the §3.4 transitions (a Down outside the
+trading window is emitted at WARN under the `circuit_down` class). `decode_anomaly` (in the WARN run of the
+enum) now carries what `session_anomaly` used to carry from the decode path (content a sub-packet should not
+carry: a decompressed-length mismatch, an unconfigured or unknown transcode, a decoder error, a unit-count
+overrun, a blob overrun); `session_anomaly` is session-only (§4.3). The
+Q1 stall-budget fatal (§5.4) is re-homed to `shard_defect` and, as before, deliberately takes no `Allow`.
+Rate limiting stays **per class**, coarser than §4.3's per-`(market_type, from, to)`. **Known wrinkle:**
+`Allow` and `Warnf` treat every class below the first ERROR class as WARN-gated, so the three
+`decode_anomaly` sites that call `Errorf` (a decoder error, a unit-count overrun, a blob overrun) are
+suppressed at `stats.logLevel=error`, which is not what the severity says. Follow-up: split the class by
+severity. The F28 stats-restart line uses the startup class (exempt from `Allow`) so a drained bucket cannot
+hide a stack.
+
+**Writer log classes *(erratum, Phase 4)*.** The writer logs through four of the classes above and no
+other: `write_failed` (F12/F13 batch failures at ERROR; and, at WARN, the one line for a batch that
+committed after a retry, ruling D6c, which changes no health state), `row_rejected` (F14, with the row
+key and the ORA number, never a bind value), `writer_stopped` (F22, a member retiring itself, including
+after a recovered panic) and `panic_recovered` (stage `writer`, ruling D10). No writer line carries the
+DSN, a bind value or statement text (G-SEC-1).
 
 > **FATAL is a severity string, not a logger method.** HLD §10.2 calls the level "FATAL-then-exit",
 > which reads as an invitation to `log.Fatalf` — and `log.Fatalf` calls `os.Exit`, which skips every
@@ -1512,11 +1626,18 @@ production. Push each invariant to the cheapest layer that can hold it.
 | §7.6 Runtime — assertions compiled in under a build tag | **1** | stress + LPAR smoke; compiled out in production | — |
 
 **By owning volume**, so each sibling knows which gates are its acceptance criteria: Vol 1 (receive
-and decode) 24 — G-LAY-1, G-BLD-1, G-DEP-1/3, G-SC-2, G-ALLOC-1, G-PTR-1, G-HDR-1/2, G-FRM-1…8,
-G-ORD-4, G-DIFF-1, G-FIX-1, G-AIX-1. Vol 2 (shard and mirror) 25 — G-LAY-2/3, G-ALLOC-2, G-PTR-1,
+and decode) 21 — G-LAY-1, G-BLD-1, G-DEP-1/3, G-SC-2, G-ALLOC-1, G-PTR-1, G-HDR-1/2, G-FRM-1…8,
+G-ORD-4, G-DIFF-1, G-FIX-1, G-AIX-1. Vol 2 (shard and mirror) 26 — G-LAY-2/3, G-ALLOC-2, G-PTR-1,
 G-MASK-1/2, G-DIG-1/2/3, G-ORD-1/2/3, G-FLUSH-1/2/3, G-EPOCH-1…4, G-INFL-1…4, G-ROW-1/2/3.
-Vol 3 (writer and persistence) 7 — G-STMT-1/2, G-ROW-1/2, G-SEC-1/2, G-CFG-7. Vol 4 (this one) 35 —
-everything in §7.3.6 outside the four above, plus §7.2, §7.4, §7.5, §7.6.
+Vol 3 (writer and persistence) 7 — G-STMT-1/2, G-ROW-1/2, G-SEC-1/2, G-CFG-7. Vol 4 (this one) 38 —
+G-BLD-2/3, G-DEP-2, G-SC-1, the thirty §7.3.6 gates not named above (G-LIFE-1…5, G-DRAIN-1/2,
+G-CFG-1…6, G-CFG-8, G-SEC-3, G-LIVE-1…3, G-SESS-1…4, G-CLOCK-1, G-OBS-1…4, G-LOG-1, G-KEY-1,
+G-UNT-1), G-RACE-1…3 and G-ASSERT-1. The four figures sum to 92 against eighty-nine distinct gates
+because three are credited to two volumes: G-PTR-1 (Vols 1 and 2) and G-ROW-1/2 (Vols 2 and 3).
+*(erratum, Phase 3: the draft said Vol 1 24, Vol 2 25 and Vol 4 35 — "everything in §7.3.6 outside the
+four above, plus §7.2, §7.4, §7.5, §7.6", which re-credited G-SC-2 and G-AIX-1 and left G-BLD-2, G-BLD-3
+and G-DEP-2 with no owner — while enumerating 21 and 26 ids; its headlines summed to 91. The
+enumerations are the authority and every headline now equals its list.)*
 
 ### 7.1 Build-time gates — the build fails
 
@@ -1620,8 +1741,8 @@ becomes "cannot be loaded at all".
 | **G-DIG-1** | A row batched, then re-merged while in flight | Complete the batch successfully | `Entry.Digest == BatchRow.Digest` — **the digest of the image the batch carried** — and **not** `digest(entry.Image)` | Recomputing the digest at completion. It records the *newer* image as written, after which NFR13 suppression swallows that change **permanently** (Vol 0 §5.4). Silent, and unrecoverable without a restart |
 | **G-DIG-2** | A row where a field's first-ever value equals its zero fill, its bit **not** in `Entry.Written` | Merge and evaluate the suppression predicate | **Not suppressed**; the statement names the column; `Written` gains the bit on commit | The permanent-`NULL` defect of ADR-L04: the image is unchanged so the digest matches, but the Oracle column was never named by any statement and stays `NULL` **forever** |
 | **G-DIG-3** | A destination-2 row whose `message_text` is rewritten from a 200-byte value to a 20-byte value | Merge, digest | The 128-byte region is **fully rewritten and zero-filled past the valid length**; the digest of the short value does not depend on the long value's tail | Copying only the valid prefix and leaving the old tail: two identical logical values then produce different digests, defeating suppression silently (Vol 0 §5.2 normalisation rule 2). Bible §4.5 warns that the bytes beyond `BroadcastMessageLength` are "not meaningful", so the exchange may put anything there |
-| **G-ORD-1** | One destination-2 row (`market_type = 1`), three contributors | Feed 6531, 6571 and 6511 with the **same** `LogTime`, differing only in receipt order (bible §4.5: the re-open sequence arrives inside one second) | All three applied **in arrival order**; the row ends carrying 6511; **none** counted `guard_superseded` | The market never reaching `Open` in the database for the rest of the day. Needs **both** per-contributor ordering slots and the `RecvMono` tiebreak (§4.4); either one alone fails this test |
-| **G-ORD-2** | Two transcodes contributing to one destination: one with a constant `BCSeqNo`, one ascending, at a mix where the **global** ratio stays below `guardSuppressionRatio` (0.5) | Run past `guardMinSamples` (100) and one `guardEvalIntervalSec` (5 s) | The constant-sequence transcode's guard disables; the healthy one's does **not**; the constant-sequence transcode's rows resume updating within one evaluation interval; `ordering_guard_disabled{code}` = 1 for it only | A **global** ratio, which both fails to fire for a minority transcode with a dead sequence field and, when it does fire, switches the guard off for well-behaved ones (HLD §6.5) |
+| **G-ORD-1** | One destination-2 row (`market_type = 1`), three contributors | Feed 6531, 6571 and 6511 with the **same** `LogTime`, differing only in receipt order (bible §4.5: the re-open sequence arrives inside one second) | All three applied **in arrival order**; the row ends carrying 6511; **none** counted `guard_superseded` | The market never reaching `Open` in the database for the rest of the day. Needs **both** per-contributor ordering slots and the `RecvMono` tiebreak (§4.4); either one alone fails this test — *across two setups, not one (erratum, Phase 3): the `RecvMono` tiebreak alone resolves the canonical sequence (Vol 2 §5.6), so only a setup with the slots pre-seeded proves the tiebreak necessary, and only an equal-`RecvMono` setup proves the slots are* |
+| **G-ORD-2** | Two transcodes contributing to one destination: one with a **descending** `BCSeqNo` and an advancing `RecvMono` *(erratum, Phase 3: the draft said "constant". Since Vol 2 §5.3 step 8, a constant `BCSeqNo` with an equal `LogTime` falls through to the receipt clock and is Applied — it freezes nothing and its ratio is 0. The fault guarded against is a sequence field that reads as **older** at step 6, descending or reset below the last value seen; the constant case is pinned as Apply)*, one ascending, at a mix where the **global** ratio stays below `guardSuppressionRatio` (0.5) | Run past `guardMinSamples` (100) and one `guardEvalIntervalSec` (5 s) | The descending-sequence transcode's guard disables; the healthy one's does **not**; the descending-sequence transcode's rows resume updating within one evaluation interval; `ordering_guard_disabled{code}` = 1 for it only | A **global** ratio, which both fails to fire for a minority transcode with a dead sequence field and, when it does fire, switches the guard off for well-behaved ones (HLD §6.5) |
 | **G-ORD-3** | N distinct rows, one contribution each, all from one transcode | Merge all N | `guard_offered == 0` — nothing reached a comparison — so `auto` cannot trip on a workload that never repeats a key | Counting slot-initialising contributions in the denominator, which makes the ratio drift with inventory mix rather than with field health (HLD §6.5) |
 | **G-ORD-4** | `Entry.LastSeq[slot]` at `int32` `0x7FFFFFFF` | Apply a contribution with `BCSeqNo = 0x80000000` | Treated as **newer**: `int32(a-b) > 0`, never `a > b` | **Every affected row freezing permanently after a wrap.** A 4-byte signed counter at 10,000 messages/s wraps in ~59 hours, so this is reachable in a long session (Vol 0 §10.3, ASM-11). The companion assertion is that `LogTime` uses a **plain** signed comparison — applying serial arithmetic to a timestamp is harmless today and wrong in a way nobody would find |
 
@@ -1630,8 +1751,8 @@ becomes "cannot be loaded at all".
 | ID | Setup | Stimulus | Assertion | Would have caught |
 |---|---|---|---|---|
 | **G-FLUSH-1** | A shard whose rings are empty, with `flushReq[k]` raised | Deliver one contribution | An epoch opens **immediately**, not at the next tick; `epoch_empty` did **not** consume the request | The HLD §7.3 ordering defect: clearing `FlushReq` before testing the rings, so a request raised against a not-yet-drained unit is consumed and the unit waits a full `W` |
-| **G-FLUSH-2** | One stalled in-flight flush | Raise N further requests during it | Exactly **one** follow-up flush; `flush_coalesced == N-1` | A regression turning the flag back into a queue, which reintroduces the `A × S` commit demand the flag exists to bound (HLD §6.6) |
-| **G-FLUSH-3** | A shard with `flushReq[k]` raised and the shard parked in `select` with no tick due for 199 ms | Raise the flag | The shard wakes **via channel W** within microseconds, not at the next tick | **Vol 0 §9.2 defect L1**: a flush flag with no wakeup leaves the shard parked until its next tick, which is precisely the `W` delay the non-rate-limited class exists to avoid. **Volume 2 owns the mechanism**; this gate is the acceptance criterion |
+| **G-FLUSH-2** | One stalled in-flight flush | Raise N further requests during it | Exactly **one** follow-up flush; `flush_coalesced == N-1` on a one-shard bus and `(N-1) × S` on an S-shard bus *(erratum, Phase 3, ruling D7: `flush_coalesced` has no shard label and `Trigger` counts it per already-set bit, so each of the N−1 requests coalesces on every shard)* | A regression turning the flag back into a queue, which reintroduces the `A × S` commit demand the flag exists to bound (HLD §6.6) |
+| **G-FLUSH-3** | A shard with `flushReq[k]` raised and the shard parked in `select` with no tick due for 199 ms | Raise the flag | The shard wakes **via channel W**, not at the next tick *(erratum, Phase 3: "within microseconds" is informational; the gate asserts the cause — the wake arm taken — which does not flake under G-RACE-2's `-race -count=20`)* | **Vol 0 §9.2 defect L1**: a flush flag with no wakeup leaves the shard parked until its next tick, which is precisely the `W` delay the non-rate-limited class exists to avoid. **Volume 2 owns the mechanism**; this gate is the acceptance criterion |
 | **G-EPOCH-1** | N dirty rows spanning several `maxBatchSize` batches | Fire **one** tick; stall nothing | All N written before the epoch closes, carried by `ceil(N / maxBatchSize)` batches **of one epoch** | The defect ADR-018 exists to prevent: a tick flushing only part of the dirty set. It looks like nothing at all until a shard is imbalanced |
 | **G-EPOCH-2** | An epoch mid-drain | Merge a contribution | It lands on the **accumulating** ring, is **not** written in this epoch, and **is** written in the next | HLD §7.12 risk 9: arriving work extending the drain, so that under load the epoch never terminates |
 | **G-EPOCH-3** | One row whose commit always fails | Run several epochs | The epoch **closes**; the row reappears at the **head** of the next cohort; ticks continue to fire | A permanently-failing row holding its epoch open forever, after which no tick fires and the flush cadence silently stops |
@@ -1639,15 +1760,15 @@ becomes "cannot be loaded at all".
 | **G-INFL-1** | Every writer stalled | Drive repeated updates to one row | The row appears in **exactly one** outstanding batch; the later update is recorded by `ReDirty`, not by a second ring entry | Breaking HLD §8.4's deadlock layer 1 and FR9 at once, once several writers can serve one shard (HLD R15) |
 | **G-INFL-2** | A row merged into while in flight | Complete the batch | The row is **dirty again** and the **newer** image is what the next flush carries | A row silently losing the update that arrived while it was in flight — it would sit clean holding an image that was never written (HLD R15) |
 | **G-INFL-3** | `maxInFlightPerShard = 1`, a cohort spanning k batches | Drain | Exactly **one** batch outstanding at any instant, and every row of batch *i* was dirtied before every row of batch *i+1* | Concurrency appearing where the configuration forbids it, or the drain order ceasing to be oldest-first (ADR-015) |
-| **G-INFL-4** | `maxInFlightPerShard = m` | Drain the same cohort | Up to **m** batches from one shard outstanding simultaneously, and the cohort drains in roughly `1/m` of the `m = 1` wall time | The pump emitting one batch at a time regardless of the setting — **the original defect, which no other gate here would notice** |
+| **G-INFL-4** | `maxInFlightPerShard = m` | Drain the same cohort | Up to **m** batches from one shard outstanding simultaneously (≤ m held, m reached), and the cohort drains in roughly `1/m` of the `m = 1` wall time *(erratum, Phase 3: the wall-time ratio is informational; the gate asserts the concurrency, which does not flake under G-RACE-2)* | The pump emitting one batch at a time regardless of the setting — **the original defect, which no other gate here would notice** |
 
 #### 7.3.5 Row outcomes and the writer contract (Vols 2 and 3)
 
 | ID | Setup | Stimulus | Assertion | Would have caught |
 |---|---|---|---|---|
-| **G-ROW-1** | A three-row batch | Return it with `OutcomeCommitted`, `OutcomeRejected`, `OutcomeFailed` respectively | Vol 0 §5.4's obligation table holds per row: committed ⇒ `Digest = BatchRow.Digest`, `Written \|= Mask`, requeued only if `ReDirty`; rejected ⇒ **nothing changed**, not requeued, `row_rejected`++; failed ⇒ `ColMask \|= Mask`, requeued at the **head**, `retry_requeued`++ | Collapsing three outcomes into two, which makes F14 inexpressible: one permanently-bad row then retries its whole batch indefinitely (Vol 0 §0.2 defect L3, HLD §9.2's stated fallback) |
+| **G-ROW-1** | A three-row batch | Return it with `OutcomeCommitted`, `OutcomeRejected`, `OutcomeFailed` respectively | Vol 0 §5.4's obligation table holds per row: committed ⇒ `Digest = BatchRow.Digest`, `Written \|= Mask`, requeued only if `ReDirty`; rejected ⇒ `Digest`, `Written` unchanged, `ColMask` = the refused `Mask`, quarantined, not requeued, `row_quarantined`++ *(erratum, Phase 3: "nothing changed" — the quarantine flag is the specified change and the mask fold is Vol 2 §8.4's, ruling D13; `row_rejected` is the writer's, ruling D11)*; failed ⇒ `ColMask \|= Mask`, requeued at the **head**, `retry_requeued`++ | Collapsing three outcomes into two, which makes F14 inexpressible: one permanently-bad row then retries its whole batch indefinitely (Vol 0 §0.2 defect L3, HLD §9.2's stated fallback) |
 | **G-ROW-2** | A batch returned with `Err != nil` and every row still `OutcomePending` | Apply the completion | **Every** Pending row is treated as `OutcomeFailed` and requeued at the head | Vol 0 §0.2 defect L4 — the missing fallback branch. A batch that never reached the server would otherwise strand every row in it |
-| **G-ROW-3** | A batch returned with `Err == nil` and one row still `OutcomePending` | Apply the completion | `batch_row_unreported{k}`++ and the shard **stops loudly** | A writer returning a batch it never adjudicated. **Undetectable without this counter** (Vol 0 §8.3 G6, F27) |
+| **G-ROW-3** | A batch returned with `Err == nil` and one row still `OutcomePending` | Apply the completion | `batch_row_unreported{k}`++ and the process **stops loudly** *(erratum, Phase 3, ruling D9: through `Fatal(FatalBatchRowUnreported)`; the shard requeues the rows at the head and keeps running into the drain rather than returning)* | A writer returning a batch it never adjudicated. **Undetectable without this counter** (Vol 0 §8.3 G6, F27) |
 | **G-STMT-1** | Two writers, one destination whose statement is invalid | Fail the same `(DestID, Mask)` identity on writer 0, then on writer 1, inside `statementFailWindowSec` | Writer 0 stops (`writers_stopped` = 1, F22); on writer 1 the **pool** stops and the process enters FailFast (F20), FATAL naming the identity, exit 4 | Retiring writers one at a time, emptying the pool one session per occurrence while the process goes on looking healthy (HLD §9.2). Also catches keying the rule on statement *text* rather than identity, which would never match across writers with different bind formatting |
 | **G-STMT-2** | A batch with one `ORA-00001` row | Commit | The batch **commits**, the offending row is `OutcomeRejected`, the writer stays **Healthy**, `row_rejected{destination}`++ | Treating a row-level data error as a session error and retrying forever — F14's explicit prohibition |
 
@@ -1659,13 +1780,13 @@ becomes "cannot be loaded at all".
 | **G-LIFE-2** | A running graph with **no** datagrams arriving, the receiver blocked in `ReadFrom` | Send SIGTERM | `run` returns within 200 ms; the receiver logged **no** ERROR for the read failure | Adding a `SetReadDeadline` poll loop, or forgetting that **closing the listener is the only way to unblock an in-flight `ReadFrom`** (`poc/gobrdclnt.go:135-145`); and logging the shutdown read error as a failure (`poc/gobrdclnt.go:152-154`) |
 | **G-LIFE-3** | `OpenDB` succeeds; the socket bind is rigged to fail | `run` | `run` returns a non-nil error **and `db.Close()` was called** | A `Fatalf` in the bind error path. G-BLD-3 catches the literal call; this catches an equivalent early `os.Exit` reached indirectly, and it is the runtime half of C-1 |
 | **G-LIFE-4** | `maxInFlightPerShard` batches outstanding for shard *k*; the shard returns at the drain deadline with rows still dirty | The writers then return their batches on `completionCh[k]` with nobody reading | **No writer blocks**; all writers return; `run` completes | The §1.5 step 10 deadlock. The proof rests entirely on `cap(completionCh[k]) == maxInFlightPerShard`; a well-meaning reduction to an unbuffered channel makes shutdown hang forever with no diagnostic |
-| **G-LIFE-5** | — | Table test over: requested shutdown; requested shutdown with the drain deadline expired; each of the five `FatalReason`s; a startup error; a `-selfcheck` failure | Exit codes 0, **0**, 4×5, 1, 3 respectively; and **nothing ever maps to 2**, which is reserved for the Go runtime's unrecovered panic | A drain-deadline expiry mapping to non-zero, which makes the supervisor **restart a process we just asked to stop** (ADR-L37); and a design condition claiming exit 2, making a real panic indistinguishable |
+| **G-LIFE-5** | — | Table test over: requested shutdown; requested shutdown with the drain deadline expired; each of the eight `FatalReason`s; a startup error; a `-selfcheck` failure | Exit codes 0, **0**, 4×8, 1, 3 respectively *(erratum, Phase 3: five in the draft; six today plus F27 and `FatalShardInvariant`, ruling D9)*; and **nothing ever maps to 2**, which is reserved for the Go runtime's unrecovered panic | A drain-deadline expiry mapping to non-zero, which makes the supervisor **restart a process we just asked to stop** (ADR-L37); and a design condition claiming exit 2, making a real panic indistinguishable |
 | **G-DRAIN-1** | N dirty rows well inside the deadline's capacity, a healthy fake database | SIGTERM | All N written; `drain_abandoned_rows{destination} == 0`; exit 0 | A drain that closes `shardCh` and returns without a final flush-all, silently losing up to `W` of state on every planned restart |
-| **G-DRAIN-2** | Dirty rows far beyond what 5 s can write, or a writer stalled indefinitely | SIGTERM | The process exits within `drainTimeoutMs` + ε; `drain_abandoned_rows{destination}` equals the remainder **per destination**; exit **0** | An unbounded drain — a shutdown that never completes is worse than one that abandons honestly. Also catches a **per-shard** deadline, which would make total shutdown `shards × drainTimeoutMs` = 20 s (§1.5 step 7) |
+| **G-DRAIN-2** | Dirty rows far beyond what 5 s can write, or a writer stalled indefinitely | SIGTERM | The process exits within `drainTimeoutMs` + ε; `drain_abandoned_rows{destination}` equals the remainder **per destination** *(erratum, Phase 4: the remainder includes the rows of batches a stalled writer still holds when the deadline passes, not only the rows still dirty on the rings)*; exit **0** | An unbounded drain — a shutdown that never completes is worse than one that abandons honestly. Also catches a **per-shard** deadline, which would make total shutdown `shards × drainTimeoutMs` = 20 s (§1.5 step 7) |
 | **G-CFG-1** | Vol 0 §7.2's key list, as data | For each key, a configuration with a value one step outside the declared range | Every one is rejected, naming the key | A key added to the schema with no validation, accepted at any value, failing later as something unrelated |
 | **G-CFG-2** | Vol 0 §7.2's key list, as data | Compare against `config.StartupOnlyKeys` | Every key Vol 0 §7.2 marks `startup-only` appears in the list, and no other key does | The list and the contract drifting apart — a new startup-only key silently becoming reloadable, which is how `runtime.generalShard` and `udp.listen` were missing from HLD §6.9 in the first place (Vol 0 C3, C4) |
 | **G-CFG-3** | A running graph under continuous load | SIGHUP with a valid config changing several reloadable keys | No reader ever observes a mixed configuration: a probe reading two keys at a natural boundary always sees them from the **same generation** | Patching the live `*Config` in place, or rebuilding only part of the derived state (§2.3 property 3) |
-| **G-CFG-4** | `ordering.guard: auto` has disabled the guard for transcode X | SIGHUP with a valid config that changes an unrelated key | The rebuilt registry entry for X carries the **same** `*atomic.Bool`, still `true` | **R-GUARD** (§2.3): a fresh `atomic.Bool` per rebuild silently re-enables every guard `auto` had disabled, and X's rows freeze again minutes after an unrelated reload. Nothing alarms |
+| **G-CFG-4** | `ordering.guard: auto` has disabled the guard for transcode X | SIGHUP with a valid config that changes an unrelated key | The rebuilt registry entry for X carries the **same** `*atomic.Bool`, still `true` — *(erratum, Phase 3, ruling D2: the bit is in `mirror.GuardTable`, which a reload never rebuilds; the assertion is that X's bit is still `true` after the reload)* | **R-GUARD** (§2.3): a fresh `atomic.Bool` per rebuild silently re-enables every guard `auto` had disabled, and X's rows freeze again minutes after an unrelated reload. Nothing alarms |
 | **G-CFG-5** | A running graph | SIGHUP with a config failing one rule | Nothing applied; the old config still governs; `config_reload_rejected`++; `config_generation` **unchanged**; the WARN names the rule, the key and both values | Partial application (HLD §6.9, F15); and a rejection that logs nothing, leaving the operator believing a fix is live |
 | **G-CFG-6** | A running graph | SIGHUP with a config changing a startup-only key **and** a reloadable one in the same file | **Both** rejected — the file is refused wholesale — and the message names the startup-only key | Applying the reloadable half, which produces a configuration the operator never wrote and the validator never saw as a whole |
 | **G-CFG-7** | `writers.count = 4` | SIGHUP raising it to 8 | 8 writer goroutines running; `db.maxOpenConns` and `maxIdleConns` both 9; `writers_configured` = 8 | Vol 0 C5 / delta D9: a fixed pool size, so raising `writers` past it produces writers that block on `database/sql` forever — **a silent throughput cliff on the exact lever the runbook names** (Q7) |
@@ -2419,7 +2540,7 @@ by the owner. **No percentiles, no histograms.**
 | `circuit_outage_max_ns` | **M** | ns | health | — | The magnitude of the worst outage in the interval, pairing with `seq_gap_messages` for the §6.6 Q5 triage |
 | `session_transitions` | C | transitions | health | `{market_type}` | `session_state` is a gauge; the re-open's three transitions inside one second (bible §4.5) are otherwise invisible |
 | `session_anomalies` | C | transitions | health | `{market_type}` | An out-of-order or missed transition (§4.3). Correlates with `seq_gap_messages` to distinguish "we lost the message" from "the exchange sent something unexpected" |
-| `session_events_dropped` | C | events | receiver | — | The drop policy of channel **H** (§4.5). **Must remain zero**; any non-zero value falsifies ASM-A2 |
+| `session_events_dropped` | C | events | decoder *(erratum, Phase 5, D5: the ledger owner is `decoder`)* | — | The drop policy of channel **H** (§4.5). **Must remain zero**; any non-zero value falsifies ASM-A2 |
 | `writer_health_state` | G | enum 0–2 | writer | — | HLD Figure 12 defines Healthy / Degraded / FailFast and Vol 0 §8.2 has no instrument for it. Without it, `writes_failed` rising cannot be told from "retrying and recovering" (§6.6 Q8) |
 | `log_events_suppressed` | C | events | obs | `{class}` | The token bucket's suffix appears only on the *next* emitted line of that class. A counter makes suppression visible in the 60 s line, and a large value is itself a signal that something is firing thousands of times a minute |
 | `clock_step_detected` | C | steps | stats | — | Makes F23 detectable rather than merely harmless. Non-zero explains a discontinuity in log timestamps and in `updated_at` in ten seconds instead of an hour |
@@ -2438,7 +2559,7 @@ declaration and offset table in §4.5.
 
 | # | Channel | Element | Capacity | Producer | Consumer | Send semantics | Full ⇒ |
 |---|---|---|---|---|---|---|---|
-| **H** | `sessionCh` | `model.SessionEvent` by value, 16 B | **64**, startup-only | receiver (decode path) | stats/health (sole) | **non-blocking** `select` with `default`; never enters the stall budget | drop; `session_events_dropped`++. Losing one costs a log line and a gauge update and **never costs data** — the same message is already routed to its shard as an `UpdateUnit` |
+| **H** | `sessionCh` | `model.SessionEvent` by value, 16 B | **64**, startup-only | decoder side of the receive path *(erratum, Phase 5, D5)* | stats/health (sole) | **non-blocking** `select` with `default`; never enters the stall budget | drop; `session_events_dropped`++. Losing one costs a log line and a gauge update and **never costs data** — the same message is already routed to its shard as an `UpdateUnit` |
 
 Capacity arithmetic and the rejected alternative are in §4.5 and ADR-L34. This is the only addition to
 Vol 0's channel inventory, and Vol 0 §9.4's property — *"no goroutine in this diagram can block
@@ -2533,7 +2654,7 @@ Vol 0's, `OQ-L7` onward are raised here.
 | **OQ-4** *(HLD)* | Does `go-ora` report **per-row results** for an array bind inside a transaction (ASM-6)? | A half-day spike against the real instance | **G-ROW-1 and the three-valued `RowOutcome`.** If it cannot attribute a failure to a row, `OutcomeRejected` and `OutcomeFailed` collapse into one, F14's "skip the row, continue the batch" becomes inexpressible, and one permanently-bad row retries its whole batch indefinitely. Vol 0 calls this the highest-value open item for the LLD and this volume agrees |
 | **OQ-8** *(HLD)* | The Oracle session budget, and whether `db.connMaxLifetimeMinutes` (30) is under the profile's `IDLE_TIME` | The DBA | **V-X7 is explicitly un-checkable in code.** The observable is a recurring F12 (`ORA-03113` on first reuse of a dead session). Also bounds `writers.count`, which D9 makes the pool follow |
 | **OQ-L3** *(Vol 0)* | Is `hash/maphash` allocation-free and fast on `aix/ppc64`? | G-AIX-1 assertion 2 | Only the claim that the digest costs 0.15 % of a core. FNV-1a is the drop-in fallback (ADR-L02) |
-| **OQ-L5** *(Vol 0)* | Does AIX ship a zoneinfo database the Go runtime can find? | §8.7 **resolves it by importing `time/tzdata` unconditionally**; G-AIX-1 assertion 3 confirms | Nothing further. G-LIVE-3 additionally ensures the gate fails **open** if the zone is still unresolvable |
+| **OQ-L5** *(Vol 0)* | Does AIX ship a zoneinfo database the Go runtime can find? | §8.7 **resolves it by importing `time/tzdata` unconditionally**; G-AIX-1 assertion 3 confirms | Nothing further. G-LIVE-3 additionally ensures the gate fails **open** if the zone is still unresolvable *(erratum, Phase 5, D3, open: as built V-TZ1 rejects an unresolvable zone at load, so fail-open is reachable only in `health.NewWindow`, see §3.5)* |
 | **OQ-13** *(HLD)* | The three destinations, their row keys and their column lists | req §8 / the schema owner | Every gate in §7 that names a column is written against **the shipped configuration**, whatever it turns out to be, so none of them is blocked. V-D4, V-D5, V-T4 and V-T6 are what keep the eventual schema honest |
 
 ### What is complete, and what a sibling volume must not read as permission

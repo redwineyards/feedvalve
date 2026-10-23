@@ -6,8 +6,10 @@ import (
 	"feedvalve/internal/config"
 	"feedvalve/internal/decode"
 	"feedvalve/internal/destinations"
+	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
+	"feedvalve/internal/writer"
 )
 
 // instruments are the lifecycle's own instrument handles, resolved once and
@@ -54,6 +56,20 @@ type instruments struct {
 	// only early warning before the fatal path (Vol 4 F24, then F9).
 	shardSendBlocked     []*obs.Counter
 	stallBudgetUsedMaxNs *obs.Max
+
+	// mirrorShards is every handle shard k writes, one struct per shard
+	// (P3-04), resolved here for the same reason as everything else in this
+	// struct: Freeze ends resolution, so a shard that resolved its own would
+	// panic on its first increment. mirrorTranscode is the per-transcode part,
+	// resolved in resolveTranscodeInstruments by configured position (phase 3
+	// ruling D2) and shared by every shard's copy.
+	mirrorShards    []mirror.ShardInstruments
+	mirrorTranscode mirror.TranscodeInstruments
+
+	// writer is every handle the writer pool writes (P4-10), resolved here for
+	// the same reason. Nil only if the registry is not an *obs.Reg, which the
+	// writer's concrete-typed resolvers need; NewPool accepts nil.
+	writer *writer.Instruments
 
 	// The sub-packet path (P2-05). Resolved here, before Freeze, because
 	// gate G-OBS-1's whole point is that an instrument reaches a struct field
@@ -141,9 +157,36 @@ type instruments struct {
 	// both counters index it.
 	unconfiguredTranscode func(code int) (*obs.Counter, bool)
 
-	// stats-owned
+	// stats-owned. batchqDepth is len(batchQ), sampled at emission -- race-free
+	// on a channel, which is why the ledger lets the stats goroutine own it.
 	clockStepDetected *obs.Counter
+	batchqDepth       *obs.Gauge
+
+	// panics_recovered{stage=shard}: F26's observable (Vol 4 section 5),
+	// counted by the shard goroutine's recover in runShard.
+	panicsRecoveredShard *obs.Counter
+
+	// panics_recovered{stage=stats}: F28's observable (P5-13).
+	panicsRecoveredStats *obs.Counter
+
+	// health-owned (P5-11): the circuit machine's instruments, written only by
+	// the stats goroutine. The session ones are indexed by market type minus
+	// one, the same slot rule obs's {market_type} dimension uses; the machine
+	// is fed by channel H (P5-12), and session_events_dropped is the one the
+	// decoder side writes (ruling D5).
+	circuitState         *obs.Gauge
+	circuitQuietEvents   *obs.Counter
+	circuitDownEvents    *obs.Counter
+	circuitOutageMaxNs   *obs.Max
+	sessionState         [numMarketTypes]*obs.Gauge
+	sessionTransitions   [numMarketTypes]*obs.Counter
+	sessionAnomalies     [numMarketTypes]*obs.Counter
+	sessionEventsDropped *obs.Counter
 }
+
+// numMarketTypes is the {market_type} dimension: 1 Normal, 2 Odd Lot, 3 Spot,
+// 4 Auction (bible Appendix A). Slot = market type minus one.
+const numMarketTypes = 4
 
 // resolveInstruments performs the resolution half of startup step 9. The caller
 // freezes the registry afterwards.
@@ -173,9 +216,21 @@ type instruments struct {
 func resolveInstruments(reg obs.Registry, cfg *config.Config, dests *destinations.Set) instruments {
 	in := resolveStaticInstruments(reg)
 	in.resolveTranscodeInstruments(reg, len(cfg.Transcodes))
-	in.resolveShardInstruments(reg, cfg.Runtime.Shards)
+	in.resolveShardInstruments(reg, cfg.Runtime.Shards, dests.Len())
 	in.resolveDestinationInstruments(reg, dests)
+	in.resolveWriterInstruments(reg, dests.Len())
+	in.resolveSessionInstruments(reg)
 	return in
+}
+
+// resolveSessionInstruments resolves the {market_type} family of the session
+// machine.
+func (in *instruments) resolveSessionInstruments(reg obs.Registry) {
+	for i := range numMarketTypes {
+		in.sessionState[i] = reg.GaugeAt(obs.IDSessionState, i)
+		in.sessionTransitions[i] = reg.CounterAt(obs.IDSessionTransitions, i)
+		in.sessionAnomalies[i] = reg.CounterAt(obs.IDSessionAnomalies, i)
+	}
 }
 
 // resolveDestinationInstruments resolves the {destination,column} family, whose
@@ -213,7 +268,16 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 
 		qdWakeParked: reg.Counter(obs.IDQDWakeParked),
 
-		clockStepDetected: reg.Counter(obs.IDClockStepDetected),
+		clockStepDetected:    reg.Counter(obs.IDClockStepDetected),
+		batchqDepth:          reg.Gauge(obs.IDBatchqDepth),
+		panicsRecoveredShard: reg.CounterAt(obs.IDPanicsRecovered, int(obs.StageShard)),
+		panicsRecoveredStats: reg.CounterAt(obs.IDPanicsRecovered, int(obs.StageStats)),
+
+		circuitState:         reg.Gauge(obs.IDCircuitState),
+		circuitQuietEvents:   reg.Counter(obs.IDCircuitQuietEvents),
+		circuitDownEvents:    reg.Counter(obs.IDCircuitDownEvents),
+		circuitOutageMaxNs:   reg.Max(obs.IDCircuitOutageMaxNs),
+		sessionEventsDropped: reg.Counter(obs.IDSessionEventsDropped),
 
 		subpacketsTotal:        reg.Counter(obs.IDSubpacketsTotal),
 		subpacketsCompressed:   reg.Counter(obs.IDSubpacketsCompressed),
@@ -268,11 +332,85 @@ func resolveStaticInstruments(reg obs.Registry) instruments {
 }
 
 // resolveShardInstruments resolves the per-shard counters, whose arity is
-// runtime.shards -- the same number obsOptions gave the registry.
-func (in *instruments) resolveShardInstruments(reg obs.Registry, shards int) {
+// runtime.shards -- the same number obsOptions gave the registry -- and then
+// the mirror's per-shard instrument sets. Runs after
+// resolveTranscodeInstruments, whose per-transcode handles every shard shares.
+func (in *instruments) resolveShardInstruments(reg obs.Registry, shards, dests int) {
 	in.shardSendBlocked = make([]*obs.Counter, shards)
 	for k := range shards {
 		in.shardSendBlocked[k] = reg.CounterAt(obs.IDShardSendBlocked, k)
+	}
+	in.resolveMirrorShards(reg, shards, dests)
+}
+
+// resolveMirrorShards resolves one mirror.ShardInstruments per shard. The
+// {destination} arity is the destination table's, the number obsOptions gave
+// the registry. Its own function so a test can resolve the mirror's handles,
+// and only those, against a frozen registry.
+func (in *instruments) resolveMirrorShards(reg obs.Registry, shards, dests int) {
+	// flush_wake_dropped{j} for every j, shared: Trigger counts a dropped wake
+	// against the shard it failed to wake, whichever shard called it.
+	wakeDropped := make([]*obs.Counter, shards)
+	for j := range shards {
+		wakeDropped[j] = reg.CounterAt(obs.IDFlushWakeDropped, j)
+	}
+
+	in.mirrorShards = make([]mirror.ShardInstruments, shards)
+	for k := range shards {
+		m := mirror.ShardInstruments{
+			UnitsMerged:               reg.Counter(obs.IDUnitsMerged),
+			UnitsApplied:              reg.Counter(obs.IDUnitsApplied),
+			RowsDirtied:               reg.Counter(obs.IDRowsDirtied),
+			UnitsSupersededOutOfOrder: reg.Counter(obs.IDUnitsSupersededOutOfOrder),
+			ChangeSuppressed:          reg.Counter(obs.IDChangeSuppressed),
+			FlushTriggered:            reg.Counter(obs.IDFlushTriggered),
+			FlushCoalesced:            reg.Counter(obs.IDFlushCoalesced),
+			RedirtyTotal:              reg.Counter(obs.IDRedirtyTotal),
+
+			FlushOnTick:          reg.CounterAt(obs.IDFlushOnTick, k),
+			FlushDeferred:        reg.CounterAt(obs.IDFlushDeferred, k),
+			FlushWakeReceived:    reg.CounterAt(obs.IDFlushWakeReceived, k),
+			TickSendDropped:      reg.CounterAt(obs.IDTickSendDropped, k),
+			EpochOpened:          reg.CounterAt(obs.IDEpochOpened, k),
+			EpochEmpty:           reg.CounterAt(obs.IDEpochEmpty, k),
+			EpochRows:            reg.CounterAt(obs.IDEpochRows, k),
+			EpochBatches:         reg.CounterAt(obs.IDEpochBatches, k),
+			EpochNsTotal:         reg.CounterAt(obs.IDEpochNsTotal, k),
+			TickSkippedEpochOpen: reg.CounterAt(obs.IDTickSkippedEpochOpen, k),
+			RetryRequeued:        reg.CounterAt(obs.IDRetryRequeued, k),
+			BatchRowUnreported:   reg.CounterAt(obs.IDBatchRowUnreported, k),
+			InflightDesync:       reg.CounterAt(obs.IDInflightDesync, k),
+			CohortNotEmpty:       reg.CounterAt(obs.IDCohortNotEmpty, k),
+			EpochStalled:         reg.CounterAt(obs.IDEpochStalled, k),
+			EpochDurationMaxNs:   reg.MaxAt(obs.IDEpochDurationMaxNs, k),
+			ShardLoopMaxNs:       reg.MaxAt(obs.IDShardLoopMaxNs, k),
+			CompletionLagMaxNs:   reg.MaxAt(obs.IDCompletionLagMaxNs, k),
+			ShardDepthMax:        reg.MaxAt(obs.IDShardDepthMax, k),
+			ShardDepth:           reg.GaugeAt(obs.IDShardDepth, k),
+			RowsInflight:         reg.GaugeAt(obs.IDRowsInflight, k),
+
+			FlushWakeDropped: wakeDropped,
+			Transcode:        in.mirrorTranscode,
+		}
+		for d := range dests {
+			m.DirtyDepth[d] = reg.GaugeAt2(obs.IDDirtyDepth, k, d)
+			m.CohortDepth[d] = reg.GaugeAt2(obs.IDCohortDepth, k, d)
+			m.ArenaChunks[d] = reg.GaugeAt2(obs.IDArenaChunks, k, d)
+			m.RingGrown[d] = reg.CounterAt2(obs.IDRingGrown, k, d)
+
+			m.RowsCreated[d] = reg.CounterAt(obs.IDRowsCreated, d)
+			m.MergeIntoQuarantined[d] = reg.CounterAt(obs.IDMergeIntoQuarantined, d)
+			m.RowQuarantined[d] = reg.CounterAt(obs.IDRowQuarantined, d)
+			m.RowsQuarantinedCurrent[d] = reg.GaugeAt(obs.IDRowsQuarantinedCurrent, d)
+			m.QuarantineReleased[d] = reg.CounterAt(obs.IDQuarantineReleased, d)
+			m.QuarantineSkipped[d] = reg.CounterAt(obs.IDQuarantineSkipped, d)
+			m.DrainAbandonedRows[d] = reg.CounterAt(obs.IDDrainAbandonedRows, d)
+			m.RowsRejectedByOracleUnpredicted[d] = reg.CounterAt(obs.IDRowsRejectedByOracleUnpredicted, d)
+			for r := range m.PrevalidateRejected[d] {
+				m.PrevalidateRejected[d][r] = reg.CounterAt2(obs.IDPrevalidateRejected, d, r)
+			}
+		}
+		in.mirrorShards[k] = m
 	}
 }
 
@@ -306,6 +444,23 @@ func (in *instruments) resolveTranscodeInstruments(reg obs.Registry, n int) {
 		in.recordCountClamped[i] = reg.CounterAt(obs.IDRecordCountClamped, i)
 		in.booktypeSkipped[i] = reg.CounterAt(obs.IDBooktypeSkipped, i)
 		in.blobOverrun[i] = reg.CounterAt(obs.IDBlobOverrun, i)
+	}
+
+	// The mirror's, shared by every shard (P3-04, ruling D2).
+	in.mirrorTranscode = mirror.TranscodeInstruments{
+		GuardOffered:          make([]*obs.Counter, n),
+		GuardSuperseded:       make([]*obs.Counter, n),
+		GuardDisabled:         make([]*obs.Gauge, n),
+		BlobLenMismatch:       make([]*obs.Counter, n),
+		PrevalidateRejectedTC: make([]*obs.Counter, n),
+	}
+	mt := &in.mirrorTranscode
+	for i := range n {
+		mt.GuardOffered[i] = reg.CounterAt(obs.IDGuardOffered, i)
+		mt.GuardSuperseded[i] = reg.CounterAt(obs.IDGuardSuperseded, i)
+		mt.GuardDisabled[i] = reg.GaugeAt(obs.IDOrderingGuardDisabled, i)
+		mt.BlobLenMismatch[i] = reg.CounterAt(obs.IDBlobLenMismatch, i)
+		mt.PrevalidateRejectedTC[i] = reg.CounterAt(obs.IDPrevalidateRejectedTranscode, i)
 	}
 }
 

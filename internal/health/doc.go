@@ -14,5 +14,5 @@
 // rather than a sampled end state -- a same-day re-open can pass through several
 // states inside one second, and a machine that sampled would see only the last.
 //
-// Specified by docs/lld/04-lifecycle-ops.md. Built in Phase 5.
+// Specified by docs/lld/04-lifecycle-ops.md (sections 3 and 4).
 package health

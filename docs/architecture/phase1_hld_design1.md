@@ -996,7 +996,10 @@ mechanism that establishes order (ADR-007).
 **The guard has an off switch, and it needs one.** If req §12.3 resolves badly and `BCSeqNo` turns out
 to be constant or zero, a strict "newer than" comparison discards every contribution after the first
 and the affected mirrors freeze — the database simply stops updating, with nothing but a rising counter
-to show for it. `orderingGuard` is therefore a reloadable three-way setting (§6.9):
+to show for it. *(erratum, Phase 3: true of a strict comparison on `BCSeqNo` alone. Vol 2 §5.3 falls
+through an equal `BCSeqNo` and an equal `LogTime` to a strictly increasing receipt clock, so a constant
+or zero field is Applied and freezes nothing. The fault the guard's off switch exists for is a field
+that reads as **older** — descending, or reset below the last value seen; Vol 4 G-ORD-2 tests that.)* `orderingGuard` is therefore a reloadable three-way setting (§6.9):
 
 - `on` — always compare, never self-disable.
 - `off` — skip the comparison entirely. Safe by construction: ADR-007 mechanism 1 establishes ordering

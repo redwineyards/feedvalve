@@ -60,6 +60,10 @@ func TestG_BLD_3_NoFatalLoggerAndNoExitOutsideMain(t *testing.T) {
 		}
 		for _, bad := range f.calls {
 			switch {
+			case isGraphFatal(f.rel, bad):
+				// Not a logger: app.Graph.Fatal delivers to the terminal
+				// channel and RETURNS, so Run drains and every defer fires --
+				// the very path this gate's message prescribes.
 			case bad.pkg == "os" && bad.sel == "Exit",
 				bad.pkg == "runtime" && bad.sel == "Goexit":
 				t.Errorf("%s: %s.%s is forbidden outside %s.\n"+
@@ -76,6 +80,73 @@ func TestG_BLD_3_NoFatalLoggerAndNoExitOutsideMain(t *testing.T) {
 					bad.pos, bad.pkg, bad.sel, exemptFile)
 			}
 		}
+	}
+}
+
+// isGraphFatal is the one Fatal-named call rule (a) permits: g.Fatal inside
+// package app where g IS the *Graph receiver of the enclosing method -- decided
+// from the parse (selCall.graphRecv), not from the variable's name. Graph.Fatal
+// is not a logger -- it sends on a one-shot channel and returns (graph.go) --
+// and the shard goroutines and their report function must call it (phase 3
+// ruling D9). A *log.Logger that happens to be called g, even inside a *Graph
+// method where it shadows the receiver, still fails; so do log.Fatal,
+// logger.Fatalf, and a g.Fatalf anywhere.
+func isGraphFatal(rel string, c selCall) bool {
+	return strings.HasPrefix(rel, "internal/app/") && c.graphRecv && c.pkg == "g" && c.sel == "Fatal"
+}
+
+// TestGraphFatalExemptionIsExact pins isGraphFatal to the one call it admits,
+// against PARSED sources, so the exemption cannot widen into a hole in rule
+// (a): the property that matters is what g's declaration is, and only the
+// scanner's own resolution of a real parse can show that.
+func TestGraphFatalExemptionIsExact(t *testing.T) {
+	const header = "package app\nimport \"log\"\ntype Graph struct{}\ntype Other struct{}\n" +
+		"func (g *Graph) Fatal(int, string) {}\nvar _ = log.Default\n"
+	for _, tc := range []struct {
+		name string
+		rel  string
+		src  string
+		want bool
+	}{
+		{"the *Graph receiver", "internal/app/shard.go",
+			"func (g *Graph) f() { g.Fatal(0, \"\") }", true},
+		{"the *Graph receiver inside a closure", "internal/app/shard.go",
+			"func (g *Graph) f() { func() { g.Fatal(0, \"\") }() }", true},
+		{"a *log.Logger named g shadowing the receiver", "internal/app/shard.go",
+			"func (g *Graph) f() { { g := log.Default(); g.Fatal(\"x\") } }", false},
+		{"a *log.Logger named g in a closure of a *Graph method", "internal/app/shard.go",
+			"func (g *Graph) f() { func(g *log.Logger) { g.Fatal(\"x\") }(log.Default()) }", false},
+		{"a local *log.Logger named g", "internal/app/shard.go",
+			"func f() { g := log.Default(); g.Fatal(\"x\") }", false},
+		{"a receiver named g of another type", "internal/app/shard.go",
+			"func (g *Other) Fatal(int, string) {}\nfunc (g *Other) f() { g.Fatal(0, \"\") }", false},
+		{"a *Graph parameter, not the receiver", "internal/app/shard.go",
+			"func f(g *Graph) { g.Fatal(0, \"\") }", false},
+		{"g.Fatalf on the receiver", "internal/app/shard.go",
+			"func (g *Graph) Fatalf() {}\nfunc (g *Graph) f() { g.Fatalf() }", false},
+		{"the *Graph receiver outside internal/app", "internal/mirror/run.go",
+			"func (g *Graph) f() { g.Fatal(0, \"\") }", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := header + tc.src + "\n"
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+			if err != nil {
+				t.Fatalf("parse: %v\n%s", err, src)
+			}
+			var fatals []selCall
+			for _, c := range qualifiedCalls(fset, file) {
+				if strings.HasPrefix(c.sel, "Fatal") {
+					fatals = append(fatals, c)
+				}
+			}
+			if len(fatals) != 1 {
+				t.Fatalf("found %d Fatal* calls, want 1: %+v", len(fatals), fatals)
+			}
+			if got := isGraphFatal(tc.rel, fatals[0]); got != tc.want {
+				t.Errorf("isGraphFatal(%s, %+v) = %v, want %v\n%s", tc.rel, fatals[0], got, tc.want, src)
+			}
+		})
 	}
 }
 
@@ -125,6 +196,10 @@ type selCall struct {
 	pkg string // the qualifier: "os" in os.Exit, "logger" in logger.Fatalf
 	sel string // the selected name: "Exit", "Fatalf"
 	pos string // file:line
+
+	// graphRecv: the qualifier resolves to the receiver of the enclosing
+	// method, and that receiver's type is *Graph. What isGraphFatal keys on.
+	graphRecv bool
 }
 
 type scannedFile struct {
@@ -184,7 +259,27 @@ func scanTree(t *testing.T) []scannedFile {
 }
 
 // qualifiedCalls returns every call of the form x.Y(...) in a file.
+//
+// graphRecv uses the parser's own identifier resolution (ast.Ident.Obj, so the
+// file must be parsed WITHOUT parser.SkipObjectResolution): an identifier that
+// resolves to the receiver field of a *Graph method is that receiver, and a
+// local or parameter that shadows it -- in a nested block or a closure --
+// resolves to its own declaration instead. Lexical resolution is exact here
+// because a receiver is only ever in scope inside its own method.
 func qualifiedCalls(fset *token.FileSet, file *ast.File) []selCall {
+	graphRecvs := map[*ast.Field]bool{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
+		}
+		if star, ok := fn.Recv.List[0].Type.(*ast.StarExpr); ok {
+			if id, ok := star.X.(*ast.Ident); ok && id.Name == "Graph" {
+				graphRecvs[fn.Recv.List[0]] = true
+			}
+		}
+	}
+
 	var out []selCall
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -199,10 +294,17 @@ func qualifiedCalls(fset *token.FileSet, file *ast.File) []selCall {
 		if !ok {
 			return true
 		}
+		recv := false
+		if id.Obj != nil {
+			if f, ok := id.Obj.Decl.(*ast.Field); ok && graphRecvs[f] {
+				recv = true
+			}
+		}
 		out = append(out, selCall{
-			pkg: id.Name,
-			sel: sel.Sel.Name,
-			pos: fset.Position(call.Pos()).String(),
+			pkg:       id.Name,
+			sel:       sel.Sel.Name,
+			pos:       fset.Position(call.Pos()).String(),
+			graphRecv: recv,
 		})
 		return true
 	})

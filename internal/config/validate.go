@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -112,13 +113,13 @@ func Validate(c *Config, prev *Config) error {
 
 func validateInto(p *problems, c, prev *Config) {
 	for _, r := range rangeRules {
-		checkRange(p, c, r)
+		checkRange(p, c, prev, r)
 	}
 	validateUDP(c, p)
 	validateRuntime(c, p)
 	validateFlush(c, p)
 	validateWriters(c, p)
-	validateDB(c, p)
+	validateDB(c, prev, p)
 	validateOrdering(c, p)
 	validateStats(c, p)
 	validateLiveness(c, p)
@@ -130,9 +131,21 @@ func validateInto(p *problems, c, prev *Config) {
 	}
 }
 
-func checkRange(p *problems, c *Config, r rangeRule) {
+// checkRange reports a value outside its declared range. It records the key
+// path and both values -- the attempted one and, when a running configuration
+// is known (a reload), the running one -- so the reload WARN can name them. A
+// db.* key records the path only: no db.* value is ever echoed.
+func checkRange(p *problems, c, prev *Config, r rangeRule) {
 	if v := r.get(c); v < r.lo || v > r.hi {
-		p.add(r.id(), "%s is %d, outside the valid range %d..%d", r.key, v, r.lo, r.hi)
+		running, attempt := "", strconv.Itoa(v)
+		if prev != nil {
+			running = strconv.Itoa(r.get(prev))
+		}
+		if strings.HasPrefix(r.key, "db.") {
+			running, attempt = "", ""
+		}
+		p.addKey(r.id(), r.key, running, attempt,
+			"%s is %d, outside the valid range %d..%d", r.key, v, r.lo, r.hi)
 	}
 }
 
@@ -218,12 +231,12 @@ func validateWriters(c *Config, p *problems) {
 	}
 }
 
-func validateDB(c *Config, p *problems) {
+func validateDB(c, prev *Config, p *problems) {
 	if !c.HasDB {
 		return
 	}
 	for _, r := range dbRangeRules {
-		checkRange(p, c, r)
+		checkRange(p, c, prev, r)
 	}
 
 	// V-DB2. A slice, not a map: map iteration is randomised, and these
@@ -284,8 +297,11 @@ func validateLiveness(c *Config, p *problems) {
 		}
 	}
 
-	// V-TZ1. See cmd/feedvalve/main.go: time/tzdata does not link in this
-	// toolchain, so this depends on the HOST having a zoneinfo database.
+	// V-TZ1. See cmd/feedvalve/main.go: time/tzdata IS linked, so a valid
+	// IANA name resolves without the host supplying a zoneinfo database and
+	// this rejects only a genuinely unknown zone. It stays a hard rejection
+	// at load and on reload (D3); the fail-open path lives in internal/health
+	// as defence in depth.
 	if _, err := time.LoadLocation(l.TradingWindow.TZ); err != nil {
 		p.add(RuleTimezone, "liveness.tradingWindow.tz %q does not resolve: %v",
 			l.TradingWindow.TZ, err)
@@ -344,60 +360,83 @@ func describeTranscode(i, code int) string {
 	return fmt.Sprintf("transcodes[%d]", i)
 }
 
-// startupOnly names every key that cannot change without a restart, paired
-// with its value.
+// startupOnlyEntry is one key that cannot change without a restart: its JSON
+// path, the rule that reports a change, and a getter for its running value.
 //
 // Spelled out rather than derived by reflection, because the list IS the
 // decision: each entry is a claim that changing this at runtime would corrupt
-// live state, and each deserves to be read.
-func startupOnly(c *Config) map[string]any {
-	return map[string]any{
-		// Rebinding the socket drops whatever arrives during the gap, on a
-		// circuit with no retransmission.
-		"udp.listen": c.UDP.Listen,
-
-		// Changing either re-keys every mirror and strands rows in the old
-		// shard.
-		"runtime.shards":       c.Runtime.Shards,
-		"runtime.generalShard": c.Runtime.GeneralShard,
-
-		// These size structures allocated once at construction. The
-		// datagram ring in particular is a single allocation.
-		"runtime.shardQueueCapacity":    c.Runtime.ShardQueueCapacity,
-		"runtime.datagramQueueCapacity": c.Runtime.DatagramQueueCapacity,
-		"runtime.maxInFlightPerShard":   c.Runtime.MaxInFlightPerShard,
-		"runtime.expectedRows":          c.Runtime.ExpectedRows,
-		"runtime.arenaChunkRows":        c.Runtime.ArenaChunkRows,
-
-		// The field map fixes every ColMask bit index and image offset.
-		// Reloading it would renumber the masks and re-lay every live image
-		// and stored digest in one step.
-		"runtime.destinationsFile": c.Runtime.DestinationsFile,
-
-		"db.host":    c.DB.Host,
-		"db.port":    c.DB.Port,
-		"db.service": c.DB.Service,
-		"db.user":    c.DB.User,
-	}
+// live state, and each deserves to be read. StartupOnlyKeys is derived from
+// this one table, so the list a test compares against Vol 0 section 7.2 and
+// the list V-R1 enforces cannot differ.
+type startupOnlyEntry struct {
+	key  string
+	rule string
+	get  func(*Config) any
 }
 
-func validateReload(c, prev *Config, p *problems) {
-	now, before := startupOnly(c), startupOnly(prev)
-	for key, nv := range now {
-		if ov := before[key]; nv != ov {
-			p.add(RuleStartupOnly, "%s is startup-only and changed from %v to %v; "+
-				"the whole file is rejected and the running configuration is kept",
-				key, ov, nv)
-		}
-	}
+var startupOnlyTable = []startupOnlyEntry{
+	// Rebinding the socket drops whatever arrives during the gap, on a
+	// circuit with no retransmission.
+	{"udp.listen", RuleStartupOnly, func(c *Config) any { return c.UDP.Listen }},
+
+	// Changing either re-keys every mirror and strands rows in the old
+	// shard.
+	{"runtime.shards", RuleStartupOnly, func(c *Config) any { return c.Runtime.Shards }},
+	{"runtime.generalShard", RuleStartupOnly, func(c *Config) any { return c.Runtime.GeneralShard }},
+
+	// These size structures allocated once at construction. The datagram
+	// ring in particular is a single allocation.
+	{"runtime.shardQueueCapacity", RuleStartupOnly, func(c *Config) any { return c.Runtime.ShardQueueCapacity }},
+	{"runtime.datagramQueueCapacity", RuleStartupOnly, func(c *Config) any { return c.Runtime.DatagramQueueCapacity }},
+	{"runtime.maxInFlightPerShard", RuleStartupOnly, func(c *Config) any { return c.Runtime.MaxInFlightPerShard }},
+	{"runtime.expectedRows", RuleStartupOnly, func(c *Config) any { return c.Runtime.ExpectedRows }},
+	{"runtime.arenaChunkRows", RuleStartupOnly, func(c *Config) any { return c.Runtime.ArenaChunkRows }},
 
 	// V-R4, separately identified because V-X3's bound depends on it: if
-	// the ceiling could move, a live maxBatchSize could become legal
-	// without the pre-allocated buffers growing to match.
-	if c.Runtime.MaxBatchSizeCeiling != prev.Runtime.MaxBatchSizeCeiling {
-		p.add(RuleCeilingFixed, "runtime.maxBatchSizeCeiling is startup-only and changed from "+
-			"%d to %d; it sizes the pre-allocated batch row buffers",
-			prev.Runtime.MaxBatchSizeCeiling, c.Runtime.MaxBatchSizeCeiling)
+	// the ceiling could move, a live maxBatchSize could become legal without
+	// the pre-allocated buffers growing to match.
+	{"runtime.maxBatchSizeCeiling", RuleCeilingFixed, func(c *Config) any { return c.Runtime.MaxBatchSizeCeiling }},
+
+	// The field map fixes every ColMask bit index and image offset.
+	// Reloading it would renumber the masks and re-lay every live image
+	// and stored digest in one step. V-R2 compares its CONTENT; this
+	// compares the path.
+	{"runtime.destinationsFile", RuleStartupOnly, func(c *Config) any { return c.Runtime.DestinationsFile }},
+
+	{"db.host", RuleStartupOnly, func(c *Config) any { return c.DB.Host }},
+	{"db.port", RuleStartupOnly, func(c *Config) any { return c.DB.Port }},
+	{"db.service", RuleStartupOnly, func(c *Config) any { return c.DB.Service }},
+	{"db.user", RuleStartupOnly, func(c *Config) any { return c.DB.User }},
+}
+
+// StartupOnlyKeys lists the JSON path of every startup-only key, in table
+// order. Exported so the drift test (G-CFG-2) and the runbook read the same
+// list V-R1 and V-R4 enforce.
+var StartupOnlyKeys = func() []string {
+	keys := make([]string, 0, len(startupOnlyTable))
+	for _, e := range startupOnlyTable {
+		keys = append(keys, e.key)
+	}
+	return keys
+}()
+
+func validateReload(c, prev *Config, p *problems) {
+	for _, e := range startupOnlyTable {
+		nv, ov := e.get(c), e.get(prev)
+		if nv == ov {
+			continue
+		}
+		// A db.* value is never echoed: Running and Attempt stay empty and
+		// the message names the key only.
+		if strings.HasPrefix(e.key, "db.") {
+			p.addKey(e.rule, e.key, "", "", "%s is startup-only and changed; "+
+				"the whole file is rejected and the running configuration is kept", e.key)
+			continue
+		}
+		p.addKey(e.rule, e.key, fmt.Sprint(ov), fmt.Sprint(nv),
+			"%s is startup-only and changed from %v to %v; "+
+				"the whole file is rejected and the running configuration is kept",
+			e.key, ov, nv)
 	}
 
 	// V-R3. The set of codes contributing to a destination fixes the slot

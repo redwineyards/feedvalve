@@ -22,12 +22,16 @@ import (
 // builds for the target. It is the difference between G-AIX-1 being blocked on
 // access and G-AIX-1 being blocked on access AND quietly broken.
 //
-// Of the five assertions, Phase 1 owns three. Assertion 1 (big-endian decode
+// Of the five assertions, Phase 1 owned three. Assertion 1 (big-endian decode
 // correctness) needs the Phase 2 decoders -- Phase 1 decodes nothing, so there
 // is nothing yet for a byte-order bug to be wrong about. Assertion 2
-// (hash/maphash allocation-free, OQ-L3) needs Phase 3's mirror. Assertions 3
+// (hash/maphash allocation-free, OQ-L3) is Phase 3's, and lives in package
+// mirror as TestG_AIX_1_2_TheDigestIsAllocationFreeAndFast
+// (internal/mirror/digest_oql3_test.go), so it measures the unexported digest
+// that ships rather than a copy of it; lpar-smoke.sh runs it from mirror.test.
+// Assertions 3
 // (time.LoadLocation), 4 (the layout constants under the ppc64 compiler) and 5
-// (the receive buffer actually granted) are live now.
+// (the receive buffer actually granted) were live from Phase 1.
 //
 // Note that assertion 4's compile-time half is ALREADY satisfied off-target, and
 // section 7.5 says why: the constants hold "because unsafe.Sizeof is
@@ -77,6 +81,23 @@ func TestG_AIX_1_TestBinariesCrossCompileForTheTarget(t *testing.T) {
 			}
 		})
 	}
+
+	// G-ASSERT-1 on the target (Vol 4 section 7.6): the mirror's binary is
+	// ALSO shipped built with -tags feedvalve_assert, because the shard's
+	// TryLock ownership check is "the only concurrency check available at
+	// all" there -- -race does not exist for aix/ppc64. scripts/build-aix.sh
+	// builds it as mirror-assert.test; this keeps that build honest.
+	t.Run("mirror-assert", func(t *testing.T) {
+		bin := filepath.Join(out, "mirror-assert.test")
+		cmd := exec.Command("go", "test", "-c", "-tags", "feedvalve_assert", "-o", bin, "./internal/mirror")
+		cmd.Dir = root
+		cmd.Env = append(cmd.Environ(), "CGO_ENABLED=0", "GOOS=aix", "GOARCH=ppc64")
+		if cmdOut, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go test -c -tags feedvalve_assert "+
+				"./internal/mirror failed:\n%s\nG-ASSERT-1's shard half has no other way onto the "+
+				"target.", cmdOut)
+		}
+	})
 
 	if built == 0 {
 		t.Error("no test binary was produced for any package, so there is nothing for " +

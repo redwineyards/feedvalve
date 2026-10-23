@@ -128,6 +128,16 @@ port, see `poc/decompress.go`).
   - `-dbcheck`: connect to the database configured under `db`, verify a round trip
     (`SELECT 1 FROM dual`), log the server version, and exit without starting the relay. Read-only;
     the way to prove credentials and network reachability from a deployment host.
+- `./cmd/feedvalve -selfcheck`: no database, password or network. Besides the config and decoder
+  catalogue it runs `destinations.StatementFor` for every destination at every single-bit column
+  mask plus the full mask and rejects any identifier off `[A-Za-z][A-Za-z0-9_]{0,29}` (gate G-SC-1).
+- `./cmd/feedvalve -dbcheck`: the round trip above, then the **catalogue check** (Vol 0 7.6): every
+  mapped column exists in the target table with a compatible type, and is `NOT NULL` only where the
+  writer always sets it. Read-only; any finding fails it. The DDL it expects is in `db/schema/*.sql`
+  (documentation, never executed by the program).
+- Live writer spike: `FEEDVALVE_ORACLE_DSN='oracle://user:pass@host:1521/SVC' go test -run
+  TestDBIntegrationWriter -v ./internal/writer/` (skips without the DSN; non-gating, logs what the
+  real server and go-ora do for the OQ-W3 questions).
 - Build for AIX: `CGO_ENABLED=0 GOOS=aix GOARCH=ppc64 go build -o gobrdclnt ./poc`. Since the cgo
   dependency is gone this now **cross-compiles from any host** — it no longer has to be built on an
   AIX machine. `poc/build_aix.sh` predates this and still documents the old cgo/`liblzo2`
@@ -311,6 +321,65 @@ nil`) — which is what keeps the decoder tests working — and `updateDummyRow`
 a SQL error is logged (`ERROR update dummy row ... err=...`) and swallowed, since a database problem
 must not stop the relay decoding the feed. Note it sits *after* the parse, so a payload that fails to
 parse writes nothing.
+
+## The new writer and Oracle layer (`internal/*`)
+
+- `internal/oradb` — the only production package that names `database/sql` and go-ora. `DB`
+  (`OpenDriver` is the substitutability seam), `Session` (one pinned connection, `ExecTx`),
+  `Classify` (ORA number to `ErrClass`, by `errors.As`, never by text), `Catalog` and `Check`.
+- `internal/oradb/oratest` — a scripted fake `database/sql` driver. It imports nothing of ours
+  (oradb's tests import it, so an edge back would be a cycle) and is test-only: the receive path,
+  `mirror` and production wiring must never import it.
+- `internal/writer` — statement assembly from a batch mask, array binds, the transaction boundary
+  and per-row attribution. A `Pool` of stateless writers; it reaches the driver only through oradb.
+- `internal/destinations` — mapping, `StatementFor` and `BindPlan`; pure, no `database/sql`.
+- `db/schema/*.sql` — the three tables the writer expects, INSERT/UPDATE grants only.
+
+Things that will bite you here: the writer **never logs the password, a bind value or statement
+text** (gate G-SEC-1, scanned in `internal/writer/integration_test.go`); array-bind `RowsAffected`
+is not recoverable through go-ora, hence the two-phase execute (array, then row-by-row only after a
+row-data error); and `AllocsPerRun`-style tests and `go test -race` need the toolchain notes in
+memory (`CC` must be the full clang path). Gate G-BLD-3 (no `os.Exit` or `Fatal*` outside
+`cmd/feedvalve/main.go`) scans `internal/` and `cmd/`, so writer and oradb are covered, and
+`TestG_BLD_3_ScanCoversTheWriterAndOradb` proves the scan actually reaches them.
+
+## Reload and health (`internal/app`, `internal/health`, `internal/config`)
+
+- **SIGHUP reloads the configuration** (`internal/app/reload.go`); it is not a no-op. Sequence: load,
+  `config.ValidateAll(ModeRun)` (never a bare `Store.Swap`), build a fresh registry and
+  `decodeCounters`, `Store.Swap`, `setRuntime`, then `applyLive` side effects. A rejected file changes
+  nothing and is refused wholesale (a startup-only key changed, V-R1; a destination shape changed,
+  V-R2). With no `-config` file, SIGHUP is a logged "nothing to reload". Reloads are serialised, and a
+  SIGHUP while draining or after stop is a logged no-op. A side-effect failure after the swap is
+  listed under `failed=` and never rolls back.
+- **Two publication points.** `Store.Swap` publishes the `*Config` and assigns `Store.Gen()` (there is
+  no `Generation()`); `Graph.setRuntime` publishes the `Runtime` snapshot. **The datapath reads only
+  `loadRuntime()`**, never `Store.Load()`. Read reloadable settings from the `Runtime` once per
+  datagram; reading `Deps.Cfg` (the startup config) for a reloadable key is a bug, and
+  `TestPickupAuditEveryDepsCfgReadIsClassified` fails on a new read.
+- **Startup-only keys** are `config.StartupOnlyKeys` (fourteen). The four easy-to-misclassify keys
+  `udp.sourceAllowList`, `udp.sourceEnforce`, `ordering.gapScope`, `ordering.gapAuditPackets` are
+  **reloadable** (ruling D9, still open for the user).
+- **Reload ordering rule:** side effects run after the swap and are derived from the published
+  config; `Pool.ReloadHealth` runs first, `Pool.Resize` last and only when `writers.count` changed
+  (it applies the `database/sql` limits itself). Timers (`stats.intervalSec`,
+  `ordering.guardEvalIntervalSec`, the circuit tick) re-arm after each firing, so a change takes up to
+  one OLD period to land.
+- **`internal/health`** holds the pure circuit and market-session state machines. It defines its own
+  config type, imports neither `config`, `oradb`, `writer`, `mirror` nor `database/sql`, and never
+  gates the data path. `app/health.go` feeds it: the decode step calls `publishSession` (non-blocking
+  send on channel H, `sessionChCap` 64, drop counts `session_events_dropped`); the stats goroutine
+  drains it. V-TZ1 rejects an unresolvable zone at load; the health-level fail-open is defence in
+  depth only (ruling D3, open).
+- **Log classes added:** `circuit_quiet`, `circuit_down`, `decode_anomaly` (`session_anomaly` is now
+  session-only). Rate limiting is per class. **Wrinkle:** `decode_anomaly` is in the WARN run, so its
+  three `Errorf` sites are suppressed at `stats.logLevel=error`.
+- **Things that will bite you:** a `-race` run of `internal/app` is not fully green (open `obs.Emit`
+  race); `time1980UnixOffsetSec` reaches the writer through `writer.Params`; `writers_configured` is
+  owned by the pool, not the sampler; the real-signal SIGHUP test skips on Windows.
+- Operator-facing: `docs/runbook.md` (a test checks every instrument name in it against the ledger).
+  CI and race requirements: `docs/development/ci.md`. Open items and as-built:
+  `docs/development/phase5-tasks.md` section 10, `docs/development/notes-for-reviewer.md`.
 
 ## Debugging parsed data
 

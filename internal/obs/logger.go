@@ -148,7 +148,7 @@ func (b *bucket) peek(nowNs, ratePerMin int64) bool {
 // standard library's default rather than a decision.
 type AppLogger struct {
 	lg    *log.Logger
-	level Level
+	level atomic.Uint32 // a Level; atomic so a reload can SetLevel under load
 	rate  atomic.Int64
 	reg   *Reg
 
@@ -174,10 +174,10 @@ type AppLogger struct {
 func NewAppLogger(w io.Writer, level Level, ratePerMin int, reg *Reg) *AppLogger {
 	l := &AppLogger{
 		lg:    log.New(w, "", 0), // timestamps are written by write(); see the type comment
-		level: level,
 		reg:   reg,
 		start: time.Now(),
 	}
+	l.level.Store(uint32(level))
 	l.rate.Store(int64(ratePerMin))
 
 	if reg != nil {
@@ -197,7 +197,9 @@ func NewAppLogger(w io.Writer, level Level, ratePerMin int, reg *Reg) *AppLogger
 func (l *AppLogger) SetRatePerMin(n int) { l.rate.Store(int64(n)) }
 
 // SetLevel applies a reloaded stats.logLevel.
-func (l *AppLogger) SetLevel(v Level) { l.level = v }
+func (l *AppLogger) SetLevel(v Level) { l.level.Store(uint32(v)) }
+
+func (l *AppLogger) curLevel() Level { return Level(l.level.Load()) }
 
 // Infof logs an unconditional operational line. INFO is not rate limited: Vol 4
 // section 6.2 lists what it carries -- startup, the effective configuration,
@@ -205,7 +207,7 @@ func (l *AppLogger) SetLevel(v Level) { l.level = v }
 // transitions, shutdown -- and every one of those is per-process or happens at
 // human rate. A bucket would only risk dropping the postmortem.
 func (l *AppLogger) Infof(format string, a ...any) {
-	if l.level > LevelInfo {
+	if l.curLevel() > LevelInfo {
 		return
 	}
 	l.write("INFO ", format, a...)
@@ -248,7 +250,7 @@ func (l *AppLogger) Allow(class Class) bool {
 	// at LevelWarn and Errorf is gated at no level at all. Without this, a
 	// deployment running at ERROR would still pay to build every WARN's
 	// arguments -- the exact cost this method exists to remove.
-	if class < firstErrorClass && l.level > LevelWarn {
+	if class < firstErrorClass && l.curLevel() > LevelWarn {
 		return false
 	}
 	return l.buckets[class].peek(int64(time.Since(l.start)), l.rate.Load())
@@ -263,7 +265,7 @@ func (l *AppLogger) Allow(class Class) bool {
 // lazily, because this method cannot un-evaluate it. What the bucket bounds is
 // the dominant cost -- the format, the write and the contention on stderr.
 func (l *AppLogger) Warnf(class Class, format string, a ...any) {
-	if l.level > LevelWarn {
+	if l.curLevel() > LevelWarn {
 		return
 	}
 	l.emit("WARN ", class, format, a...)

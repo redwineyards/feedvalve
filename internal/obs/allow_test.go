@@ -26,10 +26,39 @@ func TestClassSeverityBoundary(t *testing.T) {
 		t.Errorf("firstErrorClass = %v, want ClassDecompressFailed -- the first ERROR class "+
 			"of Vol 4 section 6.2", firstErrorClass)
 	}
-	if ClassShardSendWait != firstErrorClass-1 {
-		t.Errorf("ClassShardSendWait = %d and firstErrorClass = %d: the WARN run no longer "+
+	if ClassCircuitQuiet != firstErrorClass-1 {
+		t.Errorf("ClassCircuitQuiet = %d and firstErrorClass = %d: the WARN run no longer "+
 			"ends immediately before the ERROR run, so Allow's severity test is wrong",
-			ClassShardSendWait, firstErrorClass)
+			ClassCircuitQuiet, firstErrorClass)
+	}
+	// The numeric position, pinned. P3-04 inserted the WARN epoch_stalled at the
+	// end of the WARN run, which moved firstErrorClass from 10 to 11 and
+	// relabelled every ERROR class's log_events_suppressed{class} slot. That was
+	// deliberate; the next move should be too, so it has to edit this number.
+	// P3-13 appended the ERROR shard_defect at the very end, which moves no
+	// existing slot.
+	// P5-02 added the WARN decode_anomaly and circuit_quiet at the end of the
+	// WARN run (firstErrorClass 11 to 13, relabelling every ERROR slot, once and
+	// deliberately) and the ERROR circuit_down at the very end.
+	if firstErrorClass != 13 || numClasses != 26 {
+		t.Errorf("firstErrorClass = %d, numClasses = %d; want 13 and 26. A class was "+
+			"added or moved: check its severity run and update this pin deliberately",
+			firstErrorClass, numClasses)
+	}
+	// And the four P3-04 classes are on the side Vol 2 logs them at.
+	// So is P3-13's shard_defect: its lines report a stopping process.
+	for _, c := range []Class{ClassBlobLenMismatch, ClassGuardDisabled, ClassDrainDeadline,
+		ClassShardDefect, ClassCircuitDown} {
+		if c < firstErrorClass {
+			t.Errorf("%v is in the WARN run; Vol 2 logs it at ERROR", c)
+		}
+	}
+	// Ruling D16: the split decode class and the quiet circuit are WARN.
+	if ClassDecodeAnomaly >= firstErrorClass || ClassCircuitQuiet >= firstErrorClass {
+		t.Errorf("decode_anomaly or circuit_quiet is in the ERROR run; ruling D16 logs both at WARN")
+	}
+	if ClassEpochStalled >= firstErrorClass {
+		t.Errorf("epoch_stalled is in the ERROR run; Vol 2 section 2.4 logs it at WARN")
 	}
 	// Every class is on one side or the other, and both sides are non-empty.
 	if firstErrorClass == 0 || firstErrorClass >= numClasses {

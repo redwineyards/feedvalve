@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync/atomic"
 )
 
 // fieldFormat is the per-field trace line, kept VERBATIM from poc/reader.go.
@@ -37,24 +38,38 @@ const fieldFormat = "DEBUG field=%-30s offset=%d-%d hex=%x value=%v"
 type DebugLogger struct {
 	lg *log.Logger
 
-	// codes are the transaction codes being traced, from
-	// debug.traceTranscodes. Usually empty, occasionally one.
-	codes []int
+	// snap is the current trace selection, published whole so a reload can
+	// replace it while the receive goroutine reads it. A reader loads the
+	// pointer once and sees one consistent (codes, hexDump) pair; the snapshot
+	// is never mutated after Set stores it.
+	snap atomic.Pointer[debugSnap]
+}
 
+// debugSnap is an immutable trace selection: the transaction codes being
+// traced, from debug.traceTranscodes (usually empty, occasionally one), and
+// debug.hexDump.
+type debugSnap struct {
+	codes   []int
 	hexDump bool
 }
 
 // NewDebugLogger builds the trace logger of startup step 6. An empty codes
 // slice disables it entirely, which is the normal state.
 func NewDebugLogger(w io.Writer, codes []int, hexDump bool) *DebugLogger {
-	d := &DebugLogger{
-		lg:      log.New(w, "", log.LstdFlags|log.Lmicroseconds),
-		hexDump: hexDump,
-	}
-	if len(codes) > 0 {
-		d.codes = append(d.codes, codes...)
-	}
+	d := &DebugLogger{lg: log.New(w, "", log.LstdFlags|log.Lmicroseconds)}
+	d.Set(codes, hexDump)
 	return d
+}
+
+// Set applies a reloaded debug.traceTranscodes and debug.hexDump. It copies
+// codes and publishes a new immutable snapshot, so it is safe to call while the
+// receive goroutine is reading, and the readers below stay allocation-free.
+func (d *DebugLogger) Set(codes []int, hexDump bool) {
+	s := &debugSnap{hexDump: hexDump}
+	if len(codes) > 0 {
+		s.codes = append(s.codes, codes...)
+	}
+	d.snap.Store(s)
 }
 
 // Enabled reports whether this transaction code is being traced.
@@ -76,10 +91,11 @@ func NewDebugLogger(w io.Writer, codes []int, hexDump bool) *DebugLogger {
 // holds nothing in normal operation and one code when an operator is
 // diagnosing, so a map would be slower as well as larger.
 func (d *DebugLogger) Enabled(code int) bool {
-	if len(d.codes) == 0 {
+	codes := d.snap.Load().codes
+	if len(codes) == 0 {
 		return false
 	}
-	for _, c := range d.codes {
+	for _, c := range codes {
 		if c == code {
 			return true
 		}
@@ -94,11 +110,11 @@ func (d *DebugLogger) Enabled(code int) bool {
 // in normal operation debug.traceTranscodes is empty -- so a caller asks this
 // first and skips the resolution entirely, which is what keeps the receive path
 // the same cost traced or not.
-func (d *DebugLogger) Any() bool { return len(d.codes) > 0 }
+func (d *DebugLogger) Any() bool { return len(d.snap.Load().codes) > 0 }
 
 // HexDumpEnabled reports whether debug.hexDump is set, so a caller can skip
 // building a dump nobody will print.
-func (d *DebugLogger) HexDumpEnabled() bool { return d.hexDump }
+func (d *DebugLogger) HexDumpEnabled() bool { return d.snap.Load().hexDump }
 
 // Field traces one parsed field. lo and hi are absolute offsets within the
 // broadcast data, prefix included, so they index the hex dump directly.
@@ -112,7 +128,7 @@ func (d *DebugLogger) Field(name string, lo, hi int, raw []byte, value any) {
 // HexDump writes a hexdump -C style dump of a payload, in poc's format
 // (poc/reader.go:98-128), so a trace and a capture can be read side by side.
 func (d *DebugLogger) HexDump(data []byte) {
-	if !d.hexDump {
+	if !d.snap.Load().hexDump {
 		return
 	}
 	d.lg.Printf("DEBUG payload %d bytes\n%s", len(data), HexDump(data))

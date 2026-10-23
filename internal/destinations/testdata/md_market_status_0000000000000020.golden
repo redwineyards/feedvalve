@@ -1,0 +1,20 @@
+MERGE INTO MD_MARKET_STATUS t
+USING (SELECT
+  :1 AS market_type,
+  :2 AS effective_ts,
+  :3 AS updated_at
+  FROM dual) s
+ON (t.market_type = s.market_type)
+WHEN MATCHED THEN UPDATE SET
+  t.effective_ts = s.effective_ts,
+  t.updated_at = s.updated_at
+WHEN NOT MATCHED THEN INSERT (
+  market_type,
+  effective_ts,
+  updated_at
+)
+VALUES (
+  s.market_type,
+  s.effective_ts,
+  s.updated_at
+)

@@ -165,6 +165,10 @@ type GapDetector struct {
 	// auditLeft counts down the messages the audit still observes.
 	// ordering.gapAuditPackets, default 0 = off.
 	auditLeft int
+
+	// auditSet is the ordering.gapAuditPackets value auditLeft was last armed
+	// from, so Reconfigure can tell a changed setting from an unchanged one.
+	auditSet int
 }
 
 // NewGapDetector builds a detector for one scope.
@@ -181,7 +185,34 @@ func NewGapDetector(scope GapScope, auditPackets int, rep Reports) *GapDetector 
 	if auditPackets < 0 {
 		auditPackets = 0
 	}
-	return &GapDetector{scope: scope, rep: rep, auditLeft: auditPackets}
+	return &GapDetector{scope: scope, rep: rep, auditLeft: auditPackets, auditSet: auditPackets}
+}
+
+// Reconfigure applies a reloaded ordering.gapScope and ordering.gapAuditPackets.
+// Like Observe it must be called only by the owning goroutine, which is why the
+// caller adopts a reload at a datagram boundary rather than from the SIGHUP
+// goroutine.
+//
+// A changed scope clears the sequence state: global and per-transcode track
+// different sequence spaces, so state recorded under one is meaningless under
+// the other, and resuming from it would report a fabricated gap on the first
+// message. Clearing means the first message after the change records and emits
+// nothing, exactly as at startup. An unchanged scope keeps its state, so a
+// reload of an unrelated key (or of the audit length alone) loses nothing. A
+// changed audit length re-arms the audit; an unchanged one does not restart it.
+func (g *GapDetector) Reconfigure(scope GapScope, auditPackets int) {
+	if auditPackets < 0 {
+		auditPackets = 0
+	}
+	if scope != g.scope {
+		g.scope = scope
+		g.global = slotState{}
+		g.perCode = [gapSlots]slotState{}
+	}
+	if auditPackets != g.auditSet {
+		g.auditSet = auditPackets
+		g.auditLeft = auditPackets
+	}
 }
 
 // Observe feeds one resolved message to the detector.

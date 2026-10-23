@@ -3,13 +3,12 @@ package app
 import (
 	"bytes"
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"errors"
-	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +20,7 @@ import (
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 	"feedvalve/internal/oradb"
+	"feedvalve/internal/oradb/oratest"
 )
 
 // testGraph builds a graph the way relay does, but with no database and with
@@ -41,6 +41,12 @@ func testGraphWith(t *testing.T, listen string, tune func(*config.Config),
 	// defaults are the shipped values anyway.
 	cfg := config.Defaults()
 	cfg.UDP.Listen = listen
+	// Small mirrors. At the defaults every Build allocates ~41 MB of arenas,
+	// indexes, rings and batches, and G-LIFE-5 builds one graph per
+	// FatalReason under -race's memory multiplier. Nothing here needs the
+	// production pre-size; a tune can still restore it.
+	cfg.Runtime.ExpectedRows = 1024
+	cfg.Runtime.ArenaChunkRows = 256
 	if tune != nil {
 		tune(cfg)
 	}
@@ -124,8 +130,8 @@ func TestG_LIFE_1_TheSocketIsBoundLast(t *testing.T) {
 	if listener < 0 {
 		t.Fatalf("the listener was never acquired: %v", got)
 	}
-	for _, earlier := range []string{"derived-state", "qd-ring", "shard-channels",
-		"shard-consumers", "decoder", "stats-goroutine"} {
+	for _, earlier := range []string{"derived-state", "qd-ring", "shard-channels", "shards",
+		"shard-consumers", "decoder", "flush-ticker", "stats-goroutine"} {
 		at := idx(earlier)
 		if at < 0 {
 			t.Errorf("%q was never acquired: %v", earlier, got)
@@ -137,6 +143,15 @@ func TestG_LIFE_1_TheSocketIsBoundLast(t *testing.T) {
 				"is somewhere to put it and before the goroutine that will drain it "+
 				"exists (Vol 4 section 1.4 step 16).", earlier, got)
 		}
+	}
+
+	// Step 15 after steps 14 and 14a: the flush ticker starts beside the
+	// stats goroutine, after the shards it ticks, so the first tick cannot
+	// land on a shard that does not exist (Vol 4 section 1.4).
+	if ticker := idx("flush-ticker"); ticker < idx("shard-consumers") || ticker < idx("decoder") ||
+		ticker > idx("stats-goroutine") {
+		t.Errorf("the flush ticker is not at step 15, after the shards and the decoder and "+
+			"beside the stats goroutine (order: %v)", got)
 	}
 }
 
@@ -158,7 +173,7 @@ func TestEveryAcquiredResourceIsReleased(t *testing.T) {
 
 	released := g.Released()
 	for _, want := range []string{"udp-listener", "qd-ring", "decoder",
-		"shard-channels", "shard-consumers", "stats-goroutine"} {
+		"shard-channels", "shard-consumers", "flush-ticker", "stats-goroutine"} {
 		if !slices.Contains(released, want) {
 			t.Errorf("%q was acquired but never released (released: %v)", want, released)
 		}
@@ -249,22 +264,30 @@ func TestG_LIFE_2_SigtermReturnsPromptlyAndQuietly(t *testing.T) {
 // process that failed to start and will be restarted immediately by the
 // supervisor.
 func TestG_LIFE_3_BindFailureUnwindsWithTheDatabaseClosed(t *testing.T) {
-	closed := make(chan struct{})
-	stub := newStubDB(t, func() { close(closed) })
-	// sql.Open is lazy, so force one driver connection into the pool:
-	// otherwise sql.DB.Close has nothing to close and the observation would
+	// A counting fake from oratest, opened through the real OpenDriver, so the
+	// handle the lifecycle closes is the production *oradb.DB over a driver
+	// that counts. OpenDriver's ping forces one connection into the pool:
+	// otherwise Close would have nothing to close and the observation would
 	// pass vacuously whether the lifecycle closed the handle or not.
-	if err := stub.Ping(); err != nil {
-		t.Fatalf("priming the stub pool: %v", err)
-	}
+	fake := oratest.New()
+	t.Cleanup(fake.Close)
 
 	// The seam: the database opens, so the bind is the only thing that fails.
 	old := openDB
-	openDB = func(context.Context, oradb.DBSettings) (*sql.DB, error) { return stub, nil }
+	openDB = func(ctx context.Context, s oradb.DBSettings) (*oradb.DB, error) {
+		return oradb.OpenDriver(ctx, oratest.DriverName, fake.DSN(), s)
+	}
 	t.Cleanup(func() { openDB = old })
 
 	cfg := config.Defaults()
 	cfg.HasDB = true
+	// Defaults() leaves db unset; OpenDriver pings under ConnectTimeoutSec,
+	// and a zero timeout would fail the open before the bind is reached.
+	cfg.DB = oradb.DBSettings{
+		Host: "h", Port: 1521, Service: "s", User: "u",
+		ConnectTimeoutSec: 10, QueryTimeoutSec: 30, ConnMaxLifetimeMinutes: 30,
+		MaxOpenConns: 5, MaxIdleConns: 5,
+	}
 	// An address ListenPacket cannot bind, which is what rigs step 16 to fail.
 	cfg.UDP.Listen = "198.51.100.1:65000"
 
@@ -282,13 +305,13 @@ func TestG_LIFE_3_BindFailureUnwindsWithTheDatabaseClosed(t *testing.T) {
 	if got := ExitCode(runErr); got != ExitStartup {
 		t.Errorf("exit code = %d, want %d for a startup failure", got, ExitStartup)
 	}
-	select {
-	case <-closed:
-	default:
-		t.Error("db.Close() was NOT called after the bind failed.\n" +
-			"The Close deferred at startup step 11 must still run when step 16 fails, " +
-			"or a process that could not start leaves an Oracle session open -- and the " +
-			"supervisor restarts it immediately, so the leak compounds.")
+	if c := fake.Counts(); c.Opens != 1 {
+		t.Fatalf("non-vacuity: driver connections opened = %d, want 1", c.Opens)
+	} else if c.Closes != 1 {
+		t.Errorf("driver connections closed = %d, want 1: db.Close() was NOT called after the bind failed.\n"+
+			"The Close deferred at startup step 11 must still run when step 16 fails, "+
+			"or a process that could not start leaves an Oracle session open -- and the "+
+			"supervisor restarts it immediately, so the leak compounds.", c.Closes)
 	}
 }
 
@@ -524,42 +547,6 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// newStubDB returns a *sql.DB over a driver that does nothing but record its
-// Close. The same approach oradb's own tests use, so go test needs no database.
-func newStubDB(t *testing.T, onClose func()) *sql.DB {
-	t.Helper()
-	// Unique per call, not per test name: sql.Register panics on a duplicate,
-	// and -count=N runs the same test name N times. That is exactly how a
-	// repeated run of a scheduling-sensitive gate -- which is what G-RACE-2
-	// asks for -- would otherwise fail for a reason that has nothing to do
-	// with the thing under test.
-	name := fmt.Sprintf("appstub-%s-%d", t.Name(), stubSeq.Add(1))
-	sql.Register(name, &stubDriver{onClose: onClose})
-	db, err := sql.Open(name, "")
-	if err != nil {
-		t.Fatalf("sql.Open(%s): %v", name, err)
-	}
-	return db
-}
-
-// stubSeq makes each registered driver name unique.
-var stubSeq atomic.Int64
-
-type stubDriver struct{ onClose func() }
-
-func (d *stubDriver) Open(string) (driver.Conn, error) { return &stubConn{d: d}, nil }
-
-type stubConn struct{ d *stubDriver }
-
-func (c *stubConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("no statements") }
-func (c *stubConn) Begin() (driver.Tx, error)           { return nil, errors.New("no transactions") }
-func (c *stubConn) Close() error {
-	if c.d.onClose != nil {
-		c.d.onClose()
-	}
-	return nil
-}
-
 // TestTheQDDrainStageAbandonsNothing is the card's "shutdown order, including
 // the QD drain stage between 'stop reading' and 'stop decoding'".
 //
@@ -747,3 +734,194 @@ func TestQDBudgetExpiryIsTerminal(t *testing.T) {
 			"value of splitting the budget in two:\n%s", buf.String())
 	}
 }
+
+// TestTheTwoEmittersAreSerialised is the regression test for P3-01: the
+// obs.Emit + lastParks race that kept `go test -race ./internal/app/` from
+// being green through Phase 2. It is not a gate of its own; it is what lets
+// G-RACE-1 (`go test -race ./...` on every commit) pass over this package.
+//
+// The lifecycle has two emitters. The stats goroutine's tick, and
+// logShutdownInitiated on the Run goroutine -- which overlap, because teardown
+// stops stats LAST, after the shutdown snapshot. Both called sampleGauges (a
+// read-modify-write of the plain lastParks field) and Reg.Emit (whose snapshot
+// writes the slab its render pass reads) with nothing between them.
+//
+// SETUP: a running graph with the stats interval at its 1 s minimum, and a
+// sender keeping real datagrams flowing -- paced, so the decoder empties QD
+// and parks between them and the park count that sampleGauges reads keeps
+// moving while it is read.
+//
+// STIMULUS: one goroutine calls emitStats in a loop while another calls
+// logShutdownInitiated in a loop, and the window stays open until the REAL
+// ticker has emitted at least twice inside it -- so the production pairing,
+// the stats goroutine's own tick against a shutdown snapshot, is in the mix,
+// not only the two test goroutines. Then a normal shutdown, and one last
+// emission once the decoder has stopped.
+//
+// ASSERTION: under -race, no report. And the adversarial half, which holds
+// without the race detector: the qd_wake_parked deltas summed across EVERY
+// emitted line equal the ring's Parks(). Two unserialised sampleGauges can
+// both read the same lastParks and both add the same delta (too many); two
+// unserialised snapshots overwrite each other's curC and deltaC between
+// computing and rendering them (too few, which is what the unlocked code
+// actually showed: 159 summed against 396 parks). Either way the sum stops
+// being the parks that happened. Non-vacuity: both test emitters ran
+// repeatedly, parks moved, and the real ticker's emissions inside the window
+// (lines emitted minus the test emitters' own) are at least two.
+//
+// WOULD HAVE CAUGHT: the defect as it stood. With emitMu removed from
+// emitStats, -race reported 292 data races in -count=3 (in obs.Reg.snapshot
+// and Graph.sampleGauges), and without -race the sum check failed on its own.
+// Likewise the stats goroutine's tick calling sampleGauges and Reg.Emit
+// directly rather than through emitStats, now that the real tick is
+// guaranteed to emit inside the window.
+func TestTheTwoEmittersAreSerialised(t *testing.T) {
+	g, buf := testGraph(t, "127.0.0.1:0", func(c *config.Config) {
+		c.Stats.IntervalSec = 1 // the validated minimum, so the real tick fires inside the window
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- g.Run(ctx) }()
+	waitUntil(t, "the listener to be bound", func() bool { return g.LocalAddr() != nil })
+
+	conn, err := net.Dial("udp", g.LocalAddr().String())
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("dialling the listener: %v", err)
+	}
+	defer conn.Close()
+
+	d := datagramOf(t, uncompressedSub(mbp7208Payload(2)))
+	payload := d.Buf[:d.N]
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	// Stops the goroutines and joins Run exactly once: on the normal path
+	// below, or from Cleanup if a t.Fatalf leaves first -- so a failed wait
+	// cannot leak the emitters and the bound graph into later tests.
+	var runErr error
+	shutdown := sync.OnceFunc(func() {
+		stop.Store(true)
+		wg.Wait()
+		cancel()
+		runErr = <-done
+	})
+	t.Cleanup(shutdown)
+
+	// Traffic. Paced rather than flat out: a decoder that never finds the ring
+	// empty never parks, and then the value under contention never changes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			_, _ = conn.Write(payload) // loopback UDP may drop; a loss is harmless here
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+
+	// The two emitters, hammered. The short pause keeps a multi-second
+	// window's captured output to a size the polling below can rescan; the
+	// overlap needs many emissions from each side, not a tight loop.
+	var ticks, snapshots atomic.Int64
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			ticks.Add(1) // before, so the count below can only under-read
+			if err := g.emitStats(); err != nil {
+				t.Errorf("emitStats: %v", err)
+				return
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			snapshots.Add(1)
+			g.logShutdownInitiated(fatalEvent{}, false)
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+
+	// Every emission writes exactly one health line (obs Rule 1); the ones
+	// neither test goroutine accounts for came from the real ticker. Read
+	// under emitMu, so no emission is half-written while the (large) buffer
+	// is counted; and each test emitter counts itself before emitting, so a
+	// poll can only under-read the real ticks, never credit them with a test
+	// emitter's line.
+	realTicksSoFar := func() int64 {
+		g.emitMu.Lock()
+		defer g.emitMu.Unlock()
+		n := int64(strings.Count(buf.String(), " group=health"))
+		return n - ticks.Load() - snapshots.Load()
+	}
+	parksBefore := g.qdConsumer.Parks()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if realTicksSoFar() >= 2 &&
+			g.qdConsumer.Parks() > parksBefore+10 &&
+			g.inst().datagramsReceived.Load() > 10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for two real ticks, parks and traffic in the overlap "+
+				"(real ticks=%d ticks=%d snapshots=%d)", realTicksSoFar(), ticks.Load(), snapshots.Load())
+		}
+	}
+	parksDuring := g.qdConsumer.Parks() - parksBefore
+	stop.Store(true)
+	wg.Wait()
+	// Read before cancel, now exact: no test emitter is left, so every line
+	// beyond their counts is the stats goroutine's. The poll above already
+	// guaranteed at least two of them landed while the test emitters ran.
+	realTicks := realTicksSoFar()
+
+	shutdown()
+	if runErr != nil {
+		t.Fatalf("Run = %v", runErr)
+	}
+
+	// The decoder has returned, so Parks() is final. One more emission moves
+	// whatever is still unreported onto a line.
+	if err := g.emitStats(); err != nil {
+		t.Fatalf("the final emitStats: %v", err)
+	}
+	parks := g.qdConsumer.Parks()
+
+	// Non-vacuity: all three emitters ran, repeatedly, while parks moved.
+	if ticks.Load() < 10 || snapshots.Load() < 10 {
+		t.Fatalf("the emitters ran %d and %d times; the overlap was not exercised",
+			ticks.Load(), snapshots.Load())
+	}
+	if realTicks < 2 {
+		t.Fatalf("the real ticker emitted %d times inside the overlap, want >= 2", realTicks)
+	}
+	t.Logf("ticks=%d snapshots=%d realTicks=%d parks during overlap=%d total=%d",
+		ticks.Load(), snapshots.Load(), realTicks, parksDuring, parks)
+
+	var sum, lines uint64
+	var last uint64
+	for _, m := range qdWakeParkedRE.FindAllStringSubmatch(buf.String(), -1) {
+		cum, _ := strconv.ParseUint(m[1], 10, 64)
+		delta, _ := strconv.ParseUint(m[2], 10, 64)
+		sum += delta
+		last = cum
+		lines++
+	}
+	if lines == 0 {
+		t.Fatal("no qd_wake_parked value was emitted at all; the check below would be vacuous")
+	}
+	if sum != parks {
+		t.Errorf("qd_wake_parked deltas summed across %d lines = %d, but the ring parked %d "+
+			"times -- two emitters were not serialised", lines, sum, parks)
+	}
+	if last != parks {
+		t.Errorf("the last emitted qd_wake_parked total is %d, want Parks() = %d", last, parks)
+	}
+}
+
+// qdWakeParkedRE matches a counter's "name=total(+delta)" rendering.
+var qdWakeParkedRE = regexp.MustCompile(`\bqd_wake_parked=(\d+)\(\+(\d+)\)`)

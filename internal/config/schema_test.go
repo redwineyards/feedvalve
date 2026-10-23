@@ -59,7 +59,7 @@ func valid() *Config {
 }
 
 func TestValidBaseline(t *testing.T) {
-	if err := ValidateAll(valid(), shippedDests(t), nil, ModeRun); err != nil {
+	if err := ValidateAll(valid(), shippedDests(t), nil, nil, ModeRun); err != nil {
 		t.Fatalf("the baseline must validate, or every rejection test below could be "+
 			"passing for the wrong reason:\n%v", err)
 	}
@@ -135,7 +135,7 @@ func TestG_SC_1_EachRuleFiresExactlyOnce(t *testing.T) {
 			c := valid()
 			tc.mutate(c)
 
-			err := ValidateAll(c, dests, nil, tc.mode)
+			err := ValidateAll(c, dests, nil, nil, tc.mode)
 			if err == nil {
 				t.Fatalf("configuration was ACCEPTED; expected %s to fire", tc.rule)
 			}
@@ -167,7 +167,7 @@ func TestReloadRulesFireExactlyOnce(t *testing.T) {
 			prev, next := valid(), valid()
 			tc.mutate(next)
 
-			err := ValidateAll(next, dests, prev, ModeRun)
+			err := ValidateAll(next, dests, dests, prev, ModeRun)
 			if err == nil {
 				t.Fatalf("reload was ACCEPTED; expected %s to fire", tc.rule)
 			}
@@ -179,7 +179,7 @@ func TestReloadRulesFireExactlyOnce(t *testing.T) {
 	}
 
 	t.Run("an unchanged reload is accepted", func(t *testing.T) {
-		if err := ValidateAll(valid(), dests, valid(), ModeRun); err != nil {
+		if err := ValidateAll(valid(), dests, dests, valid(), ModeRun); err != nil {
 			t.Errorf("reloading an identical configuration must be accepted: %v", err)
 		}
 	})
@@ -197,13 +197,13 @@ func TestReloadRulesFireExactlyOnce(t *testing.T) {
 // both, so the only thing wrong is the keying.
 func TestRowKeyDerivableIsEnforced(t *testing.T) {
 	const mapping = `{"destinations":[
-	  {"name":"D_TOKEN","table":"D_TOKEN","rowKey":"token","imageLen":4,
+	  {"name":"D_TOKEN","table":"D_TOKEN","rowKey":"token","keyColumn":"k","imageLen":4,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":4,"kind":"long","sql":["v"]}]},
-	  {"name":"D_MARKET","table":"D_MARKET","rowKey":"marketType","imageLen":4,
+	  {"name":"D_MARKET","table":"D_MARKET","rowKey":"marketType","keyColumn":"k","imageLen":4,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":4,"kind":"long","sql":["w"]}]},
-	  {"name":"D_SPARE","table":"D_SPARE","rowKey":"token","imageLen":1,
+	  {"name":"D_SPARE","table":"D_SPARE","rowKey":"token","keyColumn":"k","imageLen":1,
 	   "contributors":[7305],
 	   "columns":[{"bit":0,"width":1,"kind":"char1","sql":["f"]}]}
 	]}`
@@ -231,7 +231,7 @@ func TestRowKeyDerivableIsEnforced(t *testing.T) {
 	}
 
 	// One transcode feeding one row-key rule: fine.
-	if err := ValidateAll(base(), dests, nil, ModeRun); err != nil {
+	if err := ValidateAll(base(), dests, nil, nil, ModeRun); err != nil {
 		t.Fatalf("the baseline must validate: %v", err)
 	}
 
@@ -242,7 +242,7 @@ func TestRowKeyDerivableIsEnforced(t *testing.T) {
 	c.Transcodes[0].Contributions = append(c.Transcodes[0].Contributions,
 		ContributionConfig{Destination: "D_MARKET", Columns: []string{"w"}})
 
-	err = ValidateAll(c, dests, nil, ModeRun)
+	err = ValidateAll(c, dests, nil, nil, ModeRun)
 	if err == nil {
 		t.Fatal("a transcode feeding differently-keyed destinations must be rejected (ASM-15)")
 	}
@@ -255,7 +255,7 @@ func TestRowKeyDerivableIsEnforced(t *testing.T) {
 	// and the ordering guard is silently weaker for that row.
 	c = base()
 	c.Transcodes = c.Transcodes[:1] // drop 7305, still a declared contributor of D_SPARE
-	if err := ValidateAll(c, dests, nil, ModeRun); err == nil {
+	if err := ValidateAll(c, dests, nil, nil, ModeRun); err == nil {
 		t.Error("a declared contributor that is never configured must be rejected")
 	} else if got := rulesOf(t, err); !slices.Contains(got, RuleRowKeyDerivable) {
 		t.Errorf("fired %v, want %s among them", got, RuleRowKeyDerivable)
@@ -268,13 +268,13 @@ func TestRowKeyDerivableIsEnforced(t *testing.T) {
 // Using a purpose-built map is what keeps this test about the blob bound.
 func TestBlobFitsIsEnforced(t *testing.T) {
 	const mapping = `{"destinations":[
-	  {"name":"D_WIDE","table":"D_WIDE","rowKey":"token","imageLen":250,
+	  {"name":"D_WIDE","table":"D_WIDE","rowKey":"token","keyColumn":"k","imageLen":250,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":250,"kind":"text","lenBit":-1,"sql":["wide"]}]},
-	  {"name":"D_ALSO","table":"D_ALSO","rowKey":"token","imageLen":20,
+	  {"name":"D_ALSO","table":"D_ALSO","rowKey":"token","keyColumn":"k","imageLen":20,
 	   "contributors":[7208],
 	   "columns":[{"bit":0,"width":20,"kind":"text","lenBit":-1,"sql":["alsowide"]}]},
-	  {"name":"D_STATUS","table":"D_STATUS","rowKey":"marketType","imageLen":1,
+	  {"name":"D_STATUS","table":"D_STATUS","rowKey":"marketType","keyColumn":"k","imageLen":1,
 	   "contributors":[6511],
 	   "columns":[{"bit":0,"width":1,"kind":"char1","sql":["flag"]}]}
 	]}`
@@ -301,7 +301,7 @@ func TestBlobFitsIsEnforced(t *testing.T) {
 
 	// 250 + 20 = 270, over UpdateUnit.Blob's 256. Both destinations are
 	// token-keyed, so V-D7 stays quiet and only the blob bound fires.
-	err = ValidateAll(c, dests, nil, ModeRun)
+	err = ValidateAll(c, dests, nil, nil, ModeRun)
 	if err == nil {
 		t.Fatal("270 bytes of contributions must not fit a 256-byte blob")
 	}
@@ -312,7 +312,7 @@ func TestBlobFitsIsEnforced(t *testing.T) {
 	// Trimming one contribution brings it under and the pair validates,
 	// which proves the bound rather than a permanently broken fixture.
 	c.Transcodes[0].Contributions = c.Transcodes[0].Contributions[:1]
-	if err := ValidateAll(c, dests, nil, ModeRun); err != nil {
+	if err := ValidateAll(c, dests, nil, nil, ModeRun); err != nil {
 		t.Errorf("250 bytes should fit: %v", err)
 	}
 }
@@ -326,14 +326,14 @@ func TestSelfCheckRelaxesTheDatabaseRule(t *testing.T) {
 	c := valid()
 	c.HasDB = false
 
-	if err := ValidateAll(c, dests, nil, ModeRun); err == nil {
+	if err := ValidateAll(c, dests, nil, nil, ModeRun); err == nil {
 		t.Error("ModeRun must require a db object: a relay whose purpose is to persist " +
 			"must not start with nowhere to persist to")
 	}
-	if err := ValidateAll(c, dests, nil, ModeSelfCheck); err != nil {
+	if err := ValidateAll(c, dests, nil, nil, ModeSelfCheck); err != nil {
 		t.Errorf("ModeSelfCheck must not require a db object: %v", err)
 	}
-	if err := ValidateAll(c, dests, nil, ModeDBCheck); err == nil {
+	if err := ValidateAll(c, dests, nil, nil, ModeDBCheck); err == nil {
 		t.Error("ModeDBCheck must require a db object")
 	}
 }
@@ -481,7 +481,7 @@ func TestValidationErrorReportsEveryRule(t *testing.T) {
 	c.Stats.LogLevel = "trace"
 	c.Liveness.TradingWindow.TZ = "Mars/Olympus"
 
-	err := ValidateAll(c, shippedDests(t), nil, ModeRun)
+	err := ValidateAll(c, shippedDests(t), nil, nil, ModeRun)
 	got := rulesOf(t, err)
 	want := []string{RuleRange, RuleStallBudget, RuleTimezone}
 	slices.Sort(want)

@@ -78,7 +78,7 @@ volume rather than against prose.
 | # | On | Obligation | Why this volume cannot supply it |
 |---|---|---|---|
 | **B-V1** | Volume 1 | `UpdateUnit.Contribs[d].Slot` MUST be the contributor slot of `Code` **within destination `d`**, assigned at startup by ascending transaction code among that destination's declared contributors (HLD §6.9, §7.3; Vol 0 §3.4). The shard indexes `Entry.LastSeq/LastTime/LastRecv` with it and never recomputes it | The slot is a property of the configured destination table, resolved once in `destinations`; recomputing it per contribution on the shard would be a lookup on the coalescing path for a value that cannot change |
-| **B-V1b** | Volume 1 | `UpdateUnit.RecvMono` MUST be set for **every** unit, from `time.Since(processStart).Nanoseconds()` (Vol 0 §10.2) — never zero-as-absent, never a wall clock | It is the third ordering component (§5.3) and the only sub-second discriminator the design has |
+| **B-V1b** | Volume 1 | `UpdateUnit.RecvMono` MUST be set for **every** unit, from `time.Since(processStart).Nanoseconds()` (Vol 0 §10.2), made **strictly increasing** per datagram as `max(now, last+1)` (`nextRecvMono`) — never zero-as-absent, never a wall clock, never equal to the previous datagram's *(erratum, Phase 3, seam 9: on a timer-tick monotonic clock two datagrams read in one tick otherwise share a value, and §5.3 step 8 discards the second as a re-delivery)* | It is the third ordering component (§5.3) and the only sub-second discriminator the design has |
 | **B-V3** | Volume 3 | Every returned batch MUST have every row adjudicated: `OutcomeCommitted`, `OutcomeRejected` or `OutcomeFailed`, never `OutcomePending` with `Batch.Err == nil`. A row refused for a **data** reason (`ORA-00001`, `ORA-01438`, `ORA-12899`) MUST be `OutcomeRejected` with `BatchRow.ErrCode` set to the ORA number; a row unwritten for a **session, statement or deadlock** reason MUST be `OutcomeFailed`. Per-row attribution is supplied by Vol 3's two-phase execute (ADR-W01), not by the driver | `mirror` may not import `oradb` (Vol 0 §1.3), so the shard cannot classify a driver error and must be told. The three-outcome completion path (§8) and the quarantine bound (§9) both rest on this |
 | **B-V3b** | Volume 3 | The writer MUST return the batch on `completionCh[k]` **before** any backoff, never while holding it (Vol 3 ADR-W05) | A held batch is a batch missing from the shard's `Free` list, and an empty `Free` list stops the pump (§6.6) — so a writer backing off while holding a batch stops that shard's epoch clock as surely as a stalled epoch would |
 
@@ -141,10 +141,23 @@ type Shard struct {
     TickMissed bool   // a W tick fired while the epoch was open
     epochOpenedAt int64 // monotonic ns, for epoch_duration_max_ns and the stall warning
 
+    // tickPending is a tick seen and not yet acted on: the tick arm sets it and
+    // stage B opens the epoch (§2.4). maxBatchSize is the flush.maxBatchSize
+    // loaded at epoch open and held for the whole epoch (§6.3).          [+]
+    tickPending  bool
+    maxBatchSize int
+
     // Free holds the shard's maxInFlightPerShard pre-allocated batches. Its
     // length is the shard's remaining write concurrency; an empty free list is
     // the ONLY thing that stops the pump (§7.2).
     Free []*model.Batch
+
+    // all is every batch this shard owns, in a fixed order; sentAt[i] is when
+    // all[i] was last sent on batchQ — §8.5's batchSentAt. Free is a stack and
+    // completions return out of order, so a batch's index is found by a
+    // linear scan of all (m = 2 by default).                               [+]
+    all    []*model.Batch
+    sentAt []int64
 
     // Quarantine[d] lists the arena slots of destination-d rows that Oracle has
     // permanently refused (§9). Bounded by the key universe; expected to be
@@ -163,7 +176,8 @@ type Shard struct {
     batchQ     chan<- *model.Batch     // Q2, shared with every shard
 
     bus  *FlushBus     // the only cross-shard surface (§1.4, §3)
-    cfg  *config.Store // atomic pointer, loaded at epoch open (Vol 0 §7.4)
+    params func() *Params // the published *mirror.Params inside app.Runtime; loaded at
+                          // epoch open and at each tick (ruling D1, D3; §6.3)
     dst  *destinations.Table // immutable after startup
     inst *shardInstruments    // resolved once at startup (Vol 0 §8.4 MUST)
     seed maphash.Seed         // process-wide digest seed (Vol 0 §5.5)
@@ -176,6 +190,13 @@ type arenaChunk struct {
     e [arenaChunkRows]model.Entry
 }
 ```
+
+> *(erratum, Phase 3: `tickPending`, `maxBatchSize` and `all`/`sentAt` were used by §2.4, §6.3 and
+> §8.5 but missing from this struct; added as `internal/mirror/shard.go` declares them. `cfg
+> *config.Store` became `params func() *Params`: `mirror` cannot import `config`, which imports
+> `oradb`, and G-DEP-1 is transitive — ruling D1. `app` projects config onto `mirror.Sizing`
+> (startup-only) and `mirror.Params` (reloadable), and the `*Params` lives inside `app.Runtime`, one
+> published pointer.)*
 
 > **Delta against HLD §7.3.** The HLD places `FlushReq atomic.Bool` and `Done chan *Batch` **inside**
 > `Shard`. This volume moves the flush flag out into a shared `FlushBus` (§3.1) and keeps the
@@ -190,7 +211,7 @@ type arenaChunk struct {
 > **MUST.** For the lifetime of the process, the goroutine running `Shard.Run` is the **only**
 > goroutine that reads or writes:
 >
-> - every field of `Shard` listed in §1.1 except `bus`, `cfg`, `dst`, `inst`, `seed` and the five
+> - every field of `Shard` listed in §1.1 except `bus`, `params`, `dst`, `inst`, `seed` and the five
 >   channel fields, which are set once before `Run` starts and are read-only thereafter;
 > - **every byte of every `model.Entry` in `Arena[0..2]`** — image, masks, digest, the three ordering
 >   arrays, and all five flag bytes;
@@ -216,7 +237,7 @@ Three allocations per (shard, destination), all at startup, all sized from start
 |---|---|---|
 | `Index[d]` | `make(map[model.RowKey]int32, expectedRows/shards)` = 50,000 at the defaults | A map growing incrementally toward 50,000 entries evacuates buckets on insert, and that work lands on the sole consumer of Q1 (HLD §7.8). Pre-sizing converts it into one startup cost |
 | `Arena[d]` | `Arena[d] = append(Arena[d], new(arenaChunk))` — **chunk 0 allocated with the shard**, remaining chunks on demand | Identical reason. HLD §7.8: "arena chunk 0 is allocated with the shard". A first-packet-of-the-session allocation of 1.74 MB on the shard goroutine is exactly the stall `shard_loop_max_ns` exists to catch |
-| `Accum[d]`, `Cohort[d]` | `newRing(expectedRows / shards)` = 50,000 `int32` = 200 KB each | §11.4: a ring that grows during a database outage does so at the worst possible moment. Pre-sizing is 4.8 MB total (§10) and removes the case entirely |
+| `Accum[d]`, `Cohort[d]` | `newRing(expectedRows / shards)` = 50,000 `int32`, rounded up to 65,536 = 256 KiB each | §11.4: a ring that grows during a database outage does so at the worst possible moment. Pre-sizing is 6.3 MB total (§10.3) and removes the case entirely |
 
 **Slot allocation** is a bump allocator, and the slot is an address:
 
@@ -226,7 +247,7 @@ allocEntry(d) → int32:
   2. if chunk == len(Arena[d]):  append a new zeroed *arenaChunk; count arena_chunks{k,d}
   3. slot := NextSlot[d]; NextSlot[d]++
   4. e := entry(d, slot)          // *Entry into the chunk, never copied out
-  5. *e = model.Entry{}           // explicit zero: Image, Digest, Written, SlotSeen, Fail
+  5. *e = model.Entry{}           // explicit zero: Image, Digest, Written, SlotSeen, Quarantined
   6. return slot
 ```
 
@@ -295,7 +316,7 @@ flowchart TD
     end
     subgraph SH["shard k goroutine — SOLE reader and writer of everything in here"]
         LOOP["Shard.Run main loop<br/>§2"]
-        MIR["Index[3] map[RowKey]int32 pre-sized 50,000<br/>Arena[3] []*arenaChunk, chunk = 4096 × 424 B<br/>EVERY Entry byte: Image, ColMask, Written, Digest,<br/>LastSeq/LastTime/LastRecv[8], Dirty/InFlight/ReDirty/Fail/SlotSeen"]
+        MIR["Index[3] map[RowKey]int32 pre-sized 50,000<br/>Arena[3] []*arenaChunk, chunk = 4096 × 424 B<br/>EVERY Entry byte: Image, ColMask, Written, Digest,<br/>LastSeq/LastTime/LastRecv[8], Dirty/InFlight/ReDirty/Quarantined/SlotSeen"]
         RINGS["Accum[3] + Cohort[3]<br/>circular int32 rings, pre-sized 50,000 each"]
         EP["EpochOpen, Epoch, CohortOut,<br/>TickMissed, epochOpenedAt"]
         FREE["Free []*Batch<br/>maxInFlightPerShard = 2"]
@@ -360,21 +381,21 @@ falsifies it silently. So the loop is specified here in full, with the starvatio
 
 ```go
 // Run is the shard goroutine. It returns when shardCh is closed and the drain
-// completes or its deadline expires (§2.6), when ctx is cancelled, or on one of
-// the three construction defects that must stop the process (§2.5).
+// completes or the shared drain deadline expires (§2.6), or on one of the
+// defects that must stop the process (§2.7). There is no context.
 //
 // Run returns an error rather than calling Fatalf: appLogger.Fatalf calls
 // os.Exit and skips every defer, so a fatal condition here must unwind through
 // app to run(ctx) error and out through main's exit code (CLAUDE.md,
 // poc/gobrdclnt.go:19-28; Vol 0 §10.4).
-func (s *Shard) Run(ctx context.Context) error
+func (s *Shard) Run() error
 ```
 
 ```
 Shard.Run — the loop, in full
 
   init:  draining      := false
-         drainDeadline := nil          // a nil <-chan time.Time blocks forever
+         drainDeadline := nil          // a nil channel blocks forever
          s.publishGauges()
 
   loop:
@@ -382,12 +403,14 @@ Shard.Run — the loop, in full
     │                                                                         │
     │   case u, ok := <-s.in:                                                 │
     │        if !ok { s.in = nil; draining = true                             │
-    │                 drainDeadline = time.After(cfg.Flush.DrainTimeout)      │
+    │                 drainDeadline = s.drainExpired  // shared, D4, §2.6    │
     │                 break }                                                 │
     │        s.merge(u)                                   // §4               │
     │                                                                         │
     │   case b := <-s.completion:                                             │
-    │        if err := s.applyCompletion(b); err != nil { return err } // §8  │
+    │        if err := s.applyCompletion(b); err != nil {        // §8        │
+    │             if err is S3 { s.report(err) } else { return err }  // §2.7 │
+    │        }                                                                │
     │                                                                         │
     │   case <-s.tick:                                                        │
     │        s.onTick()                                   // §2.4             │
@@ -399,14 +422,11 @@ Shard.Run — the loop, in full
     │   case <-drainDeadline:                                                 │
     │        s.abandonDirty(); return nil                 // §2.6             │
     │                                                                         │
-    │   case <-ctx.Done():                                                    │
-    │        return ctx.Err()                                                 │
-    │                                                                         │
     └─────────────────────────────────────────────────────────────────────────┘
 
     ┌── (B) post-select, run ONCE per loop pass, unconditionally ─────────────┐
     │                                                                         │
-    │   if !s.EpochOpen && (draining || s.bus.req[s.ID].Load()) {             │
+    │   if !s.EpochOpen && (draining || s.tickPending || s.bus.req[s.ID].Load()) {
     │        if err := s.maybeOpenEpoch(); err != nil { return err } // §6.3  │
     │   }                                                                     │
     │                                                                         │
@@ -417,9 +437,11 @@ Shard.Run — the loop, in full
     goto loop
 ```
 
-Six cases are listed and the section heading says five: `ctx.Done()` is a Volume 4 concern (it is how
-`app` unwinds a fatal condition raised *elsewhere*) and carries no shard logic, so it is not counted
-among the shard's own cases.
+*(erratum, Phase 3: the draft listed a sixth `ctx.Done()` arm. Nothing in the design cancels that
+context, and on SIGTERM it would skip the drain, so it is removed (YAGNI, ruling D5): a clean stop goes
+through the `shardCh` close, an abnormal one through the drain deadline. Stage B's guard now includes
+`tickPending`, as §2.4 already said it must. The drain deadline is the one shared `drainExpired`
+channel, not a per-shard `time.After` — ruling D4, §2.6.)*
 
 ### 2.3 Stage B is the level-triggered half of the L1 fix, and it is why the loop has two stages
 
@@ -459,10 +481,11 @@ shards that is the entire entitled capacity (ADR-009, req §4).
 
 ```
 onTick():
+  0. p := s.params(); s.guard = p.Guard     // one Params load per tick (ruling D3, §6.3)
   1. if s.EpochOpen:
        s.TickMissed = true
        inst.tickSkippedEpochOpen{k}.Add(1)
-       if now - s.epochOpenedAt > cfg.Flush.EpochStallWarn:          // assumed 30 s, §13 A9
+       if now - s.epochOpenedAt > p.EpochStallWarn:                  // assumed 30 s, §13 A9
             log WARN once per epoch: "epoch stalled" k, epoch, cohort depths, CohortOut, Free len
             inst.epochStalled{k}.Add(1)
        return                              // MUST NOT clear req[k] — HLD §7.3
@@ -497,7 +520,7 @@ is sufficient here.** This is the kind of claim that must be argued, so:
 | unit vs. completion | No | Under sustained load at most two cases are ready (Q1 always, completion when a batch returns). P(completion not chosen in *n* passes) = 2⁻ⁿ; expected wait **2 passes ≈ 0.7 µs** (§11.2's per-pass cost). Against a commit of 5–20 ms that is six orders of magnitude of slack. Adding a priority poll would buy 0.7 µs on a 20 ms cycle |
 | unit vs. tick | No | Same bound, and the consequence of a two-pass delay on a 200 ms window is unmeasurable. If the shard were so busy that a tick waited materially, `tickCh[k]`'s cap-1 non-blocking send drops the *next* tick at the ticker and `tick_send_dropped{k}` says so (§13 A8) |
 | unit vs. wake | No | Same bound. And the wake is redundant with stage B's level check whenever the shard is busy — a busy shard observes the flag on its next pass whether or not it ever drains the wake |
-| everything vs. drain deadline | No | `drainDeadline` is a `time.After` channel; it becomes ready once and stays ready, so it is chosen within an expected 2 passes of firing |
+| everything vs. drain deadline | No | `drainDeadline` is the shared `drainExpired` channel, closed once; it becomes ready once and stays ready, so it is chosen within an expected 2 passes of firing |
 
 **Where an explicit priority *would* have been needed, and why it is not.** If the completion arm
 could be starved, the free list would stay empty, the pump could not run, and the epoch would stall —
@@ -532,7 +555,7 @@ order: close the socket → receiver returns → close every `shardCh[k]` → **
 on s.in closing:
   1. s.in = nil                  // a nil channel blocks forever: the arm disables itself
   2. draining = true
-  3. drainDeadline = time.After(cfg.Flush.DrainTimeout)     // default 5,000 ms
+  3. drainDeadline = s.drainExpired   // the ONE shared deadline, default 5,000 ms
   4. log INFO "shard draining" k, dirty depths per destination, CohortOut
 
 while draining:
@@ -551,6 +574,11 @@ on drainDeadline:
   3. return nil     // NOT an error: the deadline is a designed outcome, not a failure
 ```
 
+*(erratum, Phase 3, ruling D4: Vol 4 §2 wins — there is **one** drain budget for the process, not one
+per shard. `app` arms a single `drainExpired` channel from `t_shutdown` and closes it when
+`flush.drainTimeoutMs` runs out; every shard selects on it. Each shard keeps a nil local arm until it
+has seen `in` closed, so even `drainTimeoutMs = 0` never pre-empts units still buffered in Q1.)*
+
 **The shard may exit with batches still outstanding, and that is safe for exactly one reason.**
 `completionCh[k]` has capacity `maxInFlightPerShard` (Vol 0 §9.2, Q2c) and a shard can have at most
 that many batches outstanding. So if the shard returns while `CohortOut > 0`, the writers still holding
@@ -563,25 +591,34 @@ this is the case it protects and it is worth naming because nothing else in the 
 shard could return with a batch in flight and dirty rows already written but unconfirmed, and the
 `drain_abandoned_rows` count would understate by up to `maxBatchSize` rows per outstanding batch.
 
-### 2.7 The three conditions under which `Run` returns an error
+### 2.7 The five defects that stop the process
 
-All three are construction or writer defects, never load. Each returns a wrapped error that unwinds
-through `app` to `run(ctx) error`; none calls `os.Exit` (Vol 0 §10.4).
+All five are construction or writer defects, never load. Four return a wrapped error from `Run` that
+unwinds through `app` to `run(ctx) error`; S3 is reported without returning (below). None calls
+`os.Exit` (Vol 0 §10.4). *(erratum, Phase 3: the draft said "three" while listing S1–S3 plus
+`cohort_not_empty` and §8.2's step 0a, and called `cohort_not_empty` both "not fatal" and "fatal too";
+the fatal mapping is ruling D9.)*
 
-| # | Condition | Detected in | Counter | Why stopping is right |
-|---|---|---|---|---|
-| **S1** | Non-blocking `batchQ` send failed | `pump`, §7.4 | `flush_deferred{k}` | It is arithmetically impossible (§7.4). The one recovery the HLD's earlier draft had cannot fire when `CohortOut == 0`, so the epoch would stay open forever and the flush cadence would stop silently — HLD §7.12 risk 9 reached through the path meant to defend against it |
-| **S2** | A completion named a row whose `Entry.InFlight` is false | `applyCompletion`, §8.2 | `inflight_desync{k}` | The only thing that clears `InFlight` is the completion itself, so this means a row reached two batches — the disjointness that ADR-007's FR9 claim and §8.4's deadlock layer 1 both rest on has been violated. Continuing would write a stale image over a newer one and never say so |
-| **S3** | A batch returned with `Err == nil` and a row still `OutcomePending` | `applyCompletion`, §8.1 | `batch_row_unreported{k}` | Vol 0 §3.8 and §5.4: the writer returned a batch it never adjudicated. Every obligation in Vol 0 §5.4 is keyed on the outcome; with no outcome there is nothing correct to do |
+| # | Condition | Detected in | Counter | `FatalReason` (Vol 4 §5) | Why stopping is right |
+|---|---|---|---|---|---|
+| **S1** | Non-blocking `batchQ` send failed | `pump`, §7.4 | `flush_deferred{k}` | F21 `FatalBatchQSendFail` | It is arithmetically impossible (§7.4). The one recovery the HLD's earlier draft had cannot fire when `CohortOut == 0`, so the epoch would stay open forever and the flush cadence would stop silently — HLD §7.12 risk 9 reached through the path meant to defend against it |
+| **S2** | A completion named a row whose `Entry.InFlight` is false | `applyCompletion`, §8.2 | `inflight_desync{k}` | `FatalShardInvariant` | The only thing that clears `InFlight` is the completion itself, so this means a row reached two batches — the disjointness that ADR-007's FR9 claim and §8.4's deadlock layer 1 both rest on has been violated. Continuing would write a stale image over a newer one and never say so |
+| **S3** | A batch returned with `Err == nil` and a row still `OutcomePending` | `applyCompletion`, §8.1 | `batch_row_unreported{k}` | F27 `FatalBatchRowUnreported` — **not returned**: passed to `NewShard`'s `report func(error)` | Vol 0 §3.8 and §5.4: the writer returned a batch it never adjudicated. Every obligation in Vol 0 §5.4 is keyed on the outcome; with no outcome there is nothing correct to do |
+| **—** | `cohort_not_empty`: a `Cohort[d]` non-empty at epoch open | `maybeOpenEpoch`, §6.3 step 4 | `cohort_not_empty{k}` | `FatalShardInvariant` | See below |
+| **0a** | A completion for another shard, a future epoch, a batch this shard does not own, or one returned twice | `applyCompletion`, §8.2 step 0a | none of its own | `FatalShardInvariant` | Routing or ownership broken; the baton of §1.2 no longer holds |
 
 **S3 does one thing before it stops, and it matters.** It first converts every `Pending` row to
 `OutcomeFailed` and requeues it at the accumulating ring's head (§8.4). The process is going down, but
 it goes down through the drain, and the drain may yet write those rows. Losing them on the way out
-would be a second defect layered on the first.
+would be a second defect layered on the first. *(erratum, Phase 3: so **S3 does not return**. Had `Run`
+returned, nobody would drain those rows and the decoder would keep fanning into a Q1 nobody reads.
+After the requeue the shard's state is consistent, so `applyCompletion` returns it last and the loop's
+completion arm hands it to `report` instead of returning,
+`app` raises `Fatal(F27)`, and the shard keeps running into the normal drain — ruling D9.)*
 
-**A fourth condition is deliberately *not* fatal.** `cohort_not_empty{k}` — a `Cohort[d]` found
+**A fourth condition, `cohort_not_empty{k}`** — a `Cohort[d]` found
 non-empty at epoch open (§6.3 step 4) — is HLD §7.12 risk 10's detector, the swapped-rings defect. It
-is fatal too, for the same reason as S2: a non-empty cohort at open means the previous epoch closed
+is fatal, for the same reason as S2: a non-empty cohort at open means the previous epoch closed
 with rows still in it, so those rows are now unreachable and will never be written. It is listed
 separately because, unlike S1–S3, it is caught by an assertion whose cost is three `Len()` calls per
 epoch.
@@ -592,7 +629,7 @@ flowchart TD
     SEL{"select — five cases<br/>uniform random among ready"}
     SEL -->|"u, ok := &lt;-shardCh[k]<br/>UpdateUnit by value, 360 B"| U{"ok?"}
     U -->|"yes"| MERGE["merge(u) — §4<br/>≤ 3 contributions, guard, image, digest,<br/>ring; may broadcast the flush trigger"]
-    U -->|"no: channel closed"| DR["draining = true<br/>in = nil, drainDeadline = 5,000 ms"]
+    U -->|"no: channel closed"| DR["draining = true<br/>in = nil, drainDeadline = shared drainExpired"]
     SEL -->|"b := &lt;-completionCh[k]<br/>*Batch, per-row Outcome filled"| COMP["applyCompletion(b) — §8<br/>3 outcomes, ring re-entry,<br/>batch → Free, CohortOut--"]
     SEL -->|"&lt;-tickCh[k]<br/>struct{}, every W = 200 ms"| TICK["onTick() — §2.4<br/>epoch open ⇒ TickMissed, stall check<br/>MUST NOT clear req[k]"]
     SEL -->|"&lt;-wake[k]<br/>struct{}, cap 1, the L1 edge"| WK["count flush_wake_received<br/>NO other work in this arm"]
@@ -610,13 +647,13 @@ flowchart TD
     Q -->|"no"| SEL
     Q -->|"yes"| RET(["return nil"])
     AB --> RET
-    COMP -.->|"S2 inflight_desync / S3 batch_row_unreported"| ERR(["return error → app → run(ctx) → exit non-zero"])
+    COMP -.->|"S2 inflight_desync / 0a<br/>(S3: report → Fatal F27, loop continues)"| ERR(["return error → app → run(ctx) → exit non-zero"])
     OPEN -.->|"S1 flush_deferred / cohort_not_empty"| ERR
 ```
 
 *Figure 2.2 — The shard main loop (closes L2). Stage A is the `select`; **stage B is the level check
-that closes L1** and runs after every case, not only after a wake. The three dotted edges to `ERR` are
-the only ways the loop exits other than drain or context cancellation, and all three are construction
+that closes L1** and runs after every case, not only after a wake. The dotted edges to `ERR` are
+the only ways the loop exits other than the drain, and all are construction
 defects (§2.7). Note that no arm blocks on anything except the `select` itself: `merge`, `pump`,
 `applyCompletion` and `maybeOpenEpoch` are straight-line code over shard-local state plus one
 non-blocking channel send.*
@@ -903,7 +940,12 @@ if verdict == Supersede:
 
 ---
 
-**Step 3 — record the ordering values, all three together.**
+**Step 3 — record the ordering values, all three together** — after step 4's pass 1 (below).
+
+> *(erratum, Phase 3: step 4's width validation runs **before** step 3. A contribution with a wrong
+> packed width is rejected whole and advances no ordering slot — which is what step 2's "no partial
+> application" requires; otherwise a corrupt unit could make later valid ones look out of order. The
+> copy itself stays at step 4.)*
 
 ```
 e.LastSeq[c.Slot]  = u.Seq                      // BCSeqNo as read, bible §2.8 offset 14
@@ -924,20 +966,29 @@ e.SlotSeen        |= 1 << c.Slot                // this slot now has a comparabl
 **Step 4 — validate the contribution's packed width, then merge the masked fields.**
 
 ```
-// pass 1 — validate. Walk c.Mask low to high, summing declared widths.
+// pass 1 — validate; runs BEFORE step 3. Walk c.Mask low to high, summing declared widths.
 want := 0
 for bit in setBits(c.Mask) ascending:
     want += s.dst[d].Columns[bit].Width
 if want != int(c.BlobLen):
     inst.blobLenMismatch{u.Code}.Add(1)
     log ERROR (rate-limited): dest, code, mask, want, c.BlobLen
-    continue                                    // merge NOTHING; the image stays consistent
+    continue                                    // merge NOTHING; image and slots stay consistent
+
+// (step 3 runs here)
+
+// pre-validation (Vol 0 §5A) — per field, against the column's DDL facts. A refused
+// field leaves the contribution's EFFECTIVE mask and is counted
+// prevalidate_rejected{d,reason} + prevalidate_rejected_transcode{code}.
+eff := s.prevalidate(d, &c, &u)                 // ⊆ c.Mask
+if eff == 0: continue                           // nothing left: dirties nothing
 
 // pass 2 — copy. One cursor, ascending bit order (Vol 0 §3.4).
 cur := int(c.BlobOff)
-for bit in setBits(c.Mask) ascending:
-    col := s.dst[d].Columns[bit]
-    copy(e.Image[col.Offset : col.Offset+col.Width], u.Blob[cur : cur+col.Width])
+for bit in setBits(c.Mask) ascending:           // walk ALL of c.Mask: a refused field
+    col := s.dst[d].Columns[bit]                //   still occupies its place in the blob
+    if eff has bit:
+        copy(e.Image[col.Offset : col.Offset+col.Width], u.Blob[cur : cur+col.Width])
     cur += int(col.Width)
 ```
 
@@ -952,6 +1003,12 @@ for bit in setBits(c.Mask) ascending:
 > **Preserves Vol 0 §4.1 R1**: no byte-swapping, no scaling, no trimming — two `copy`s and nothing
 > else. Conversion happens in `writer` at bind time.
 
+*(erratum, Phase 3, ruling D12: Vol 0 §5A's "validate at merge, per contribution" runs inside this
+step, between the width check and the copy; this volume never named the step. Its three instruments
+are the shard's. An explicit-length text field and its length field are judged and withdrawn as a
+pair (Vol 0 §4.5). `NotNull` is not checked here — at merge the mirror cannot tell an insert from an
+update.)*
+
 **Why two passes rather than one.** Vol 0 §6.1 permits a decoder to clear a mask bit for a field the
 message left absent, so `c.Mask` may be a strict subset of `ColSpec.Mask` and `c.BlobLen` is therefore
 variable at runtime. A single copy-and-check-at-the-end pass would leave a partially merged image
@@ -965,7 +1022,7 @@ condition; `blob_len_mismatch{code}` non-zero warrants a rebuild, not a tuning c
 **Step 5 — dirty the columns.**
 
 ```
-e.ColMask |= c.Mask
+e.ColMask |= eff                                // c.Mask less any pre-validation refusals
 ```
 
 > **Preserves INV-MASK** (Vol 0 §6.2): `Entry.ColMask` means *"fields dirtied since this row was last
@@ -993,7 +1050,7 @@ if e.Quarantined:                                                               
 
 ```
 if u.Flags & model.FlagNonRateLimited == 0:                 // rate-limited only
-    if e.Digest != 0 && (e.ColMask &^ e.Written) == 0:
+    if !e.InFlight && e.Digest != 0 && (e.ColMask &^ e.Written) == 0:
         if maphash.Bytes(s.seed, e.Image[:s.dst[d].ImageLen]) |or 1| == e.Digest:
             inst.changeSuppressed.Add(1)
             continue                              // leave clean; ColMask stays set (Vol 0 §6.2 step 3)
@@ -1007,6 +1064,11 @@ if u.Flags & model.FlagNonRateLimited == 0:                 // rate-limited only
 > **Preserves NFR13's carve-out** (HLD §6.7, §7.4): a non-rate-limited contribution always marks the
 > row dirty, digest or no digest, and the digest is *not computed* on that path — the check is skipped
 > rather than merely failing, which is one fewer thing to be wrong.
+> **Never on an in-flight row** *(erratum, Phase 3)*. `Digest` describes the last **commit**, not the
+> batch in flight, so a value that returns to the committed one mid-flight (A committed, B pumped, A
+> merged) would match it and be dropped — leaving Oracle at B and the mirror at A with nothing to
+> requeue the row. Figure 2.4 already has no suppression arc out of `InFlight`; Vol 0 §5.3 carries the
+> same clause.
 > **Note the fourth clause uses `e.ColMask`, not `c.Mask`.** Bits may have accumulated from earlier
 > suppressed merges (Vol 0 §6.2 step 3 leaves them set), and the question the clause asks is "would
 > the *statement* name a column no statement has named before" — which is about the mask the next
@@ -1086,7 +1148,7 @@ Three booleans encode four states, and each state has exactly one encoding:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Clean: allocEntry — Image zeroed, Digest 0,<br/>Written 0, SlotSeen 0, Fail None (INV-ZERO)
+    [*] --> Clean: allocEntry — Image zeroed, Digest 0,<br/>Written 0, SlotSeen 0, Quarantined false (INV-ZERO)
 
     Clean --> Dirty: merge applies (§4 step 8 default arm)<br/>ColMask |= c.Mask, PushBack to Accum[d] TAIL<br/>rows_dirtied++
     Clean --> Clean: merge suppressed (§4 step 7)<br/>digest matches ∧ ColMask ⊆ Written ∧ rate-limited<br/>change_suppressed++ — ColMask stays set
@@ -1098,7 +1160,7 @@ stateDiagram-v2
     InFlight --> InFlightRe: merge lands mid-flight (§4 step 8 InFlight arm)<br/>image + ColMask updated, ReDirty := true,<br/>NO ring entry — redirty_total++
     InFlightRe --> InFlightRe: further merges — same
 
-    InFlight --> Clean: completion Committed (§8.3)<br/>Digest := BatchRow.Digest, Written |= BatchRow.Mask,<br/>ColMask UNTOUCHED, Fail := None
+    InFlight --> Clean: completion Committed (§8.3)<br/>Digest := BatchRow.Digest, Written |= BatchRow.Mask,<br/>ColMask UNTOUCHED
     InFlightRe --> Dirty: completion Committed ∧ ReDirty (§8.3)<br/>as above, then PushBack to Accum[d] TAIL
 
     InFlight --> Dirty: completion Failed (§8.4)<br/>ColMask |= BatchRow.Mask, PushFrontBlock to Accum[d] HEAD<br/>retry_requeued++ — Digest and Written UNCHANGED
@@ -1264,16 +1326,28 @@ guard(e, c, u, d) — evaluated strictly top to bottom, first match wins
         if u.RecvMono > e.LastRecv[c.Slot] → Apply
         else                                → Supersede
  -------------------------------------------------------------------------
- on Supersede: guard_superseded{u.Code}++   and   units_superseded_out_of_order++
+ on Supersede: guard_superseded{u.Code}++   (units_superseded_out_of_order++ is the
+               merge's, §4 step 2 — counting it here too would double it)
 ```
+
+*(erratum, Phase 3: the draft's footer and Figure 2.5 also counted `units_superseded_out_of_order` here.
+It is counted once, by the merge at §4 step 2; the guard counts only `guard_superseded{code}`. Its
+tests assert the counter rises by exactly 1 per Supersede.)*
 
 This is HLD §6.5's table made executable. Three points where the table leaves a choice and this volume
 makes one:
 
 - **Step 8 is reached by both scopes, and it is `>` not `>=`.** A unit whose `RecvMono` exactly equals
   the stored one is the *same* unit re-delivered, which can only happen if Volume 1 replayed it. It is
-  superseded. Since `RecvMono` is nanosecond-resolution monotonic and every unit gets its own reading
-  (obligation **B-V1b**), equality is unreachable in practice; specifying it removes the question.
+  superseded. Since every datagram gets its own **strictly increasing** reading (obligation **B-V1b**),
+  equality between units of different datagrams is unreachable by construction; specifying it removes
+  the question. Units of **one** datagram share its reading (Vol 1 §10.3: one clock read per datagram),
+  so two of them that reach step 8 on the same slot of the same row still tie. *(erratum, Phase 3,
+  seam 9: the draft said "nanosecond-resolution monotonic … unreachable in practice". That is a
+  property of the clock, not of `time.Since`: on a timer-tick monotonic clock (windows/amd64) two
+  datagrams read in one tick share a reading, and the second's contribution to a row the first touched
+  was discarded as a re-delivery — 10,373 times in a 60 s G-RACE-3 run. The receiver now stamps
+  `RecvMono = nextRecvMono(now, last)` = `max(now, last+1)`, which makes the premise true.)*
 - **`RecvMono` is stored always, never as a fallback** (HLD §3.4(a), Vol 0 §3.5). Step 3 of the merge
   writes all three components unconditionally on Apply, so step 8 always has a value to compare.
 - **`FlagOrderingUnusable` is the decoder's escape hatch** (Vol 0 §3.5), not the guard's. It means
@@ -1299,7 +1373,7 @@ flowchart TD
     F --> G{"u.Flags has FlagGeneral?"}
     G -->|"no — token-scoped"| H{"Δ := int32(u.Seq − e.LastSeq[slot])<br/>SERIAL arithmetic, ASM-11"}
     H -->|"Δ > 0"| AP(["APPLY — write all three slot<br/>components, then merge (§4 step 3)"])
-    H -->|"Δ < 0"| SUP(["SUPERSEDE — discard, touch nothing<br/>guard_superseded{code}++,<br/>units_superseded_out_of_order++"])
+    H -->|"Δ < 0"| SUP(["SUPERSEDE — discard, touch nothing<br/>guard_superseded{code}++<br/>(units_superseded_out_of_order++ at §4 step 2)"])
     H -->|"Δ == 0 — identical BCSeqNo"| I
     G -->|"yes — general, FR8"| I{"u.LogTime vs e.LastTime[slot]<br/>PLAIN signed, seconds since 1980"}
     I -->|"newer"| AP
@@ -1374,7 +1448,8 @@ Five mechanical points, each of which is a way to get this wrong:
    updating *entirely*, so the worst-case freeze must be measured in seconds. Worst case is one
    evaluation interval plus the time to reach the sample floor.
 3. **One `atomic.Bool` per configured transcode, written once by the stats goroutine, read by the
-   shards with a single atomic load** (HLD §6.5, Vol 0 §3.9 `RegistryEntry.GuardOff`). The stats
+   shards with a single atomic load** (HLD §6.5; held in `mirror.GuardTable`, outside the decoder
+   registry, which is swapped whole on a reload — *erratum, Phase 3, ruling D2*). The stats
    goroutine is the **sole writer** (Vol 0 §9.1); no shard ever writes it. That is what makes the
    whole mechanism safe with no lock on a platform with no race detector (req §4).
 4. **Disabling is one-way within a session.** Re-enabling on a recovered ratio would flap, and there is
@@ -1522,9 +1597,9 @@ stateDiagram-v2
 
     Open --> Stopped: batchQ non-blocking send failed (§7.4)<br/>/ flush_deferred[k]++ ; FATAL — no completion can resume it<br/>when CohortOut == 0, so the epoch would never close
     Open --> Stopped: completion names a row with InFlight false<br/>/ inflight_desync[k]++ ; FATAL — a row reached two batches
-    Open --> Stopped: batch returned Err == nil with a Pending row<br/>/ batch_row_unreported[k]++ ; requeue at head, then FATAL
+    Open --> Open: batch returned Err == nil with a Pending row<br/>/ batch_row_unreported[k]++ ; requeue at head, report → Fatal(F27),<br/>keep running into the drain (§2.7, ruling D9)
 
-    Idle --> Draining: shardCh[k] closed (§2.6)<br/>/ drainDeadline := flush.drainTimeoutMs = 5,000 ms
+    Idle --> Draining: shardCh[k] closed (§2.6)<br/>/ arm the shared drainExpired (one budget, flush.drainTimeoutMs = 5,000 ms)
     Open --> Draining: same
     Draining --> Draining: back-to-back epochs, W ignored entirely<br/>stage B's guard includes `draining`
     Draining --> [*]: quiescent — no epoch, CohortOut 0,<br/>Accum empty, Free full / log INFO, return nil
@@ -1557,7 +1632,8 @@ maybeOpenEpoch() — steps in this order, and the order is load-bearing
 
  0. precondition: !s.EpochOpen        (stage B's guard; re-asserted here)
 
- 1. s.tickPending = false             // a tick is a periodic SAMPLE and is consumed
+ 1. onTick := s.tickPending           // remembered for step 8's flush_on_tick{k}
+    s.tickPending = false             // a tick is a periodic SAMPLE and is consumed
                                       // whatever we decide. The FLAG is not — see step 2.
 
  2. if s.Accum[0].Len() + s.Accum[1].Len() + s.Accum[2].Len() == 0:
@@ -1582,12 +1658,14 @@ maybeOpenEpoch() — steps in this order, and the order is load-bearing
  6. s.EpochOpen = true; s.Epoch++; s.CohortOut = 0; s.TickMissed = false
     s.epochOpenedAt = nowMono()
 
- 7. cfg := s.cfg.Load()               // Vol 0 §7.4: the shard reloads AT EPOCH OPEN and
-    s.maxBatchSize = cfg.Flush.MaxBatchSize     // holds the pointer for the whole epoch
-    if cfg.Gen != s.cfgGen: s.releaseQuarantine(); s.cfgGen = cfg.Gen      // §9.5
+ 7. p := s.params()                    // one *mirror.Params load, held for the whole epoch
+    s.maxBatchSize = p.MaxBatchSize   // (also loaded at each tick, §2.4 — ruling D3)
+    s.guard = p.Guard
+    if p.Gen != s.cfgGen: s.releaseQuarantine(); s.cfgGen = p.Gen          // §9.5
 
  8. inst.epochOpened{k}.Add(1)
-    publish dirty_depth{k,d} = 0 and cohort_depth{k,d} = Cohort[d].Len()   // shape G
+    if onTick: inst.flushOnTick{k}.Add(1)   // the ONLY increment point of flush_on_tick
+    publish dirty_depth{k,d} = Accum[d].Len() and cohort_depth{k,d} = Cohort[d].Len()   // shape G
 
  9. return s.pump()                   // §7
 ```
@@ -1633,6 +1711,18 @@ now-empty accumulating ring.
 
 **Step 7 is the only place the shard reads configuration** (Vol 0 §7.4). Holding one pointer for the
 whole epoch is what stops `maxBatchSize` changing between two batches of the same epoch.
+*(erratum, Phase 3: not the only place — the tick arm (§2.4) also loads `Params` once per tick, for
+`flush.epochStallWarnMs` and `ordering.guard`, so a reload of either takes effect within one `W`.
+`maxBatchSize` and the `Gen` compare remain epoch-open only, so the holding argument stands — ruling
+D3. The shard reads a `*mirror.Params` projected by `app`, not `config.Store`: `mirror` may not import
+`config` (G-DEP-1, ruling D1).)*
+
+**Step 8's `dirty_depth` is `Accum[d].Len()`, not 0** *(erratum, Phase 3)*: the accumulating rings are
+empty after step 5's swap *unless* step 7 released quarantined rows onto them (§9.5).
+
+**`flush_on_tick{k}` counts only an open with `tickPending` set** *(erratum, Phase 3)*. A §6.4 step 4
+re-open driven by `TickMissed` is not counted, so under sustained load `flush_on_tick` runs below the
+tick-caused share of `epoch_opened`. Documented, not changed.
 
 ### 6.4 Closing an epoch
 
@@ -1997,7 +2087,8 @@ available**, supplied by Volume 3's fallback phase rather than by the driver. Ob
 // returns the batch to the free list and advances the epoch. Called only from
 // the main loop's completion arm (§2.2).
 //
-// Returns an error for the two writer-defect conditions of §2.7 (S2, S3).
+// Returns an error for the writer-defect conditions of §2.7 (S2, S3, 0a); the
+// main loop reports S3 rather than returning it.
 func (s *Shard) applyCompletion(b *model.Batch) error
 ```
 
@@ -2041,7 +2132,9 @@ applyCompletion(b) — step 0, before any entry is touched
 > **Step 0c is defect S3 and it stops the process** (Vol 0 §3.8, §5.4: *"a batch returned with any row
 > still `Pending` is a WRITER DEFECT, not a load condition: the shard counts it and stops loudly"*).
 > Every obligation in Vol 0 §5.4 is keyed on the outcome; with no outcome there is nothing correct to
-> do. What this volume adds is that it requeues before it stops.
+> do. What this volume adds is that it requeues before it stops — and *(erratum, Phase 3, ruling D9)*
+> that it stops through `Fatal(F27)` while the shard keeps running into the drain, not by `Run`
+> returning (§2.7).
 
 ### 8.3 The per-row walk
 
@@ -2141,11 +2234,11 @@ inst.retryRequeued{k}.Add(1)
 **`OutcomeRejected` — permanent data error; retry cannot help (F14).**
 
 ```
-// e.Digest:  UNCHANGED   // e.Written: UNCHANGED   // e.ColMask: UNTOUCHED
+// e.Digest:  UNCHANGED   // e.Written: UNCHANGED   // e.ColMask: see the fold below
 e.Dirty       = false
 e.Quarantined = true                                                              [+]
 s.Quarantine[d] = append(s.Quarantine[d], r.Slot)
-inst.rowRejected{d}.Add(1); inst.rowQuarantined{d}.Add(1)
+inst.rowQuarantined{d}.Add(1)        // row_rejected is the WRITER's (ruling D11)
 publish rows_quarantined_current{d} += 1
 log ERROR (rate-limited by stats.eventRatePerMin): dest, row key, rejected mask hex,
     r.ErrCode (the bare ORA number), "row quarantined — not retried until a
@@ -2161,7 +2254,22 @@ if e.ReDirty:
         e.Dirty = true; s.Accum[d].PushBack(r.Slot)      // TAIL
         inst.quarantineSkipped{d}.Add(1)
     // else: the overlapping columns would be refused again — stay quarantined
+
+if e.Quarantined:                         // stayed quarantined (either way above)
+    e.ColMask |= r.Mask                   // fold the refused columns back — AFTER the
+                                          // disjoint test, which needs ColMask without them
 ```
+
+*(erratum, Phase 3, ruling D11: `row_rejected` is counted by the writer (Vol 3, G-STMT-2), not here —
+counting it in both would double it in Phase 4. The shard counts only `row_quarantined{d}`.)*
+
+*(erratum, Phase 3, ruling D13: the stay-quarantined branch folds the refused columns back,
+`ColMask |= r.Mask`, exactly as the Failed arm does. Otherwise a row not merged into while quarantined
+is released (§9.5) with `ColMask == 0`, batched with `Mask == 0`, refused by Vol 3 W-4 as a Vol 2
+defect (`batch_row_empty_mask`) and re-quarantined — runbook step 4 then reads "the fix did not take"
+though it did — and the refused columns are never rewritten unless a later merge touches them,
+contradicting §9.4's "a release writes the **latest** state". Nothing is re-offered early: merge step
+6 still keeps a quarantined row off the rings.)*
 
 > **Preserves F14 and the self-healing property.** `Digest` unchanged means the *next* genuine change
 > to that row produces a different digest, is not suppressed, and is written — so a row whose
@@ -2214,8 +2322,9 @@ a second. §9.4 works that arithmetic.
     for d in 0..2: b.DestStart[d] = 0; b.DestCount[d] = 0
 10. s.Free = append(s.Free, b)          // the baton returns; the writer no longer holds it
 11. s.CohortOut−−
-12. publish dirty_depth{k,d} = Accum[d].Len(); cohort_depth{k,d} = Cohort[d].Len()
     inst.completionLagMaxNs{k}.Observe(nowMono() − batchSentAt[b])
+14. the failed rows' head push (§8.6) — BEFORE step 13
+12. publish dirty_depth{k,d} = Accum[d].Len(); cohort_depth{k,d} = Cohort[d].Len()
 13. if everyCohortEmpty() ∧ s.CohortOut == 0:  return s.closeEpoch()      // §6.4
     else:                                      return s.pump()           // §7
 ```
@@ -2226,6 +2335,10 @@ a second. §9.4 works that arithmetic.
 > never has to defend against a stale `Outcome` from two batches ago. The ordering — reset `Rows[:N]`
 > **before** `N = 0` — is the kind of line that is correct once and wrong after a refactor, so it is
 > specified rather than implied.
+> *(erratum, Phase 3: `batchSentAt[b]` is defined — `Shard.all` holds every batch the shard owns in a
+> fixed order and `sentAt[i]` is when `all[i]` was last sent on `batchQ`, found by a linear scan of `all`
+> (§1.1). And step 14 runs **before** step 13, ruling D8: if `closeEpoch` re-opened from `Accum` first,
+> the Failed rows would miss the very next cohort and G-EPOCH-3 would fail.)*
 > **Step 11 pairs with the `CohortOut++` in §7.2**, which happens only after a *successful* `batchQ`
 > send. The two together make `CohortOut` exactly "batches of this epoch emitted and not yet
 > returned", which is half the epoch-close predicate.
@@ -2233,7 +2346,7 @@ a second. §9.4 works that arithmetic.
 ### 8.6 Head insertion as a block, and why one-at-a-time would be a defect
 
 Failed rows are collected per destination during the walk (§8.4) and pushed in **one** operation after
-it:
+it — numbered 14 but run before §8.5's step 13 (ruling D8):
 
 ```
 14. for d in 0..2:
@@ -2403,24 +2516,17 @@ touches *different* columns, which is the common shape when two transcodes share
 §4.5). The residue is accepted because the alternative is the arithmetic above. The mitigation is that
 a release is one `SIGHUP` away and costs nothing (§9.5).
 
-> **A quarantined row is not queued by a merge** (§4 step 6). The merge still updates the image
-> and ORs into `ColMask`, so the mirror stays truthful and a release writes the **latest** state rather
-> than the state at the moment of quarantine. `merge_into_quarantined{destination}` counts the
-> arrivals that are landing on quarantined rows, which is how an operator sees that the quarantine is
-> costing live data rather than sitting on a dead contract.
+*(erratum, Phase 3: a duplicated copy of the two paragraphs above was removed. The latest state
+includes the refused columns themselves, folded back into `ColMask` by §8.4's reject arm — ruling D13.)*
 
-**What is given up, stated plainly.** A row whose rejection was caused by one transient bad value —
-say a single price that overflowed a column, followed by normal values — does *not* self-heal in
-the same columns; it waits for a reload. That is a real regression against Vol 0 §5.4's self-healing
-property and it is accepted, because the alternative is the arithmetic above. The mitigation is that a
-release is one `SIGHUP` away and costs nothing (§9.5).
+*(erratum, Phase 3: stale references to the removed `Fail` field (§9.2) now read `Quarantined`.)*
 
 ### 9.5 Release: what un-quarantines a row
 
 > **A configuration reload releases every quarantined row.**
 
 `Shard.Quarantine[d] []int32` materialises the set. At epoch open (§6.3 step 7) the shard compares the
-configuration generation it observed against `cfg.Gen`; if it advanced, it walks the three slices:
+configuration generation it observed against `Params.Gen`; if it advanced, it walks the three slices:
 
 ```
 releaseQuarantine():
@@ -2431,10 +2537,15 @@ releaseQuarantine():
           e.Dirty       = true
           s.Accum[d].PushBack(slot)                 // TAIL — no urgency, and FIFO is preserved
           inst.quarantineReleased{d}.Add(1)
-      publish rows_quarantined_current{d} = 0
+      publish rows_quarantined_current{d} −= len(s.Quarantine[d])   // shared gauge: NOT = 0
       s.Quarantine[d] = s.Quarantine[d][:0]         // retain capacity; expected to be tiny
   log INFO: per-destination released counts
 ```
+
+*(erratum, Phase 3: the draft published `rows_quarantined_current{d} = 0`, right only with one shard.
+The gauge has no shard label and every shard shares it, so a release subtracts its own count, matching
+V0-Δ1's `−= 1` in §8.4. Released rows go to the tail of `Accum[d]` in quarantine order; step 7 runs
+after §6.3 step 5's swap, so they ride the **next** epoch, not the cohort just opened.)*
 
 **Why a reload is the right trigger, and the only one.** A reload is the operator saying *"I changed
 something"* — and the things that fix a quarantined row are exactly the things a reload or a restart
@@ -2500,7 +2611,7 @@ flowchart TD
     K -->|"yes — genuinely new data, never offered"| L(["release at once, PushBack to Accum[d] TAIL<br/>quarantine_skipped{d}++ — delta V0-Δ1, §8.4"])
     K -->|"no — the refused column is being re-offered"| M["row sits off every ring"]
     M --> N["merges keep Image and ColMask CURRENT<br/>but do NOT queue it §4 step 6<br/>merge_into_quarantined{d}++"]
-    N --> O{"configuration reload?<br/>cfg.Gen advanced, seen at epoch open §6.3 step 7"}
+    N --> O{"configuration reload?<br/>Params.Gen advanced, seen at epoch open §6.3 step 7"}
     O -->|"no"| N
     O -->|"yes — the operator fixed something"| P(["releaseQuarantine §9.5: Quarantined := false,<br/>PushBack to Accum[d] TAIL with the LATEST image,<br/>quarantine_released{d}++, gauge := 0"])
 ```
@@ -2623,24 +2734,28 @@ token-keyed pairs. Included as a stated margin rather than folded into the total
 |---|---|---|---|---|
 | **Arenas** | §10.2, chunk-quantised | **187,564,032** | 169.6 MB | **+18.0 MB** |
 | **Indexes** | `make(map[RowKey]int32, 50000)` → `B = 13`, 8,192 buckets × 112 B + 512 overflow × 112 B = 974,848 per (shard, destination) × 12 | **11,698,176** | 7 MB | **+4.7 MB** |
-| **Rings** | 24 rings (2 × 3 destinations × 4 shards) pre-sized `expectedRows/shards` = 50,000 `int32` = 200,000 B each | **4,800,000** | 3 MB | **+1.8 MB** |
+| **Rings** | 24 rings (2 × 3 destinations × 4 shards) pre-sized `expectedRows/shards` = 50,000, rounded up to the power of two `cap(buf)` must be (§1.3) = 65,536 `int32` = 262,144 B each | **6,291,456** | 3 MB | **+3.3 MB** |
 | **Q1** | `shards × shardQueueCapacity × sizeof(UpdateUnit)` = 4 × 4,096 × 360 | **5,898,240** | 5.9 MB | — |
 | **Batch row buffers** | `shards × maxInFlightPerShard × maxBatchSizeCeiling × sizeof(BatchRow)` = 4 × 2 × 1,000 × 288 | **2,304,000** | 2.3 MB | — |
 | Fixed buffers | `readBuf` 64 KB + `decompBuf` 2 KB + `fanoutBuf` 40 × 360 B | ~81,000 | <1 MB | — |
 | `Batch` headers, `Free`/`Quarantine` slices, instruments | 8 batches × ~120 B + slice headers | ~5,000 | — | — |
-| **Resident total** | | **212,350,448 B ≈ 212.4 MB** | ≈ 189 MB | **+23.4 MB** |
+| **Resident total** | | **213,841,904 B ≈ 213.8 MB** | ≈ 189 MB | **+24.8 MB** |
 | Skew margin (§10.2) | up to 4 extra chunks | +6,946,816 | — | |
-| **Resident total, with skew** | | **≈ 219.3 MB** | | |
+| **Resident total, with skew** | | **≈ 220.8 MB** | | |
+
+*(erratum, Phase 3: the rings were costed at 50,000 slots, 4.8 MB; a ring's `cap(buf)` is a power of
+two, so each is 65,536 slots and the 24 rings are 6.3 MB. Totals moved by +1.5 MB; the percentages do
+not. `TestMemoryFigures` pins the corrected figure.)*
 
 **Against the 40 GB partition: 0.53 %** (0.55 % with skew). The HLD's figure was 166 MB at 0.4 %,
-Vol 0's 189 MB at 0.47 %, this volume's 212.4 MB at 0.53 %. **Every conclusion in HLD §7.8 and §11.3
+Vol 0's 189 MB at 0.47 %, this volume's 213.8 MB at 0.53 %. **Every conclusion in HLD §7.8 and §11.3
 survives unchanged**, and req §4's explicit instruction — that a design holding a full in-memory mirror
 should not be rejected on memory grounds — is satisfied with three orders of magnitude of margin.
 
 **Two Vol 0 figures confirmed exactly:** Q1 at 5.9 MB (`4 × 4096 × 360`) and batch row buffers at
 2.3 MB (`4 × 2 × 1000 × 288`). **Three corrected:** arenas, indexes and rings, all upward, all from
 quantisation that occupied-bytes arithmetic does not capture. **`Entry` itself is confirmed at 424
-bytes** — this volume adds `Fail` and `SlotSeen` (§13, additions A1 and A2) and both land in the five
+bytes** — this volume adds `Quarantined` and `SlotSeen` (§13, additions A1 and A2) and both land in the five
 pad bytes Vol 0 §3.7 already declares at offset 163, so the offset table and the total are unchanged:
 
 ```
@@ -2797,7 +2912,7 @@ pre-size. That is ADR-003's claim, and this volume's mechanisms are what make it
 | Input | What happens | Bounded by |
 |---|---|---|
 | **10× the assumed rate** (150,000 units/s) | Shard busy rises to ~2.9 %; Q1 depth still trivial; cohorts 7,500/shard → 8 batches/epoch → epoch ≈ `4 × t_commit` ≈ 60 ms, inside `W`. **The write path saturates long before the shard does** | §11.2's 340× margin |
-| **Database down for an hour** | Every batch fails `ErrSession`. Rows requeue at the head as blocks (§8.6), no row is charged `Fail` (§9.2's gate), epochs keep opening and terminating (§8.7). `dirty_depth` rises to the active row count and plateaus. HLD §9.2's fail-fast budget (30 s / 20 writes) stops the process long before an hour | §8.7 termination + Vol 3's fail-fast |
+| **Database down for an hour** | Every batch fails `ErrSession`. Rows requeue at the head as blocks (§8.6), no row is quarantined (`OutcomeFailed` never quarantines, §8.4), epochs keep opening and terminating (§8.7). `dirty_depth` rises to the active row count and plateaus. HLD §9.2's fail-fast budget (30 s / 20 writes) stops the process long before an hour | §8.7 termination + Vol 3's fail-fast |
 | **One permanently unwritable row** (`ORA-01438`) | Vol 3's second phase attributes it on the **first** batch that contains it; the shard quarantines it with **zero retries**. That batch costs `1 + N` round trips once (§8.4a). One ERROR line naming the ORA code, plus a standing gauge | §9.2, §9.3 |
 | **Feed goes silent mid-epoch** | The epoch drains and closes normally; the shard parks in `select`. Ticks keep arriving and find empty rings → `epoch_empty`. No timer expires, nothing leaks. Liveness is `health`'s (6541, bible §4.12) | §6.3 step 2 |
 | **A flush-trigger storm** (mis-classified chatty transcode) | `Swap(true)` on a set bit is a no-op; the cap-1 wake drops; each shard runs one epoch at a time. Ceiling `S / t_commit` ≈ 200 commits/s. Observable: `flush_coalesced / flush_triggered → 1`, `flush_wake_dropped` rising. **Degrades into batching, never into spin or a stop** | §3.4, HLD F10 |
@@ -2821,11 +2936,11 @@ is what those tests must assert.
 | `completionCh[k]` element | any writer (send) | shard *k* (receive) | `chan *model.Batch`, cap `maxInFlightPerShard` = 2 | Same baton, returning. Capacity equals the maximum a shard can have outstanding, so the send **cannot block** — which is what lets a shard exit on a drain timeout with batches still in flight without hanging the writer pool (§2.6) |
 | `BatchRow.Outcome`, `.Mask`, `.Digest`, `.Image`, `.Slot` | shard at pump (§7.2); writer fills `Outcome` only | writer (all but `Outcome`); shard at completion (all) | fields of a batoned `*Batch` | Two channel edges bracket every access. The writer MUST NOT write anything but `Outcome`; that is Volume 3's obligation and is structurally reinforced by `writer` not importing `mirror` (Vol 0 §1.2) |
 | `Batch.Err` | writer, before its send | shard, after its receive | field of a batoned `*Batch` | Same edge. The shard tests it for nil only (§8.2 step 0b); the per-row ORA number arrives in `BatchRow.ErrCode`, a bare `uint16` (§13 A7), so `mirror` never names an `oradb` type (Vol 0 §1.3) |
-| `RegistryEntry.GuardOff` | **stats goroutine only**, `Store(true)`, once, one-way | all S shards, `Load()`, once per unit | `*atomic.Bool` | Single writer by construction (Vol 0 §9.1: stats is the "sole writer of `GuardOff` bools"). One-way, so a shard can never observe a transition back to false and no shard writes it |
+| `GuardTable` entry's `off` (*erratum, Phase 3, D2: not `RegistryEntry.GuardOff`*) | **stats goroutine only**, `Store(true)`, once, one-way | all S shards, `Load()`, once per unit | `*atomic.Bool` | Single writer by construction (Vol 0 §9.1: stats is the "sole writer of `GuardOff` bools"). One-way, so a shard can never observe a transition back to false and no shard writes it |
 | `guard_offered{code}`, `guard_superseded{code}` | **all S shards**, `Add(1)` | stats goroutine, `Load()` | `atomic.Uint64` | The only instruments with more than one writer of the same class. `Add` is an atomic read-modify-write, so concurrent increments are exact; **no shard ever reads them**, so there is no lost-update hazard on the shard side. Stated because Vol 0 §8.1's "incremented on the owning goroutine" reads as single-writer |
 | `dirty_depth{k,d}`, `cohort_depth{k,d}`, `rows_inflight{k}`, `shard_depth{k}` | shard *k* only, `Store`/`Add` at a point it already visits | stats goroutine, `Load()` | Vol 0 shape **G** (`atomic.Int64`) | These are `Len()` of shard-owned rings. **The stats goroutine must never read the ring directly** — that is the race Vol 0 delta D10 exists to close, and on a platform with no race detector it would never be caught where it runs. The owner publishes; the reader loads |
-| `config.Store` pointer | lifecycle goroutine, `Swap` on SIGHUP | shard *k*, `Load()` **at epoch open only** (§6.3 step 7) | `atomic.Pointer[Config]` | A published `Config` is immutable (Vol 0 §3.10), so holding the pointer for a whole epoch is safe and is required: re-loading mid-epoch would let two `maxBatchSize` values govern one epoch's batches |
-| `cfg.Gen` | lifecycle, at construction of each `Config` | shard *k*, at epoch open | field of an immutable `*Config` | Read through the atomic pointer above. Monotonic, so `cfg.Gen != s.cfgGen` is an exact "something was reloaded" edge (§9.5) |
+| `*mirror.Params` inside `app.Runtime` (*erratum, Phase 3, D1*) | lifecycle goroutine, `Swap` on SIGHUP | shard *k*, `params()` **at epoch open and at each tick** (§6.3 step 7, §2.4; *erratum, D3*) | `atomic.Pointer[Runtime]` | A published `Params` is immutable (Vol 0 §3.10), so holding the pointer for a whole epoch is safe and is required: re-loading mid-epoch would let two `maxBatchSize` values govern one epoch's batches. The tick's load reads only `epochStallWarnMs` and `ordering.guard` |
+| `Params.Gen` | lifecycle, at construction of each `Config` | shard *k*, at epoch open | field of an immutable `*Params` | Read through the atomic pointer above. Monotonic, so `p.Gen != s.cfgGen` is an exact "something was reloaded" edge (§9.5) |
 
 ### 12.2 Every field this volume declares NOT to cross a boundary
 
@@ -2833,7 +2948,7 @@ Asserted here so a future change that shares one of them is recognisable as a de
 a refactor:
 
 > **Every byte of every `model.Entry`** — `Row`, `ColMask`, `Written`, `Digest`, `LastSeq[8]`,
-> `LastTime[8]`, `LastRecv[8]`, `Dirty`, `InFlight`, `ReDirty`, `Fail`, `SlotSeen`, `Image[256]` — is
+> `LastTime[8]`, `LastRecv[8]`, `Dirty`, `InFlight`, `ReDirty`, `Quarantined`, `SlotSeen`, `Image[256]` — is
 > written and read by exactly one goroutine and is a plain field with **no atomic and no lock**.
 > Likewise `Index[3]`, `Arena[3]`, `Accum[3]`, `Cohort[3]`, `Free`, `Quarantine[3]`, `EpochOpen`,
 > `Epoch`, `CohortOut`, `TickMissed`, `epochOpenedAt`, `cfgGen`, `maxBatchSize`, `tickPending`.
@@ -2879,7 +2994,7 @@ what it costs.
 | **A6** | `config.Config.Gen uint64`, assigned monotonically by `config.Load`/`Store.Swap` | `config` | 8 B | The shard needs "was this configuration reloaded?" as a cheap exact test at epoch open. Comparing pointers would work but would also fire on a no-op re-publish |
 | **A7** | **`BatchRow.ErrCode uint16`** at offset **30** — the bare ORA number for a `Rejected` or `Failed` row, `0` otherwise. Layout becomes `Outcome` @28, `_ [1]byte` @29, `ErrCode` @30, `Image` @32 | `model` | **0 bytes** — lands in the three pad bytes Vol 0 §3.8 declares at offset 29. **`BatchRow` stays 288 B** and §10.3's 2.3 MB is unchanged | The quarantine ERROR line must name the ORA code or it is undiagnosable (§9.6), and `mirror` may not import `oradb` (Vol 0 §1.3). A bare `uint16` covers every ORA number and is the *entire* Oracle vocabulary the shard needs — the shard never classifies, it only logs. **An earlier draft moved `oradb.ErrClass` into `model` instead; with OQ-4 resolved the shard no longer branches on a class at all, so this is strictly smaller and leaves Vol 0 §3.11 untouched** |
 | **A8** | `FlushBus` type: `req []atomic.Bool`, `wake []chan struct{}`, methods `Trigger`, `Taken`, `Pending` | `mirror` | `S × 4 B` + `S` channels | §3.1. Vol 0 §9.2 reserved channel **W** and §7.3 of the HLD put `FlushReq` inside `Shard`; the bus is what makes "no shard can reach another shard's state" structural rather than disciplinary (delta D2-1) |
-| **A9** | `ring` type with `PopFront`, `PushBack`, **`PushFrontBlock`**, `Len`, `Peek`, `Swap`, `Reset` | `mirror` | see §10.3: 4.8 MB pre-sized | §1.3, §8.6, §11.4. HLD §7.3 types the dirty structure `[]int32` and calls it a ring; a slice does not support O(1) head insertion and §11.4 shows the consequence is a process crash during a database outage (ADR-L21) |
+| **A9** | `ring` type with `PopFront`, `PushBack`, **`PushFrontBlock`**, `Len`, `Peek`, `Swap`, `Reset` | `mirror` | see §10.3: 6.3 MB pre-sized | §1.3, §8.6, §11.4. HLD §7.3 types the dirty structure `[]int32` and calls it a ring; a slice does not support O(1) head insertion and §11.4 shows the consequence is a process crash during a database outage (ADR-L21) |
 
 ### 13.2 Configuration keys
 
@@ -2924,7 +3039,8 @@ Vol 0 §8.2 already defines everything else this volume writes: `units_merged`, 
 `epoch_duration_max_ns{k}`, `epoch_ns_total{k}`, `tick_skipped_epoch_open{k}`, `retry_requeued{k}`,
 `batch_row_unreported{k}`, `shard_loop_max_ns{k}`, `shard_depth{k}`, `dirty_depth{k,destination}`,
 `cohort_depth{k,destination}`, `completion_lag_max_ns{k}`, `rows_inflight{k}`, `redirty_total`,
-`row_rejected{destination}`, `drain_abandoned_rows{destination}`, `message_truncated{destination,column}`.
+`drain_abandoned_rows{destination}`, `message_truncated{destination,column}`. *(erratum, Phase 3,
+ruling D11: `row_rejected{destination}` is the writer's, not this volume's.)*
 
 **Fifteen additions is a lot, and the justification is that eleven of them are error or defect paths
 that run zero times in a healthy process** (A11, A13, A16, A17, A18, A19, A21, A22, A23, A24, A25) and
@@ -2941,11 +3057,11 @@ arithmetic or the citation that forced it. Numbered `D2-n` so they cannot be con
 | # | HLD § | What it says | What this LLD does | Why | Impact |
 |---|---|---|---|---|---|
 | **D2-1** | §7.3 | `FlushReq atomic.Bool` is a field **of `Shard`** | Moved out into a shared `FlushBus` (`req []atomic.Bool`, `wake []chan struct{}`), §3.1 | With the flag inside `Shard`, shard *j* must hold a `*Shard` pointer to shard *k* to set it — which makes every other field of shard *k* reachable from shard *j* and reduces "the shard owns its state exclusively" (§1.2) from a structural property to a discipline, on a platform with no race detector | The cross-shard surface becomes one type containing nothing but atomics and channels. No behaviour change |
-| **D2-2** | §7.3 | `DirtyRing [3][]int32`, `Cohort [3][]int32` — typed as slices, called rings | A genuine circular buffer with O(1) `PushFront`/`PushBack` and a `PushFrontBlock` for a failed batch (§1.3, ADR-L21) | §11.4's arithmetic: with a slice, a database outage costs ≈ 200 ms of shard memmove per epoch, which saturates the shard, backs up Q1 and trips F9's fatal stall budget. **A database outage would become a process crash, through the retry path** | Rings pre-sized to 4.8 MB (§10.3, +1.8 MB against Vol 0). The failure mode is removed |
+| **D2-2** | §7.3 | `DirtyRing [3][]int32`, `Cohort [3][]int32` — typed as slices, called rings | A genuine circular buffer with O(1) `PushFront`/`PushBack` and a `PushFrontBlock` for a failed batch (§1.3, ADR-L21) | §11.4's arithmetic: with a slice, a database outage costs ≈ 200 ms of shard memmove per epoch, which saturates the shard, backs up Q1 and trips F9's fatal stall budget. **A database outage would become a process crash, through the retry path** | Rings pre-sized to 6.3 MB (§10.3, +3.3 MB against Vol 0). The failure mode is removed |
 | **D2-3** | §7.3 | `Shard.Done chan *Batch` | `completion <-chan *model.Batch`, receive-only on the shard side | Vol 0 §9.2 already names it `completionCh[k]`; making the field directional stops the shard from ever sending on it | Naming and a compile-time direction check |
 | **D2-4** | §9.2, Appendix A gap S4 | The OQ-4 fallback: *"the whole batch is treated as failed and every row returns to the head of the next epoch's ring, so one permanently-bad row would retry its whole batch indefinitely"* | **Quarantine on the first rejection, zero retries** (§9.2). Volume 3's two-phase execute attributes the row (ADR-W01, §8.1); the shard removes it from every ring, keeps its image current on subsequent merges, and releases it only on a configuration reload | The HLD's fallback is a total, silent, per-shard write outage caused by one value being one character too wide (§9.1) — reachable from bible §2.4's precision change alone. It cannot ship. **Gap S4 is closed**: by Vol 3 for attribution and by this section for the retry bound | One `bool` in existing padding; `Entry` unchanged at 424 B. A poison row costs its batch one serial pass of `N × RTT`, **once** (§8.4a) |
-| **D2-5** | §7.8 | Arenas `400,000 × 368 = 147 MB`; Vol 0 §3.7 revises to `400,000 × 424 = 169.6 MB` | **187.6 MB** (§10.2) | Both figures count *occupied* bytes. Arenas are chunked at `arenaChunkRows` = 4096, so 13 chunks hold 53,248 slots for 50,000 rows, and destination 2 spends a full 1.74 MB chunk per shard on ~25 rows | +18.0 MB. Resident total **212.4 MB**, 0.53 % of the 40 GB partition. Every HLD §7.8 and §11.3 conclusion survives |
-| **D2-6** | §7.8 | Indexes `400,000 × ~18 B = 7 MB`; dirty rings `3 MB` | Indexes **11.7 MB**, rings **4.8 MB** (§10.3) | Go sizes a `map[uint64]int32` pre-sized to 50,000 at `2¹³` = 8,192 buckets × 112 B plus 512 pre-allocated overflow buckets = 974,848 B per map, × 12. Rings are pre-sized rather than grown, per D2-2 | +6.5 MB combined. Folded into D2-5's total |
+| **D2-5** | §7.8 | Arenas `400,000 × 368 = 147 MB`; Vol 0 §3.7 revises to `400,000 × 424 = 169.6 MB` | **187.6 MB** (§10.2) | Both figures count *occupied* bytes. Arenas are chunked at `arenaChunkRows` = 4096, so 13 chunks hold 53,248 slots for 50,000 rows, and destination 2 spends a full 1.74 MB chunk per shard on ~25 rows | +18.0 MB. Resident total **213.8 MB** (212.4 MB before the Phase 3 ring erratum, §10.3), 0.53 % of the 40 GB partition. Every HLD §7.8 and §11.3 conclusion survives |
+| **D2-6** | §7.8 | Indexes `400,000 × ~18 B = 7 MB`; dirty rings `3 MB` | Indexes **11.7 MB**, rings **6.3 MB** (§10.3) | Go sizes a `map[uint64]int32` pre-sized to 50,000 at `2¹³` = 8,192 buckets × 112 B plus 512 pre-allocated overflow buckets = 974,848 B per map, × 12. Rings are pre-sized rather than grown, per D2-2 | +8.0 MB combined (+6.5 MB before the Phase 3 ring erratum). Folded into D2-5's total |
 | **D2-7** | §6.6 | Shard per-unit work *"on the order of 200 ns"*, giving 0.08 % occupancy | **≈ 365 ns** per contribution, **0.29 %** per shard, 1.2 % combined (§4.4, §11.2) | The 200 ns figure does not count the digest (~90 ns, Vol 0 §5.2 computes it at merge *and* pump), the two-pass mask validation (~80 ns, §4 step 4), the main-loop overhead or the pump | None. HLD §6.6's conclusion — that a Q1 overflow is a defect and not load — holds with a ~340× margin instead of ~1,200× |
 | **D2-8** | §7.3, §6.9 | `flush.maxBatchSize` bounds *a transaction* (NFR6) and nothing else | Same, **plus**: it now also bounds **the blast radius of one unwritable row**, because Vol 3's attribution fallback re-runs a row-data-failing batch serially at `N × RTT` (§7.3 rule 1, §8.4a) | The coupling did not exist before the two-phase execute and is easy to miss when tuning | Adds a second reason to lower `maxBatchSize` during an incident. It is reloadable in both directions within the ceiling (Vol 0 §7.3, C2), so the lever is reachable |
 | **D2-9** | §8.3 | *"Row ordering within a destination: sorted by row key"*, listed in the write-strategy table | The shard does **not** sort; the writer does, as part of grouping by `(destination, mask)` | Vol 0 ADR-L05 already assigns this to the writer with a reusable scratch. Sorting in the shard would put `O(n log n)` on the one goroutine whose stalls propagate to the receive path, to save writers work they do while blocked on I/O | None; recorded because "sorted by key" appears in the HLD's write table and a reader may look for it in the pump |
@@ -3027,7 +3143,7 @@ step 8), and **`PushFront` for a failed batch's rows** so a retry stays ahead of
 (HLD §7.3, §6.7). A Go slice supports the first two in O(1) and the third only in O(n).
 
 **Decision:** A circular buffer — `buf []int32`, `head`, `n`, power-of-two capacity — pre-sized to
-`runtime.expectedRows / runtime.shards` (50,000 entries, 200 KB) per ring, with an explicit
+`runtime.expectedRows / runtime.shards` (50,000 entries, rounded up to 65,536 = 256 KiB) per ring, with an explicit
 `PushFrontBlock(ss []int32)` that inserts a whole failed batch in one O(k) operation **preserving the
 rows' order**. Growth doubles and counts `ring_grown{k,d}`; it should never happen.
 
@@ -3052,8 +3168,8 @@ rows' order**. Growth doubles and counts `ring_grown{k,d}`; it should never happ
 
 **Consequences:** Better — every ring operation is O(1) or O(k-inserted); the outage path costs ≈ 8 µs
 per round instead of 200 ms; FIFO survives the retry; `Swap` is three word moves. Worse — ~50 lines of
-container code to write and test, 4.8 MB resident (+1.8 MB against Vol 0's estimate), and destination 2
-over-provisions 200 KB per ring for ~25 rows.
+container code to write and test, 6.3 MB resident (+3.3 MB against Vol 0's estimate), and destination 2
+over-provisions 256 KiB per ring for ~25 rows.
 
 **Revisit when:** `ring_grown{k,d}` is non-zero, which means `expectedRows` understates the real
 universe and both the ring **and** the index pre-size need raising together.

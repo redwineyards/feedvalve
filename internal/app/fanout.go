@@ -183,8 +183,9 @@ func nonNegative(d time.Duration) uint64 {
 //
 // The line carries section 10.6's whole table, because HLD section 10.2
 // requires a terminal message to be diagnosable from the log alone, with no
-// live process to query. shard_loop_max_ns{k} is the one field of that table
-// missing here: it is the shard's own instrument and arrives with Phase 3.
+// live process to query -- including shard_loop_max_ns{k}, the stalled shard's
+// longest loop pass since the last emission, which tells a shard blocked in
+// one pass from one merely slow on every pass.
 func (r *receiver) stallFatal(k model.ShardID, u *model.UpdateUnit,
 	i, n, idx, count int, budget, used time.Duration) error {
 
@@ -202,6 +203,7 @@ func (r *receiver) stallFatal(k model.ShardID, u *model.UpdateUnit,
 		" datagram_bytes=" + strconv.Itoa(r.datagramBytes) +
 		" budget_ms=" + strconv.FormatInt(budget.Milliseconds(), 10) +
 		" used_ns=" + strconv.FormatInt(int64(used), 10) +
+		" shard_loop_max_ns=" + strconv.FormatUint(r.g.deps.Inst.mirrorShards[k].ShardLoopMaxNs.Load(), 10) +
 		" depths=" + r.g.shardDepths()
 
 	// Not rate-limited and not a WARN. At 0.08% steady-state occupancy a full
@@ -220,7 +222,7 @@ func (r *receiver) stallFatal(k model.ShardID, u *model.UpdateUnit,
 	// the operator's only account of why the process stopped. Guarding it would
 	// let a bucket drained by an unrelated class suppress exactly that. Leave
 	// it, and do not "fix" it to match the others.
-	r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
+	r.g.deps.Log.Errorf(obs.ClassShardDefect,
 		"shard queue stall budget expired; nothing is discarded, the process stops: %s", detail)
 
 	r.g.Fatal(FatalQ1Overflow, detail)

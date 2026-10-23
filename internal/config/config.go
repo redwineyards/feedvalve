@@ -59,7 +59,7 @@ type RuntimeConfig struct {
 	MaxBatchSizeCeiling   int // sizes the pre-allocated Batch.Rows slices
 	ExpectedRows          int // pre-sizes each shard's index
 	ArenaChunkRows        int
-	Time1980UnixOffsetSec int // a key and not a constant because the epoch's anchor
+	Time1980UnixOffsetSec int // 0 means the default 315532800 (writer.Params); a key and not a constant because the epoch's anchor
 	// is an open question; this turns a wrong answer from
 	// a rebuild into a reload
 

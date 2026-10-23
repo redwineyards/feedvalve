@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"feedvalve/internal/oradb"
 )
@@ -185,6 +187,15 @@ func LoadUnvalidated(path string) (*Config, error) {
 
 // decode performs the strict JSON decode shared by both load paths.
 func decode(raw []byte) (fileConfig, error) {
+	var f fileConfig
+
+	// V-DB3 first, over a generic tree. The strict decode below would also
+	// refuse a password key, but as "unknown field" -- and a file that
+	// carries one has already leaked it, which the operator must be told.
+	if err := checkNoPasswordKey(raw); err != nil {
+		return f, err
+	}
+
 	dec := json.NewDecoder(bytes.NewReader(raw))
 
 	// V-STRICT1. Unknown keys are REJECTED, not ignored. A typo'd key
@@ -192,11 +203,62 @@ func decode(raw []byte) (fileConfig, error) {
 	// and did not -- during the incident they are trying to fix.
 	dec.DisallowUnknownFields()
 
-	var f fileConfig
 	if err := dec.Decode(&f); err != nil {
+		const unknown = "json: unknown field "
+		if msg := err.Error(); strings.HasPrefix(msg, unknown) {
+			// encoding/json reports the leaf name only, not its path.
+			key := strings.Trim(strings.TrimPrefix(msg, unknown), `"`)
+			var p problems
+			p.addKey(RuleStrictKeys, key, "", "", "unknown configuration key %q: %s. "+
+				"A misspelt tuning key would otherwise do nothing at all, silently", key, msg)
+			return f, p.err()
+		}
 		return f, fmt.Errorf("decoding configuration: %w", err)
 	}
 	return f, nil
+}
+
+// checkNoPasswordKey is V-DB3: no key named "password" at any depth, found by
+// walking the file as generic JSON BEFORE the strict decode can hide it as an
+// unknown field. It reports the key path only, never the value.
+//
+// Input that is not a JSON object is left for the real decode to reject.
+func checkNoPasswordKey(raw []byte) error {
+	var tree map[string]any
+	if json.Unmarshal(raw, &tree) != nil {
+		return nil
+	}
+	var p problems
+	walkForPassword(&p, "", tree)
+	return p.err()
+}
+
+func walkForPassword(p *problems, path string, v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys) // map order is random; the message is read and diffed
+		for _, k := range keys {
+			kp := k
+			if path != "" {
+				kp = path + "." + k
+			}
+			if strings.EqualFold(k, "password") {
+				p.addKey(RuleDBNoPassword, kp, "", "", "%s is present in the configuration file. "+
+					"The file has already leaked that credential: rotate it, delete the key, and "+
+					"supply the password only through FEEDVALVE_DB_PASSWORD", kp)
+				continue
+			}
+			walkForPassword(p, kp, t[k])
+		}
+	case []any:
+		for i, e := range t {
+			walkForPassword(p, fmt.Sprintf("%s[%d]", path, i), e)
+		}
+	}
 }
 
 // Parse decodes, resolves and validates a configuration.

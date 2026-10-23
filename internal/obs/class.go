@@ -13,10 +13,12 @@ package obs
 // box and hash it, per event, exactly when the process can least afford it.
 //
 // The classes are Vol 4 section 6.2's WARN and ERROR rows, one per distinct
-// event the table names. They live here rather than at the call sites because
-// obs owns the buckets; without a shared vocabulary each Phase 2 call site
-// would invent its own spelling and the suppression counters would fragment
-// into near-duplicates.
+// event the table names, plus four Vol 2 events that table omits (one WARN,
+// three ERROR; an erratum to Vol 4 section 6.2, phase 3 task P3-04), plus
+// shard_defect (ERROR; phase 3 task P3-13, the same erratum). They live
+// here rather than at the call sites because obs owns the buckets; without a
+// shared vocabulary each Phase 2 call site would invent its own spelling and
+// the suppression counters would fragment into near-duplicates.
 type Class uint8
 
 const (
@@ -29,8 +31,11 @@ const (
 	ClassTruncation                      // F29 -- a value cut at its declared width
 	ClassClockStep                       // F23 -- the wall clock moved under us
 	ClassReloadRejected                  // F15 -- the operator's change did NOT take effect
-	ClassSessionAnomaly                  // the exchange sent something unexpected
+	ClassSessionAnomaly                  // the exchange's session state moved unexpectedly (session-only)
 	ClassShardSendWait                   // a Q1 send that had to wait AT ALL
+	ClassEpochStalled                    // Vol 2 section 2.4 -- an epoch open past epochStallWarnMs
+	ClassDecodeAnomaly                   // phase 5 ruling D16 -- bad or unexpected content while decoding (was session_anomaly)
+	ClassCircuitQuiet                    // phase 5 ruling D16 -- the feed went quiet
 
 	// ERROR classes -- Vol 4 section 6.2.
 	ClassDecompressFailed // F3  -- DecompressSafe refused the input
@@ -41,6 +46,11 @@ const (
 	ClassWriterStopped    // F22 -- a pool member retired
 	ClassPanicRecovered   // F25, F26, F28
 	ClassStartupFailed    // a failed startup step
+	ClassBlobLenMismatch  // Vol 2 section 4 step 4 -- a decoder or configuration defect
+	ClassGuardDisabled    // Vol 2 section 5.5 -- the ordering guard switched off for a transcode
+	ClassDrainDeadline    // Vol 2 section 2.6 -- the drain ran out of time with rows unwritten
+	ClassShardDefect      // phase 3 ruling D9 -- a shard defect (S1, S2, S3/F27); also the Q1 stall-budget fatal (phase 5 ruling D16)
+	ClassCircuitDown      // phase 5 ruling D16 -- the feed is down
 
 	numClasses
 )
@@ -58,7 +68,7 @@ const firstErrorClass = ClassDecompressFailed
 
 // logClasses are the {class} label values, in Class order. The order IS the
 // slot order, so reordering this list silently re-labels live counters -- which
-// is what TestClassTableMatchesEnum exists to prevent.
+// is what TestClassTableMatchesTheEnum exists to prevent.
 var logClasses = []string{
 	ClassSeqGap:             "seq_gap",
 	ClassNetidMismatch:      "netid_mismatch",
@@ -70,6 +80,9 @@ var logClasses = []string{
 	ClassReloadRejected:     "reload_rejected",
 	ClassSessionAnomaly:     "session_anomaly",
 	ClassShardSendWait:      "shard_send_wait",
+	ClassEpochStalled:       "epoch_stalled",
+	ClassDecodeAnomaly:      "decode_anomaly",
+	ClassCircuitQuiet:       "circuit_quiet",
 	ClassDecompressFailed:   "decompress_failed",
 	ClassFramingAbandoned:   "framing_abandoned",
 	ClassErrorResponse:      "error_response",
@@ -78,6 +91,11 @@ var logClasses = []string{
 	ClassWriterStopped:      "writer_stopped",
 	ClassPanicRecovered:     "panic_recovered",
 	ClassStartupFailed:      "startup_failed",
+	ClassBlobLenMismatch:    "blob_len_mismatch",
+	ClassGuardDisabled:      "guard_disabled",
+	ClassDrainDeadline:      "drain_deadline",
+	ClassShardDefect:        "shard_defect",
+	ClassCircuitDown:        "circuit_down",
 }
 
 func (c Class) String() string {

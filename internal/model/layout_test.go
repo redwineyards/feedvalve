@@ -142,6 +142,61 @@ func TestMemoryFigures(t *testing.T) {
 				tc.what, tc.got, tc.want)
 		}
 	}
+
+	// The mirror's three structures at the DEFAULT sizing, quantised the way
+	// they are really allocated (Vol 2 section 10.2-10.3, P3-04). Occupied-bytes
+	// arithmetic undercounts all three. internal/mirror's
+	// TestNewShardAllocatesTheDerivedFigure measures one shard against the same
+	// arithmetic.
+	const (
+		expectedRowsCfg = 200_000                                          // runtime.expectedRows: per token-keyed destination
+		perShard        = expectedRowsCfg / shards                         // 50,000: what Index, Accum and Cohort are pre-sized at
+		arenaChunkRows  = 4096                                             // runtime.arenaChunkRows
+		tokenDests      = 2                                                // MD_TOKEN_QUOTE, MD_SECURITY_MASTER
+		chunksPerTokDst = (perShard + arenaChunkRows - 1) / arenaChunkRows // 13
+	)
+
+	// The rings: newRing rounds up to a power of two, so 50,000 is 65,536 --
+	// 6.3 MB over 24 rings, not section 10.3's 4.8 MB (the phase 3 erratum).
+	ringCap := uintptr(1)
+	for ringCap < perShard {
+		ringCap <<= 1
+	}
+	rings := 2 * MaxDestinations * shards * ringCap * unsafe.Sizeof(int32(0))
+
+	// The indexes: a Go 1.23 map hinted at 50,000 takes B = 13 (6.5 x 8,192 >=
+	// 50,000) plus 1/16 as many pre-allocated overflow buckets. A bucket is 8
+	// tophash bytes, 8 keys, 8 values and an overflow pointer.
+	const loadFactorNum, loadFactorDen = 13, 2
+	buckets := uintptr(1)
+	for buckets*loadFactorNum/loadFactorDen < perShard {
+		buckets <<= 1
+	}
+	bucket := 8 + 8*unsafe.Sizeof(RowKey(0)) + 8*unsafe.Sizeof(int32(0)) + unsafe.Sizeof(uintptr(0))
+	indexes := MaxDestinations * shards * (buckets + buckets/16) * bucket
+
+	// The arenas: whole chunks. 13 per token-keyed destination per shard, and
+	// a full chunk per shard for MD_MARKET_STATUS's ~25 rows.
+	chunk := arenaChunkRows * unsafe.Sizeof(Entry{})
+	arenas := shards * (tokenDests*chunksPerTokDst + 1) * chunk
+
+	for _, tc := range []struct {
+		what      string
+		got, want uintptr
+	}{
+		{"ring capacity at 50,000 (power of two)", ringCap, 65_536},
+		{"rings (24 x 65,536 x int32)", rings, 6_291_456},
+		{"index buckets at a 50,000 hint", buckets, 8_192},
+		{"map bucket for map[RowKey]int32", bucket, 112},
+		{"indexes (12 x (8,192 + 512) x 112)", indexes, 11_698_176},
+		{"arena chunk (4,096 x Entry)", chunk, 1_736_704},
+		{"arenas, chunk-quantised (4 x 27 chunks)", arenas, 187_564_032},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d. Vol 2 section 10.3's resident figure needs re-deriving.",
+				tc.what, tc.got, tc.want)
+		}
+	}
 }
 
 // TestRowKeyIsZeroExtended pins the encoding hazard Vol 0 section 3.2 warns

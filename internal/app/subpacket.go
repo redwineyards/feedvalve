@@ -97,6 +97,10 @@ type receiver struct {
 	fatalErr error
 
 	in *instruments
+
+	// gapGen is the configuration generation the gap detector was last
+	// configured from.
+	gapGen uint64
 }
 
 // newReceiver allocates the sub-packet path's buffers once, before anything
@@ -114,6 +118,7 @@ func newReceiver(g *Graph) *receiver {
 
 	return &receiver{
 		g:          g,
+		gapGen:     cfg.Gen,
 		in:         g.inst(),
 		stallTimer: t,
 		// 4 MiB at the default expectedRows, allocated HERE rather than on the
@@ -195,6 +200,15 @@ func (r *receiver) decodeDatagram(d *model.Datagram) error {
 		return nil
 	}
 
+	// Pickup of ordering.gapScope and ordering.gapAuditPackets (P5-07): the
+	// detector is owned by THIS goroutine and has no lock, so it adopts a new
+	// generation here, at the datagram boundary, and nowhere else.
+	if gen := r.rt.Cfg.Gen; gen != r.gapGen {
+		r.gapGen = gen
+		r.gap.Reconfigure(decode.ParseGapScope(r.rt.Cfg.Ordering.GapScope),
+			r.rt.Cfg.Ordering.GapAuditPackets)
+	}
+
 	// The envelope's cNetId, checked once per datagram against the same
 	// expectation as each sub-packet's payload[0] (Vol 1 section 6.2).
 	if n := d.Bytes(); len(n) >= 2 {
@@ -262,6 +276,14 @@ func (r *receiver) SubPacket(payload []byte, compressed bool, idx, count int) {
 	// recover can see. P2-07's gap detector goes inside, between the header
 	// parse and the registry lookup.
 	r.fatalErr = r.route(r.fanoutBuf[:n], idx, count)
+
+	// Channel H (Vol 4 section 4.5): AFTER the units reached their shards, so a
+	// dropped health event can never cost data, and outside the recover
+	// boundary and the stall budget because the send never blocks. Skipped when
+	// the budget expired: the process is stopping and nothing reads it.
+	if r.fatalErr == nil {
+		r.publishSession(r.fanoutBuf[:n])
+	}
 }
 
 // decodeSubPacket is the protected region: decompress, resolve, dispatch.
@@ -400,8 +422,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		want := int(wire.BroadcastDataPrefixLen) + int(r.hdr.MsgLen)
 		if m := len(payload); m != want {
 			r.in.decompressedLenMismatch[slot].Add(1)
-			if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-				r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+			if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+				r.g.deps.Log.Warnf(obs.ClassDecodeAnomaly,
 					"decompressed length %d against 8+MessageLength %d for code %d",
 					m, want, r.hdr.Code)
 			}
@@ -457,8 +479,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		// allocates nothing. Which sentinel it was goes in the log, not in a
 		// counter label: the counters that matter here already fired above.
 		// Boxing it into the variadic does allocate, hence the Allow.
-		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-			r.g.deps.Log.Errorf(obs.ClassSessionAnomaly, "decoding code %d: %v", r.hdr.Code, err)
+		if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+			r.g.deps.Log.Errorf(obs.ClassDecodeAnomaly, "decoding code %d: %v", r.hdr.Code, err)
 		}
 		return 0
 	}
@@ -466,8 +488,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		// A decoder that wrote more than it declared would have written past
 		// fanoutBuf already; this is the assertion that says so rather than
 		// letting the overflow travel downstream.
-		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-			r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
+		if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+			r.g.deps.Log.Errorf(obs.ClassDecodeAnomaly,
 				"code %d reported %d units with MaxUnits %d", r.hdr.Code, n, units)
 		}
 		return 0
@@ -499,8 +521,8 @@ func (r *receiver) countUnresolved(code model.TransCode) {
 		// onto the shared dynamic table, so it counts properly now.
 		c, ok := r.in.unconfiguredTranscode(int(code))
 		c.Add(1)
-		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-			r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+		if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+			r.g.deps.Log.Warnf(obs.ClassDecodeAnomaly,
 				"transcode %d has a decoder in this build but is not configured, so nothing says "+
 					"which destination its fields belong to (ADR-011)%s", code, fullTable(ok))
 		}
@@ -508,8 +530,8 @@ func (r *receiver) countUnresolved(code model.TransCode) {
 	}
 	c, ok := r.in.unknownTranscode(int(code))
 	c.Add(1)
-	if !ok && r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-		r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+	if !ok && r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+		r.g.deps.Log.Warnf(obs.ClassDecodeAnomaly,
 			"transcode %d is not in this build's catalogue, and the unknown-code table is "+
 				"full, so it is counted under unknown_transcode_other", code)
 	}

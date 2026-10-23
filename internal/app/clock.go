@@ -30,3 +30,18 @@ const obsClassStartup = obs.ClassStartupFailed
 // because a second time.Now() for the second value would have been the clock
 // read that section is written against.
 var processStart = time.Now()
+
+// nextRecvMono is the receipt clock the ordering guard needs: strictly
+// increasing per receiver, which the guard's RecvMono tiebreak (Vol 2 section
+// 5.3 step 8, obligation B-V1b) assumes. time.Now's monotonic reading only
+// advances once per timer tick on some platforms (windows/amd64), so two
+// datagrams read in one tick would otherwise get the same stamp and the guard
+// would drop the second as a re-delivery. One reader goroutine owns last, so
+// bumping a tie by a nanosecond costs nothing and leaves real differences
+// untouched. Closes phase3-tasks seam 9.
+func nextRecvMono(now, last int64) int64 {
+	if now <= last {
+		return last + 1
+	}
+	return now
+}

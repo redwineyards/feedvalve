@@ -16,10 +16,14 @@
 #   1. -selfcheck     needs no password, no network, no database. If this
 #                     fails, nothing below is worth running.
 #   2. test binaries  the layout constants and the timezone, AT RUNTIME on
-#                     big-endian ppc64 (G-AIX-1 assertions 3 and 4).
+#                     big-endian ppc64 (G-AIX-1 assertions 3 and 4), and the
+#                     mirror's ownership assertions (mirror-assert.test,
+#                     G-ASSERT-1). Then G-AIX-1 assertion 2 on its own: the
+#                     digest's allocations and MB/s, recorded for OQ-L3.
 #   3. -dbcheck       proves the credential, the listener and the service name
 #                     FROM THIS HOST -- before step 4 can blame the binary for
-#                     a database that was never reachable.
+#                     a database that was never reachable. Also reports the
+#                     catalogue check: the tables match the field map.
 #   4. the full run   start, one instrument line, SIGTERM, clean exit.
 #   5. the host       no cgo, and the receive buffer actually granted
 #                     (G-AIX-1 assertion 5, the only thing that falsifies
@@ -74,8 +78,10 @@ found_tests=0
 for t in ./*.test; do
 	[ -f "$t" ] || continue
 	found_tests=1
-	run "$t -test.short"
-	if "$t" -test.short; then
+	# G-AIX-1 assertion 2 is skipped here and run on its own below, so an
+	# OQ-L3 failure is reported once, as itself, and not also as a layout one.
+	run "$t -test.short -test.skip ^TestG_AIX_1_2_"
+	if "$t" -test.short -test.skip '^TestG_AIX_1_2_'; then
 		pass "$(basename "$t")"
 	else
 		fail "$(basename "$t") -- a layout or runtime assertion failed ON THE TARGET, which is the case no amd64 run can make"
@@ -83,6 +89,30 @@ for t in ./*.test; do
 done
 if [ "$found_tests" -eq 0 ]; then
 	skip "no *.test binaries beside this script -- run scripts/build-aix.sh"
+fi
+
+say ""
+say "G-AIX-1 assertion 2 (OQ-L3): the mirror's digest (hash/maphash) over a"
+say "181-byte row image must allocate nothing and run at >= 200 MB/s on THIS"
+say "machine. It is skipped in the loop above and run here on its own, so its"
+say "figures are printed for the record and a failure is reported once, as"
+say "itself. A FAIL here triggers the FNV-1a fallback (ADR-L02) -- record it."
+if [ -f ./mirror.test ]; then
+	run "./mirror.test -test.run ^TestG_AIX_1_2_ -test.v"
+	OUT2=$(./mirror.test -test.run '^TestG_AIX_1_2_' -test.v 2>&1)
+	rc=$?
+	printf '%s\n' "$OUT2" | sed 's/^/    /'
+	if [ "$rc" -eq 0 ] && printf '%s\n' "$OUT2" | grep -q -- '--- PASS: TestG_AIX_1_2_'; then
+		pass "digest: 0 allocs/op and >= 200 MB/s (OQ-L3 closed -- record the figures above)"
+	else
+		fail "digest on the target -- OQ-L3: switch the digest to FNV-1a (ADR-L02) and record the figures above"
+	fi
+else
+	skip "no mirror.test beside this script, so G-AIX-1 assertion 2 cannot run"
+fi
+
+if [ ! -f ./mirror-assert.test ]; then
+	skip "no mirror-assert.test beside this script, so G-ASSERT-1's shard half did not run on the target"
 fi
 
 # --- 3 -----------------------------------------------------------------------
@@ -96,8 +126,21 @@ if [ -z "${FEEDVALVE_DB_PASSWORD:-}" ]; then
 	say "one and does not say so."
 else
 	run "$BIN -config $CFG -dbcheck"
-	if "$BIN" -config "$CFG" -dbcheck; then
+	DBCHECK_OUT=$("$BIN" -config "$CFG" -dbcheck 2>&1)
+	DBCHECK_RC=$?
+	echo "$DBCHECK_OUT"
+	if [ "$DBCHECK_RC" -eq 0 ]; then
 		pass "dbcheck"
+		# The catalogue half of -dbcheck (Vol 0 section 7.6): every mapped column
+		# exists, with a compatible type, and is NOT NULL only where the writer
+		# always sets it. Printed as its own line because "the round trip worked
+		# but the tables are wrong" is the failure step 4 would otherwise report
+		# as a writer fault.
+		if echo "$DBCHECK_OUT" | grep -q "catalogue matches the field map"; then
+			pass "catalogue matches the field map"
+		else
+			fail "dbcheck passed but did not report the catalogue check -- is this binary older than the catalogue check?"
+		fi
 	else
 		fail "dbcheck -- credential, listener or service name is wrong from this host. Step 4 will fail for this reason and not because of the binary"
 	fi
@@ -120,7 +163,36 @@ else
 		fail "the process exited during startup"
 		say "--- output ---"; cat "$LOG"; say "--- end ---"
 	else
-		say "  started, pid $PID; waiting ${WAIT}s for an emission"
+		say "  started, pid $PID"
+
+		# SIGHUP (OQ-L7 / ASM-A9): does the signal reach a Go handler on AIX
+		# and drive a reload? The assertion is the INFO line the reload itself
+		# writes, "config reloaded generation=", NOT the config_generation
+		# gauge, which is only sampled at the next stats emission (up to
+		# stats.intervalSec later) and would make this step slow and ambiguous.
+		# An unchanged file still reloads, so no edit to config.json is needed.
+		# A rejected reload logs "config reload rejected" instead, reported as
+		# its own failure so a bad file is not mistaken for a lost signal.
+		head2 "4a. SIGHUP reloads the configuration (OQ-L7 / ASM-A9)"
+		run "kill -HUP $PID"
+		if kill -HUP "$PID" 2>/dev/null; then
+			i=0
+			while [ "$i" -lt 10 ] && ! grep -q 'config reloaded generation=' "$LOG"; do
+				sleep 1
+				i=$((i + 1))
+			done
+			if grep -q 'config reloaded generation=' "$LOG"; then
+				pass "SIGHUP reached the handler: $(grep -m1 'config reloaded generation=' "$LOG")"
+			elif grep -q 'SIGHUP received' "$LOG"; then
+				fail "SIGHUP was delivered but no reload completed -- see $LOG (a rejected reload is a WARN just above)"
+			else
+				fail "no SIGHUP log line in 10s -- the signal never reached the Go handler on this host (OQ-L7: record the AIX/Go version)"
+			fi
+		else
+			skip "could not send SIGHUP to pid $PID"
+		fi
+
+		say "  waiting ${WAIT}s for an emission"
 		sleep "$WAIT"
 		kill -TERM "$PID" 2>/dev/null
 		wait "$PID"

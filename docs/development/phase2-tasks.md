@@ -59,7 +59,7 @@ Counts taken from the volumes by command, not from memory:
 | Transcodes with a decoder | **9** | Vol 1 §9.1 |
 | Transcodes recognised but not decoded | **2** (6541, 6503) | Vol 1 §9.6 |
 | Hand-off boundaries out of the volume | **3** — Q1, liveness gauge, the fatal error | Vol 1 §1.2 |
-| Gates owned by Volume 1 | **24** declared / **21** enumerated, of which **16 are new here** | Vol 4 §7 |
+| Gates owned by Volume 1 | **21** (Vol 4 §7 declared 24 until the Phase 3 errata; resolved), of which **16 are new here** | Vol 4 §7 |
 | LLD ADRs raised by Volume 1 | **7** — ADR-L06 … ADR-L12 | Vol 1 §13 |
 
 ### The decoder inventory (Vol 1 §9.1)
@@ -479,6 +479,10 @@ enumerates **21** distinct ids. Subtracting the five already green from Phase 1 
 G-DEP-3, G-PTR-1, G-AIX-1) leaves the **16 new** counted in §2 — derived from the enumeration. Had
 it been derived from the headline figure it would read 19, and a reviewer auditing Phase 2 against
 "19 new gates" would conclude three were missing.
+
+**Resolved** (Phase 3 errata doc commit): Vol 4 §7 now declares Vol 1 **21**, Vol 2 26, Vol 3 7 and
+Vol 4 38 — each equal to its enumeration — summing to 92 against eighty-nine distinct gates, the
+difference being G-PTR-1 and G-ROW-1/2, each credited to two volumes.
 
 Seams 3 and 4 of §6 are not from the LLD: they are defects in the merged Phase 1 code, found by the
 `/simplify` review of `internal/`, reported rather than fixed because both require a behaviour

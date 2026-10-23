@@ -5,13 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
 	"time"
 
 	"feedvalve/internal/framing"
+	"feedvalve/internal/mirror"
 	"feedvalve/internal/model"
 	"feedvalve/internal/obs"
 	"feedvalve/internal/wire"
@@ -36,7 +33,8 @@ const readBufferLen = 65536
 // The returned error is nil for a requested shutdown -- INCLUDING one whose
 // drain deadline expired and abandoned rows, which is a counted, logged
 // degradation of a stop we asked for and not a failure (ADR-L37) -- and non-nil
-// only for a terminal runtime condition, which main maps to exit code 4.
+// only for a terminal runtime condition, which main maps to exit code 4. That
+// includes one raised DURING a requested drain: the request does not absorb it.
 //
 // THE DRAIN IS IN THE BODY, NOT A DEFER, and Vol 4 section 1.1 is explicit
 // about why: "a defer cannot be sequenced against another defer's resource, and
@@ -56,12 +54,16 @@ func (g *Graph) Run(ctx context.Context) error {
 	// a bind failure must return an error with the database closed, not exit.
 	defer g.teardown()
 
-	// Step 14: the Q1 consumers, BEFORE the decoder that feeds them -- the same
-	// consumers-before-producers rule as below, one queue further down. Until
-	// Phase 3 these discard; what matters now is that the channel always has a
-	// reader, so the fan-out's budget measures the design's fast path rather
-	// than the absence of a shard.
-	g.startShardConsumers()
+	// Step 13: the writers, before the shards, so a shard's first batch has a
+	// consumer. Only with a database; see startWriters.
+	if err := g.startWriters(); err != nil {
+		return err
+	}
+
+	// Step 14: the shards, Q1's consumers, BEFORE the decoder that feeds them --
+	// the same consumers-before-producers rule as below, one queue further
+	// down.
+	g.startShards()
 
 	// Step 14a: the decoder, BEFORE the producer that feeds it. Consumers
 	// before producers is the same rule that puts the writers before the
@@ -69,8 +71,11 @@ func (g *Graph) Run(ctx context.Context) error {
 	// burns queue slack for nothing.
 	g.startDecoder()
 
-	// Step 15: the stats and health goroutine. Before the socket, so the
-	// liveness clock is already running when the first datagram could arrive.
+	// Step 15: the flush ticker, then the stats and health goroutine. After
+	// the shards, so the first tick cannot land on a shard that does not
+	// exist; before the socket, so the liveness clock is already running when
+	// the first datagram could arrive.
+	g.startFlushTicker()
 	g.startStats()
 
 	// Step 16: the listener, LAST of the resources, so nothing arrives before
@@ -85,10 +90,28 @@ func (g *Graph) Run(ctx context.Context) error {
 	defer stopHUP()
 
 	ev, terminal := g.wait(ctx)
+	// Right after wait and BEFORE the shutdown line and the drain: the signal
+	// is unregistered and an in-flight reload finishes first, so no reload
+	// ever overlaps teardown (D12). The defer above is the error-path net.
+	stopHUP()
 	g.logShutdownInitiated(ev, terminal)
 
 	// Steps 3 to 10: the drain.
 	g.teardown()
+
+	// A terminal condition raised DURING a requested drain -- F26 or F27 from
+	// a shard, which runs on into the drain by design (ruling D9) -- must
+	// still reach the exit code. wait() stopped reading g.fatal at
+	// ctx.Done(); Fatal is one-shot into a buffer of one, so one non-blocking
+	// read after every goroutine has joined sees it if it came.
+	if !terminal {
+		select {
+		case ev = <-g.fatal:
+			terminal = true
+			g.deps.Log.Infof("shutdown escalated reason=%s%s", ev.reason, detailSuffix(ev.detail))
+		default:
+		}
+	}
 
 	if terminal {
 		return &ExitError{
@@ -137,17 +160,10 @@ func (g *Graph) bind() error {
 		effective = n
 	}
 
-	// The allow-list is parsed ONCE, here, because parsing per datagram would
-	// allocate 2,400 times a second to learn the same answer (section 3.5).
-	// It cannot fail on a validated config -- V-SRC1 checks it with the same
-	// parser -- so a failure here means an unvalidated Config reached Run, and
-	// refusing to start is the right answer: the alternative is a source
-	// filter nobody realises is misconfigured.
-	prefixes, err := cfg.UDP.SourcePrefixes()
-	if err != nil {
-		return exitf(ExitStartup, "parsing udp.sourceAllowList: %w", err)
-	}
-	g.srcPrefixes = prefixes
+	// The allow-list is parsed ONCE per generation, by newRuntime, because
+	// parsing per datagram would allocate 2,400 times a second to learn the
+	// same answer (section 3.5). Build already refused an unparseable one.
+	prefixes := g.loadRuntime().SrcPrefixes
 
 	g.inst().readbufEffective.Store(int64(effective))
 	// Requested and effective SIDE BY SIDE. If they differ, the kernel capped
@@ -185,8 +201,8 @@ func (g *Graph) startReader(ctx context.Context) {
 		// datagram would take a lock 2,400 times a second to learn the same
 		// answer.
 		conn := g.getConn()
-		cfg := g.deps.Cfg
 		in := g.inst()
+		var lastRecv int64 // the previous datagram's RecvMono; see nextRecvMono
 
 		for {
 			// Step 2. The only blocking call in the loop that is not bounded
@@ -230,15 +246,22 @@ func (g *Graph) startReader(ctx context.Context) {
 			// are monotonic, because t0 carries time.Now's monotonic reading
 			// and Sub uses it. Never a wall-clock difference.
 			t0 := time.Now()
-			d.RecvMono = int64(t0.Sub(processStart))
+			d.RecvMono = nextRecvMono(int64(t0.Sub(processStart)), lastRecv)
+			lastRecv = d.RecvMono
 
 			// Step 5.
 			in.datagramsReceived.Add(1)
 			in.lastDatagramMonoNs.Store(d.RecvMono)
 
+			// The configuration snapshot for THIS datagram (P5-07 pickup: the
+			// receiver adopts a reload on the next datagram). One atomic load,
+			// no allocation; the allow-list is already parsed in the snapshot.
+			rt := g.loadRuntime()
+			cfg, prefixes := rt.Cfg, rt.SrcPrefixes
+
 			// Step 6, section 3.5. An empty allow-list skips the check
 			// entirely rather than matching against nothing.
-			if len(g.srcPrefixes) > 0 && !sourceAllowed(g.srcPrefixes, src) {
+			if len(prefixes) > 0 && !sourceAllowed(prefixes, src) {
 				in.datagramsUnexpectedSrc.Add(1)
 				// Allow first: src is a netip.AddrPort and boxing it into the
 				// variadic allocates, per datagram, on the receive goroutine --
@@ -247,7 +270,7 @@ func (g *Graph) startReader(ctx context.Context) {
 				if g.deps.Log.Allow(obs.ClassUnexpectedSource) {
 					g.deps.Log.Warnf(obs.ClassUnexpectedSource,
 						"datagram from unexpected source %s (allow-list has %d entries, enforce=%v)",
-						src, len(g.srcPrefixes), cfg.UDP.SourceEnforce)
+						src, len(prefixes), cfg.UDP.SourceEnforce)
 				}
 				if cfg.UDP.SourceEnforce {
 					// THE ONE PLACE FeedValve DISCARDS DATA ON PURPOSE
@@ -432,79 +455,43 @@ func (g *Graph) startStats() {
 	g.statsStarted = true
 	g.mark(&g.acquired, "stats-goroutine")
 
-	interval := g.deps.Cfg.StatsInterval()
-	go func() {
-		defer close(g.statsDone)
-		t := time.NewTicker(interval)
-		defer t.Stop()
+	go g.statsLoop() // stats.go: the body, its F28 recover and the F23 detector
+}
 
-		last := time.Now()
-		for {
-			select {
-			case <-g.statsStop:
-				return
-			case now := <-t.C:
-				// A wall clock that jumped by much more than the interval is a
-				// step, and it makes every timestamp in the log discontinuous.
-				// Explaining that in ten seconds instead of an hour is the
-				// whole value of the counter.
-				if skew := now.Sub(last) - interval; skew > interval || skew < -interval {
-					g.inst().clockStepDetected.Add(1)
-				}
-				last = now
+// emitStats samples the lifecycle-owned gauges and writes one emission, under
+// emitMu. It is the only way either emitter reaches Reg.Emit -- see emitMu for
+// why the two of them overlap.
+func (g *Graph) emitStats() error {
+	g.emitMu.Lock()
+	defer g.emitMu.Unlock()
+	g.sampleGauges()
+	return g.deps.Reg.Emit(g.deps.Stderr)
+}
 
-				g.sampleGauges()
-				if err := g.deps.Reg.Emit(g.deps.Stderr); err != nil {
-					g.deps.Log.Errorf(obsClassStartup, "emitting the stats line: %v", err)
-				}
-			}
-		}
-	}()
+// evaluateGuards is one pass of the ordering guard's auto-disable (Vol 2
+// section 5.5), under emitMu like the other stats-goroutine work, so the
+// evaluator's snapshot and an emission never interleave.
+func (g *Graph) evaluateGuards() {
+	g.emitMu.Lock()
+	defer g.emitMu.Unlock()
+	mirror.EvaluateGuards(g.guards, g.loadRuntime().Mirror, g.guardSnap, g.deps.Log)
 }
 
 // sampleGauges stores the values Vol 0 section 8.2 describes as sampled at
-// emission and whose owner is the lifecycle.
+// emission and whose owner is the lifecycle. Caller holds emitMu.
 func (g *Graph) sampleGauges() {
 	in := g.inst()
 	in.configGeneration.Store(int64(g.deps.Store.Gen()))
-	in.writersConfigured.Store(int64(g.deps.Cfg.Writers.Count))
+	// writers_configured is NOT stored here: the pool owns the gauge (Start and
+	// Resize), so a reload that changes writers.count is not overwritten by the
+	// startup value.
+	in.batchqDepth.Store(int64(len(g.batchQ)))
 	// The ring's own counters are plain numbers, not instruments: the ledger
 	// assigns qd_wake_parked to the decoder, so the decoder's handle reports
 	// it rather than the ring writing it directly.
 	if parks := g.qdConsumer.Parks(); parks > g.lastParks {
 		in.qdWakeParked.Add(parks - g.lastParks)
 		g.lastParks = parks
-	}
-}
-
-// installReloadHandler wires SIGHUP. It is a no-op until Phase 5 -- ADR-010's
-// re-read, validate and atomic swap is section 2's work -- but the handler is
-// installed now, and AFTER the graph exists, because a SIGHUP arriving
-// mid-construction would race a half-built registry against a swap. Before this
-// point SIGHUP's default disposition terminates the process, which during a
-// sub-second startup is acceptable and is stated rather than discovered.
-func (g *Graph) installReloadHandler() func() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGHUP)
-
-	stop := make(chan struct{})
-	var once sync.Once
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ch:
-				g.deps.Log.Infof("SIGHUP received; configuration reload arrives in " +
-					"Phase 5 (ADR-010). The running configuration is unchanged.")
-			}
-		}
-	}()
-	return func() {
-		once.Do(func() {
-			signal.Stop(ch)
-			close(stop)
-		})
 	}
 }
 
@@ -562,6 +549,9 @@ func (g *Graph) wait(ctx context.Context) (fatalEvent, bool) {
 
 func (g *Graph) logShutdownInitiated(ev fatalEvent, terminal bool) {
 	g.drainStarted = time.Now()
+	// t_shutdown: the shared drain deadline runs from here (Vol 4 section 1.5
+	// step 7), not from the moment each shard sees its channel close.
+	g.armDrainDeadline()
 	reason := "signal"
 	if terminal {
 		reason = ev.reason.String()
@@ -570,9 +560,8 @@ func (g *Graph) logShutdownInitiated(ev fatalEvent, terminal bool) {
 	// must carry the counters that led to it, because R12 -- "operators do not
 	// read the 60 s line" -- is mitigated only if the last line is
 	// self-contained.
-	g.sampleGauges()
 	g.deps.Log.Infof("shutdown initiated reason=%s%s", reason, detailSuffix(ev.detail))
-	if err := g.deps.Reg.Emit(g.deps.Stderr); err != nil {
+	if err := g.emitStats(); err != nil {
 		g.deps.Log.Errorf(obsClassStartup, "emitting the shutdown snapshot: %v", err)
 	}
 }
@@ -588,6 +577,11 @@ func detailSuffix(detail string) string {
 // Run's body on the normal path and deferred for the error paths.
 func (g *Graph) teardown() {
 	g.teardownOnce.Do(func() {
+		// No reload may start from here on, and one already running finishes
+		// first (it holds reloadMu). Idempotent with stopHUP; this is the net
+		// for error paths that reach teardown without having been through wait.
+		g.closeReload()
+
 		// Step 3: close the listener. This is the ONLY way to unblock an
 		// in-flight ReadFrom -- no SetReadDeadline, no polling. A poll loop
 		// would wake a sleeping goroutine ten times a second forever to serve
@@ -625,17 +619,33 @@ func (g *Graph) teardown() {
 		// close safe rather than a panic: the decoder is Q1's sole producer,
 		// so once it is joined nothing can send. Same shape as the QD stage
 		// above -- drained, not abandoned.
+		//
+		// Steps 7 and 8 are inside that wait: each shard drains under the ONE
+		// shared deadline, armed at t_shutdown -- or here, on an error path
+		// that never logged it -- and counts what it abandons. The deadline is
+		// stopped once every shard is quiescent, and the flush ticker once
+		// they have returned.
+		g.armDrainDeadline()
 		g.stopShardConsumers()
 
-		// Steps 7 to 10 -- the shard drain under one shared deadline, close
-		// batchQ, the writers' last batch -- arrive with Phase 3 and Phase 4.
-		// The ordering is what P1-09 fixes; the stages slot in here.
+		// Steps 9 and 10: close batchQ, then let the writers finish what is
+		// queued and join them. Strictly after the shards have joined (they
+		// are batchQ's only senders) and strictly before the database closes,
+		// which run's defer does once Run returns. The drain timer is stopped
+		// AFTER this, not before: it is the writers' deadline too (D13).
+		g.stopWriters()
+		g.drainTimer.Stop()
+		g.stopFlushTicker()
 
 		if g.statsStarted {
 			close(g.statsStop)
 			<-g.statsDone
 			g.mark(&g.released, "stats-goroutine")
 		}
+
+		// The pool watcher last: a pool that stops DURING the drain still has
+		// to reach the exit code.
+		g.stopPoolWatch()
 	})
 }
 

@@ -2,6 +2,7 @@ package destinations
 
 import (
 	"fmt"
+	"strings"
 
 	"feedvalve/internal/model"
 )
@@ -42,6 +43,12 @@ func validateDestination(d *Destination) error {
 	if err := validIdent(d.Table); err != nil {
 		return fmt.Errorf("table: %w", err)
 	}
+	if err := validIdent(d.KeyColumn); err != nil {
+		return fmt.Errorf("keyColumn: %w", err)
+	}
+	if strings.EqualFold(d.KeyColumn, UpdatedAtColumn) {
+		return fmt.Errorf("keyColumn %q collides with the writer-owned %s column", d.KeyColumn, UpdatedAtColumn)
+	}
 	if d.NContributors == 0 {
 		return fmt.Errorf("no contributors declared; nothing could ever write this destination")
 	}
@@ -77,6 +84,15 @@ func validateDestination(d *Destination) error {
 		}
 
 		for _, name := range c.SQL {
+			// Statement aliases are case-insensitive in Oracle, so the
+			// key and updated_at collisions are compared folded.
+			if strings.EqualFold(name, d.KeyColumn) {
+				return fmt.Errorf("SQL column %q (bit %d) is also the keyColumn; the key "+
+					"is bound once and never in the SET list", name, c.Bit)
+			}
+			if strings.EqualFold(name, UpdatedAtColumn) {
+				return fmt.Errorf("SQL column %q (bit %d) is reserved for the writer's clock", name, c.Bit)
+			}
 			if prev, dup := seenSQL[name]; dup {
 				return fmt.Errorf("SQL column %q is declared by both bit %d and bit %d",
 					name, prev, c.Bit)

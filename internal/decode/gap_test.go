@@ -548,3 +548,59 @@ func TestParseGapScope(t *testing.T) {
 		}
 	}
 }
+
+// TestGapReconfigureKeepsStateUnlessTheScopeChanges is the pickup contract for
+// a reloaded ordering.gapScope and ordering.gapAuditPackets (P5-07).
+//
+// SETUP: a global-scope detector that has seen 10. STIMULUS: (a) Reconfigure
+// with the same scope and audit; (b) the next message, 15; (c) Reconfigure to
+// per-transcode and back to global; (d) the next message, 40.
+// ASSERTION: (a) keeps the sequence state, so 15 is a 4-message gap; (c) clears
+// it, because the two scopes track different sequence spaces and state recorded
+// under one is meaningless under the other, so 40 is a first message and
+// reports nothing.
+// WOULD HAVE CAUGHT: a reload that resets the detector on every generation
+// (an unrelated reload would forget the last sequence number and hide a gap
+// that straddles it), and one that keeps stale state across a scope change
+// (a fabricated gap on the first message after it).
+// NON-VACUITY: 15 after (a) does report a gap, so the state survived.
+func TestGapReconfigureKeepsStateUnlessTheScopeChanges(t *testing.T) {
+	rep := &recordingReports{}
+	g := NewGapDetector(GapGlobal, 0, rep)
+	g.Observe(bcast(10), 0)
+
+	g.Reconfigure(GapGlobal, 0)
+	g.Observe(bcast(15), 0)
+	if len(rep.gaps) != 1 || rep.missing() != 4 {
+		t.Fatalf("an unchanged scope lost its state: gaps=%d missing=%d, want 1 and 4",
+			len(rep.gaps), rep.missing())
+	}
+
+	g.Reconfigure(GapPerTranscode, 0)
+	g.Reconfigure(GapGlobal, 0)
+	g.Observe(bcast(40), 0)
+	if len(rep.gaps) != 1 {
+		t.Errorf("a scope change kept stale state: %d gaps, want still 1", len(rep.gaps))
+	}
+}
+
+// TestGapReconfigureRearmsTheAuditOnlyWhenItsLengthChanges: the audit counts
+// down a fixed number of messages; an unrelated reload must not restart it.
+func TestGapReconfigureRearmsTheAuditOnlyWhenItsLengthChanges(t *testing.T) {
+	g := NewGapDetector(GapGlobal, 5, nil)
+	for i := range 3 {
+		g.Observe(bcast(int32(i)), 0)
+	}
+	g.Reconfigure(GapGlobal, 5)
+	if g.auditLeft != 2 {
+		t.Errorf("auditLeft = %d after an unchanged Reconfigure, want 2 (not restarted)", g.auditLeft)
+	}
+	g.Reconfigure(GapGlobal, 9)
+	if g.auditLeft != 9 {
+		t.Errorf("auditLeft = %d after the length changed, want 9", g.auditLeft)
+	}
+	g.Reconfigure(GapGlobal, -3)
+	if g.auditLeft != 0 {
+		t.Errorf("auditLeft = %d for a negative length, want 0", g.auditLeft)
+	}
+}

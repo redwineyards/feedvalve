@@ -177,3 +177,57 @@ func goListDepsAt(t *testing.T, root, pattern string) []string {
 	}
 	return strings.Fields(string(out))
 }
+
+// TestG_BLD_3_ScanCoversHealth is the non-vacuity half of G-BLD-3 for Phase 5.
+// SETUP: the scan's own file list. ASSERTION: it parsed the health machines'
+// production files (circuit, window, session), none of which calls os.Exit or
+// a Fatal* logger. WOULD HAVE CAUGHT: a scanRoots edit or package move that
+// took the new package out of the gate, so a fatal in a state machine would
+// skip deferred cleanup unnoticed.
+func TestG_BLD_3_ScanCoversHealth(t *testing.T) {
+	seen := map[string]bool{}
+	for _, f := range scanTree(t) {
+		if !strings.HasPrefix(f.rel, "internal/health/") {
+			continue
+		}
+		seen[f.rel] = true
+		for _, c := range f.calls {
+			if (c.pkg == "os" && c.sel == "Exit") || strings.HasPrefix(c.sel, "Fatal") {
+				t.Errorf("%s: %s.%s in internal/health", c.pos, c.pkg, c.sel)
+			}
+		}
+	}
+	for _, name := range []string{"circuit.go", "window.go", "session.go"} {
+		if !seen["internal/health/"+name] {
+			t.Errorf("the G-BLD-3 scan did not parse internal/health/%s", name)
+		}
+	}
+}
+
+// TestG_BLD_3_ScanCoversTheWriterAndOradb is the non-vacuity half of G-BLD-3
+// for Phase 4. SETUP: the scan's own file list. ASSERTION: it parsed at least
+// one non-test file in internal/writer and in internal/oradb, and in neither
+// does any file call os.Exit or a Fatal* logger (the scan test already fails
+// on one; this proves the scan looks there at all). WOULD HAVE CAUGHT: a
+// scanRoots edit, or a package move, that silently took the two packages that
+// hold Oracle sessions out of the gate.
+func TestG_BLD_3_ScanCoversTheWriterAndOradb(t *testing.T) {
+	seen := map[string]int{}
+	for _, f := range scanTree(t) {
+		for _, p := range []string{"internal/writer/", "internal/oradb/"} {
+			if strings.HasPrefix(f.rel, p) {
+				seen[p]++
+				for _, c := range f.calls {
+					if (c.pkg == "os" && c.sel == "Exit") || strings.HasPrefix(c.sel, "Fatal") {
+						t.Errorf("%s: %s.%s in a package that owns Oracle sessions", c.pos, c.pkg, c.sel)
+					}
+				}
+			}
+		}
+	}
+	for _, p := range []string{"internal/writer/", "internal/oradb/"} {
+		if seen[p] == 0 {
+			t.Errorf("the G-BLD-3 scan parsed no files under %s", p)
+		}
+	}
+}

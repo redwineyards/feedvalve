@@ -649,9 +649,10 @@ HLD's 147 MB.
 > **Superseded by Vol 2 §10, which is canonical for the envelope.** Occupied-byte arithmetic
 > understates the real figure because it ignores quantisation: arenas are allocated in chunks, Go
 > rounds map buckets to a power of two, and the rings are pre-sized. Vol 2 re-derived arenas at
-> **187.6 MB**, indexes at **11.7 MB** and rings at **4.8 MB**. With Q1 at 5.9 MB, the new datagram
+> **187.6 MB**, indexes at **11.7 MB** and rings at **6.3 MB** *(erratum, Phase 3: 4.8 MB before the
+> rings' power-of-two capacity was counted, Vol 2 §10.3)*. With Q1 at 5.9 MB, the new datagram
 > ring **QD** at 8.5 MB (§9.5.2), batch rows at 2.3 MB and fixed buffers under 1 MB, the resident
-> total is ≈ **220.8 MB — 0.55 % of the 40 GB partition.** Use these figures, not the 169.6/189 pair.
+> total is ≈ **222.3 MB — 0.56 % of the 40 GB partition.** Use these figures, not the 169.6/189 pair.
 
 Every conclusion in HLD
 §7.8 and §11.3 survives unchanged.
@@ -835,10 +836,11 @@ type RegistryEntry struct {
     Class     model.Class
     Slots     [maxDestinations]uint8    // contributor slot of Code in each destination
     Contrib   [maxDestinations]ColSpec  // which columns of each destination Code supplies
-    GuardOff  *atomic.Bool              // per-transcode ordering-guard kill switch (HLD §6.5,
-                                        // `auto`). Written once by the stats goroutine, read
-                                        // by the shards with one atomic load
 }
+// (erratum, Phase 3, ruling D2: the draft carried GuardOff *atomic.Bool here. The
+// registry is immutable and swapped whole on a reload, so the bit lives instead in
+// mirror.GuardTable — built once by app, shared by every shard, never rebuilt —
+// with its guard_offered/guard_superseded counters resolved before Freeze.)
 
 // ColSpec is one transcode's declared contribution to one destination: the mask
 // of fields it supplies and the total packed width of their values. Width is
@@ -967,7 +969,7 @@ func (e *Error) Unwrap() error
 type ErrClass uint8
 
 const (
-    ErrRowData    ErrClass = iota // ORA-00001, ORA-01438, ORA-12899 — no retry, skip the row
+    ErrRowData    ErrClass = iota // ORA-00001, ORA-01438, ORA-12899, ORA-01722 — no retry, skip the row (Phase 4 as built: ErrUnknown is the zero value, ErrSpace is added, ORA-24381 is Unknown)
     ErrSession                    // ORA-03113, ORA-03114, ORA-12541, ORA-12170 — retire and retry
     ErrStatement                  // ORA-00936, ORA-00942 — deployment defect, stop the writer
     ErrDeadlock                   // ORA-00060 — should be unreachable (HLD §8.4); retry once
@@ -1504,7 +1506,13 @@ suppress  ⟺   class == ClassRateLimited                       (HLD §6.8, §7.
           ∧   e.Digest != 0                                    row has been written at least once
           ∧   digest(e, d) == e.Digest                         image unchanged since that write
           ∧   (e.ColMask &^ e.Written) == 0                    no field is new to the Oracle row
+          ∧   !e.InFlight                                      no batch of this row is in flight
 ```
+
+*(erratum, Phase 3: the fifth clause. `Digest` describes the last **commit**, not the batch in flight,
+so a value that returns to the committed one mid-flight — A committed, B pumped, A merged — matches it
+and would be dropped, leaving Oracle at B and the mirror at A with nothing to requeue the row. Vol 2
+Figure 2.4 already has no suppression arc out of `InFlight`.)*
 
 The fourth clause is why `Entry.Written` exists, and the failure it prevents is concrete. Suppose
 destination 1 is fed by two transcodes and the second one contributes `tick_size` for the first time,
@@ -1533,7 +1541,7 @@ obligations any mechanism must satisfy.**
 | `BatchRow.Outcome` | `Entry.Digest` | `Entry.Written` | `Entry.ColMask` | Ring action |
 |---|---|---|---|---|
 | `OutcomeCommitted` | `= BatchRow.Digest` — **the digest of the image the batch carried**, never recomputed from the entry | `\|= BatchRow.Mask` | untouched (zeroed at pump; now holds exactly what was dirtied since) | tail of the accumulating ring **iff** `ReDirty` |
-| `OutcomeRejected` | **unchanged** | **unchanged** | untouched | **not requeued**; count `row_rejected` |
+| `OutcomeRejected` | **unchanged** | **unchanged** | untouched, except that a row which stays quarantined gets `\|= BatchRow.Mask` back so a release rewrites the refused columns *(erratum, Phase 3: Vol 2 §8.4, ruling D13)* | **not requeued**; the shard counts `row_quarantined`, the writer `row_rejected` *(erratum, Phase 3: ruling D11)* |
 | `OutcomeFailed` | **unchanged** | **unchanged** | `\|= BatchRow.Mask` (restore the unwritten fields) | **head** of the accumulating ring; count `retry_requeued` |
 | `OutcomePending` on return | — | — | — | **defect.** Count `batch_row_unreported` and stop loudly: the writer returned a batch it never adjudicated |
 
@@ -2031,6 +2039,57 @@ Startup behaviour: if a `db` object is present and `FEEDVALVE_DB_PASSWORD` is un
 `OpenDB` returns `ErrNoPassword` and `run` returns it — the process exits non-zero with deferred
 cleanup intact, because startup returns errors rather than calling `Fatalf` (CLAUDE.md;
 `poc/gobrdclnt.go:19-28`). `-selfcheck` does not require the variable; `-dbcheck` does.
+
+### 7.6 Catalogue check
+
+The DDL in Vol 3 §10 is documentation: the application never issues `CREATE` (ruling D8). So the
+mapping (§4) and the real tables can drift, and the drift is silent until a row is refused. The
+catalogue check compares the one against the other **before** that happens. It is the check §5A.5
+refers to when it calls `rows_rejected_by_oracle_unpredicted` "a gap the catalogue check should have
+caught".
+
+**Where it runs.** `-dbcheck` (after the round trip) and relay startup (after the database opens,
+before the writers start). It reads only; it needs `SELECT` on `ALL_TAB_COLUMNS`, which every
+account has for the objects it can see.
+
+**Query.** One per destination table, a fixed text with a positional bind:
+
+```sql
+SELECT table_name, column_name, data_type, data_precision, data_length, nullable
+  FROM all_tab_columns
+ WHERE owner = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AND table_name = :1
+ ORDER BY column_id
+```
+
+The owner filter is not optional. `ALL_TAB_COLUMNS` lists every table the account can *see*, so
+without it a same-named table in another schema, granted to the writer, would be compared and could
+make a wrong table pass. `CURRENT_SCHEMA` rather than the login name, because that is the schema an
+unqualified `md_token_quote` in a MERGE resolves to. Table names are passed upper-case; column
+names are compared case-insensitively.
+
+**Layering.** `oradb` returns neutral rows (`CatalogColumn`: table, column, data type, precision,
+byte length, nullable) and does not import `destinations`. The comparison is a pure function in
+`app`, the only package that sees both. A missing table is a table with no rows.
+
+**What is compared**, for the key column, `updated_at` and every SQL name of every mapped column:
+
+| Finding | Rule |
+|---|---|
+| missing table | the query returned no rows for it |
+| missing column | the name is absent from the table |
+| type family | `NUMBER` column (`sqlPrecision` > 0, a `long`/`short`/`double` kind, any ladder group column) must be `NUMBER`; character (`sqlMaxBytes` > 0) must be `VARCHAR2` or `CHAR`; `time1980` and `updated_at` must be `TIMESTAMP*` |
+| short precision | catalogue `DATA_PRECISION` is less than `sqlPrecision` (NULL precision, i.e. a bare `NUMBER`, passes) |
+| short varchar | catalogue `DATA_LENGTH` (bytes) is less than `sqlMaxBytes` |
+| NOT NULL data column | any data column that is not nullable (Vol 3 §10.4: a NOT NULL data column turns the first partial-mask insert into `ORA-01400`, permanently). The key and `updated_at` are the only columns allowed to be NOT NULL and are not flagged |
+
+Not compared: scale, `CHECK` domains, grants, indexes. Ladder group columns are checked for family
+and nullability only, because the mapping carries one `sqlPrecision` for the group, not one per
+element.
+
+**Outcome.** Every finding is one line naming table, column and the fault. `-dbcheck` exits
+non-zero (`ExitStartup`) if there is any finding or if the catalogue could not be read. Startup
+logs **one ERROR per finding and proceeds**: the fix is DDL by a DBA, and it must not need a
+redeploy. A failure to read the catalogue at startup is one ERROR, also non-fatal.
 
 ---
 

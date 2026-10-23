@@ -147,8 +147,27 @@ func TestClassTableMatchesTheEnum(t *testing.T) {
 	if ClassSeqGap.String() != "seq_gap" {
 		t.Errorf("ClassSeqGap = %q, want seq_gap", ClassSeqGap)
 	}
-	if ClassStartupFailed.String() != "startup_failed" {
-		t.Errorf("ClassStartupFailed = %q, want startup_failed", ClassStartupFailed)
+	if ClassShardDefect.String() != "shard_defect" {
+		t.Errorf("ClassShardDefect = %q, want shard_defect", ClassShardDefect)
+	}
+	// And the two seams P3-04 inserted at: the end of the WARN run and the end
+	// of the ERROR run. A name landing one slot off shifts every label after it.
+	for c, want := range map[Class]string{
+		ClassShardSendWait:    "shard_send_wait",
+		ClassEpochStalled:     "epoch_stalled",
+		ClassDecodeAnomaly:    "decode_anomaly",
+		ClassCircuitQuiet:     "circuit_quiet",
+		ClassSessionAnomaly:   "session_anomaly",
+		ClassCircuitDown:      "circuit_down",
+		ClassDecompressFailed: "decompress_failed",
+		ClassStartupFailed:    "startup_failed",
+		ClassBlobLenMismatch:  "blob_len_mismatch",
+		ClassGuardDisabled:    "guard_disabled",
+		ClassDrainDeadline:    "drain_deadline",
+	} {
+		if c.String() != want {
+			t.Errorf("class %d = %q, want %q", c, c, want)
+		}
 	}
 }
 
@@ -163,7 +182,7 @@ func TestStaticVocabularyTablesCoverTheirEnums(t *testing.T) {
 		{"decompressReasons", decompressReasons, int(ReasonInputNotConsumed)},
 		{"recycleReasons", recycleReasons, int(RecycleError)},
 		{"prevalidateReasons", prevalidateReasons, int(PrevalidateNonfinite)},
-		{"retryClasses", retryClasses, int(RetryDeadlock)},
+		{"retryClasses", retryClasses, int(RetryUnknown)},
 		{"panicStages", panicStages, int(StageStats)},
 		{"payloadStages", payloadStages, int(PayloadBody)},
 		{"probeResults", probeResults, int(ProbeFail)},
@@ -177,6 +196,22 @@ func TestStaticVocabularyTablesCoverTheirEnums(t *testing.T) {
 			if s == "" {
 				t.Errorf("%s[%d] is empty", tc.name, i)
 			}
+		}
+	}
+}
+
+// Hand-written label table: swapping the order of retryClasses would pass the
+// length check above but mislabel every write_retry sample.
+func TestRetryClassLabelStrings(t *testing.T) {
+	want := map[RetryClass]string{
+		RetrySession:  "session",
+		RetryDeadlock: "deadlock",
+		RetrySpace:    "space",
+		RetryUnknown:  "unknown",
+	}
+	for c, w := range want {
+		if got := retryClasses[c]; got != w {
+			t.Errorf("retryClasses[%d] = %q, want %q", c, got, w)
 		}
 	}
 }

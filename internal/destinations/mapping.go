@@ -35,6 +35,7 @@ type fileDestination struct {
 	Name         string          `json:"name"`
 	Table        string          `json:"table"`
 	RowKey       string          `json:"rowKey"`
+	KeyColumn    string          `json:"keyColumn"`
 	ImageLen     int             `json:"imageLen"`
 	Contributors []int           `json:"contributors"`
 	Columns      []fileColumn    `json:"columns"`
@@ -115,10 +116,11 @@ func Parse(raw []byte) (*Set, error) {
 // file deliberately does not declare.
 func buildDestination(id model.DestID, fd fileDestination) (Destination, error) {
 	d := Destination{
-		ID:      id,
-		Name:    fd.Name,
-		Table:   fd.Table,
-		Columns: make([]Column, 0, len(fd.Columns)),
+		ID:        id,
+		Name:      fd.Name,
+		Table:     fd.Table,
+		KeyColumn: fd.KeyColumn,
+		Columns:   make([]Column, 0, len(fd.Columns)),
 	}
 
 	key, err := parseRowKey(fd.RowKey)

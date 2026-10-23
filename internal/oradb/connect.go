@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	go_ora "github.com/sijms/go-ora/v2"
@@ -21,29 +20,8 @@ func (s DBSettings) dsn(password string) string {
 	return go_ora.BuildUrl(s.Host, s.Port, s.Service, s.User, password, nil)
 }
 
-// redactDSN is the SECOND line of defence, not the first.
-//
-// The first is that callers build their own messages from Describe. This
-// exists because a driver error can quote the connection string back at us,
-// and on this host operational logs are append-only and long-lived, so one
-// leak is permanent.
-func redactDSN(err error, dsn, password string, s DBSettings) error {
-	if err == nil {
-		return nil
-	}
-	text := err.Error()
-	out := text
-	if dsn != "" {
-		out = strings.ReplaceAll(out, dsn, s.Describe())
-	}
-	if password != "" {
-		out = strings.ReplaceAll(out, password, "[redacted]")
-	}
-	if out == text {
-		return err
-	}
-	return errors.New(out)
-}
+// realDriver is the go-ora driver's registered name.
+const realDriver = "oracle"
 
 // Open connects and verifies the connection before returning it.
 //
@@ -53,50 +31,80 @@ func redactDSN(err error, dsn, password string, s DBSettings) error {
 // fails.
 //
 // The password is read here, from the environment, and never stored.
-func Open(ctx context.Context, s DBSettings) (*sql.DB, error) {
+func Open(ctx context.Context, s DBSettings) (*DB, error) {
+	return open(ctx, realDriver, s)
+}
+
+// open is Open over a named driver; the tests that need a driver whose errors
+// quote the DSN go through it.
+func open(ctx context.Context, name string, s DBSettings) (*DB, error) {
 	password, err := Password()
 	if err != nil {
 		return nil, err
 	}
+	return openDriver(ctx, name, s.dsn(password), password, s)
+}
 
-	dsn := s.dsn(password)
-	db, err := sql.Open("oracle", dsn)
+// OpenDriver is Open for a caller-chosen database/sql driver and DSN. It is the
+// documented substitutability seam: the writer and app tests live in other
+// packages and open an oratest fake through it, and everything past this call
+// (pool settings, ping under ConnectTimeout, redaction, sessions) behaves the
+// same for the fake as for go-ora.
+//
+// The password, if the environment supplies one, is used only to build the
+// redactor; a fake's DSN carries none and the variable may be unset.
+func OpenDriver(ctx context.Context, driverName, dsn string, s DBSettings) (*DB, error) {
+	password, err := Password()
+	if err != nil && !errors.Is(err, ErrNoPassword) {
+		return nil, err
+	}
+	return openDriver(ctx, driverName, dsn, password, s)
+}
+
+func openDriver(ctx context.Context, driverName, dsn, password string, s DBSettings) (*DB, error) {
+	red := Redactor{dsn: dsn, password: password, s: s}
+	sdb, err := sql.Open(driverName, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", s.Describe(), redactDSN(err, dsn, password, s))
+		return nil, fmt.Errorf("open %s: %w", s.Describe(), red.redact(err))
 	}
 
 	// The pool is deliberately small and derived from the writer count:
 	// Oracle caps concurrent sessions through the instance's sessions and
 	// processes parameters, so an unbounded pool fails as ORA-00020 under
 	// load rather than queueing.
-	db.SetMaxOpenConns(s.MaxOpenConns)
-	db.SetMaxIdleConns(s.MaxIdleConns)
+	sdb.SetMaxOpenConns(s.MaxOpenConns)
+	sdb.SetMaxIdleConns(s.MaxIdleConns)
 
 	// Oracle profiles (IDLE_TIME) and stateful firewalls kill idle sessions
 	// silently; the first reuse of a dead one surfaces as ORA-03113 or
 	// ORA-03114. Retiring connections before that turns an error into a
 	// reconnect.
-	db.SetConnMaxLifetime(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute)
+	sdb.SetConnMaxLifetime(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute)
 
-	pingCtx, cancel := context.WithTimeout(ctx, time.Duration(s.ConnectTimeoutSec)*time.Second)
-	defer cancel()
-
-	if err := db.PingContext(pingCtx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("connect to %s: %w", s.Describe(), redactDSN(err, dsn, password, s))
+	d := &DB{db: sdb, red: red, s: s, live: &liveSettings{}}
+	d.live.lifetime.Store(int64(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute))
+	d.live.connectTimeout.Store(int64(time.Duration(s.ConnectTimeoutSec) * time.Second))
+	if err := d.PingContext(ctx); err != nil {
+		sdb.Close()
+		return nil, fmt.Errorf("connect to %s: %w", s.Describe(), err)
 	}
-	return db, nil
+	return d, nil
 }
 
 // Check is -dbcheck: connect, prove a round trip, report the server version,
 // and close. Read-only, and the way to prove credentials and reachability
 // from a deployment host before the relay is ever started.
 func Check(ctx context.Context, s DBSettings) (version string, err error) {
-	db, err := Open(ctx, s)
+	return check(ctx, realDriver, s)
+}
+
+func check(ctx context.Context, name string, s DBSettings) (version string, err error) {
+	d, err := open(ctx, name, s)
 	if err != nil {
 		return "", err
 	}
-	defer db.Close()
+	defer d.Close()
+	db, red := d.db, d.red
 
 	queryCtx, cancel := context.WithTimeout(ctx, time.Duration(s.QueryTimeoutSec)*time.Second)
 	defer cancel()
@@ -105,10 +113,7 @@ func Check(ctx context.Context, s DBSettings) (version string, err error) {
 	// handshake: a ping can succeed against a session that cannot execute.
 	var one int
 	if err := db.QueryRowContext(queryCtx, "SELECT 1 FROM dual").Scan(&one); err != nil {
-		// No redactDSN here: with no dsn and no password to substitute it
-		// returns err untouched, which reads as a control while being none.
-		// Describe() is what keeps this line safe.
-		return "", fmt.Errorf("round trip to %s: %w", s.Describe(), err)
+		return "", fmt.Errorf("round trip to %s: %w", s.Describe(), red.redact(err))
 	}
 	if one != 1 {
 		return "", fmt.Errorf("round trip to %s returned %d, want 1", s.Describe(), one)

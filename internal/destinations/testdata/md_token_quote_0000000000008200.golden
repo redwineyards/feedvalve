@@ -1,0 +1,24 @@
+MERGE INTO MD_TOKEN_QUOTE t
+USING (SELECT
+  :1 AS token,
+  :2 AS last_trade_time,
+  :3 AS effective_ts,
+  :4 AS updated_at
+  FROM dual) s
+ON (t.token = s.token)
+WHEN MATCHED THEN UPDATE SET
+  t.last_trade_time = s.last_trade_time,
+  t.effective_ts = s.effective_ts,
+  t.updated_at = s.updated_at
+WHEN NOT MATCHED THEN INSERT (
+  token,
+  last_trade_time,
+  effective_ts,
+  updated_at
+)
+VALUES (
+  s.token,
+  s.last_trade_time,
+  s.effective_ts,
+  s.updated_at
+)
