@@ -26,17 +26,14 @@ const (
 	statusImageLen = 142 // MD_MARKET_STATUS, section 4.5
 )
 
+// The worst case (MD_TOKEN_QUOTE, 181 of 256) carries 75 bytes of headroom
+// today. If a destination ever approaches ImageSize, that is the conversation
+// about raising it to 288 (Vol 0 section 4.6).
 const (
 	_ = uint(model.ImageSize - quoteImageLen)
 	_ = uint(model.ImageSize - masterImageLen)
 	_ = uint(model.ImageSize - statusImageLen)
 )
-
-// The worst case carries 71% headroom today. Recorded as a constant so the
-// margin is visible rather than something a reader has to recompute: if a
-// destination ever approaches ImageSize, this is the line that should prompt
-// the conversation about raising it to 288 (Vol 0 section 4.6).
-const imageHeadroomBytes = model.ImageSize - quoteImageLen
 
 // shippedImageLens maps destination name to the length the build asserts, so
 // the loader test can prove mapping.json and these constants agree. Two
