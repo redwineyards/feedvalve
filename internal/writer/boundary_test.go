@@ -91,6 +91,10 @@ func TestG_ROW_2_RunBatchChangesOnlyOutcomeErrCodeErr(t *testing.T) {
 			}
 			return oratest.Result{}
 		}, batch: func() *model.Batch { return randomBatch(2) }},
+		{name: "phase2 reject", script: rowScript(1, map[int64]int{20: 1}), batch: func() *model.Batch { return randomBatch(10) }},
+		{name: "phase2 abandon", script: rowScript(1, map[int64]int{20: 1, 10: 60}), batch: func() *model.Batch { return randomBatch(11) }},
+		{name: "phase2 direct", script: rowScript(0, map[int64]int{9: 1438}), hook: func(g *rig) { g.r.skipPhase1 = true },
+			batch: func() *model.Batch { return randomBatch(12) }},
 		{name: "commit failure", script: failOn(oratest.OpCommit, 3113), batch: func() *model.Batch { return randomBatch(3) }},
 		{name: "panic in bind", hook: func(g *rig) {
 			bd, _ := g.r.binder(stmtKey{Dest: 1, Mask: 0x1FF})

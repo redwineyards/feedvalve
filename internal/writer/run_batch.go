@@ -23,6 +23,14 @@ type RunInstruments struct {
 	Panics *obs.Counter
 	// Busy is the writers_busy gauge: incremented for the length of a batch.
 	Busy *obs.Gauge
+	// RowRejected counts rows phase 2 rejected for their own data, by
+	// destination (D11: the writer's counter).
+	RowRejected [model.MaxDestinations]*obs.Counter
+	// RowsAffectedMismatch counts executions whose RowsAffected differed from
+	// the rows bound, by destination. It changes no outcome (V3 6.5).
+	RowsAffectedMismatch [model.MaxDestinations]*obs.Counter
+	// FallbackPerrow is batch_fallback_perrow: entries into phase 2.
+	FallbackPerrow *obs.Counter
 }
 
 // NewRunInstruments resolves the handles for the first `destinations`
@@ -31,9 +39,13 @@ func NewRunInstruments(reg *obs.Reg, destinations int) *RunInstruments {
 	in := &RunInstruments{
 		Panics: reg.CounterAt(obs.IDPanicsRecovered, int(obs.StageWriter)),
 		Busy:   reg.Gauge(obs.IDWritersBusy),
+
+		FallbackPerrow: reg.Counter(obs.IDBatchFallbackPerrow),
 	}
 	for d := 0; d < destinations && d < model.MaxDestinations; d++ {
 		in.RowsWritten[d] = reg.CounterAt(obs.IDRowsWritten, d)
+		in.RowRejected[d] = reg.CounterAt(obs.IDRowRejected, d)
+		in.RowsAffectedMismatch[d] = reg.CounterAt(obs.IDRowsAffectedMismatch, d)
 	}
 	return in
 }
@@ -73,6 +85,7 @@ type runner struct {
 
 	now         func() time.Time // nil means time.Now
 	afterCommit func()           // test seam, called once after a successful commit
+	skipPhase1  bool             // test seam: go straight to phase 2 (V3 self-gate)
 	where       string           // statement identity being bound or executed, for the panic line
 }
 
@@ -177,9 +190,33 @@ func (r *runner) runBatch(ctx context.Context, s *oradb.Session, b *model.Batch)
 		defer cancel()
 	}
 
-	err := s.ExecTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		return r.phase1(ctx, tx, b, updatedAt)
-	})
+	// Phase 1 is the array path. A row-data failure there has been rolled back
+	// by ExecTx and sends the WHOLE batch to phase 2, once (V3 6.4); every
+	// other class is the caller's to retry or give back.
+	var err error
+	toPhase2 := r.skipPhase1
+	if !toPhase2 {
+		err = s.ExecTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			return r.phase1(ctx, tx, b, updatedAt)
+		})
+		if err != nil {
+			if cerr, ok := r.db.Classify(err); ok && cerr.Class == oradb.ErrRowData {
+				// oracle_error stays first-come (D16): the trigger's code.
+				if r.oracleErr != nil && cerr.Code > 0 {
+					r.oracleErr(cerr.Code)
+				}
+				toPhase2 = true
+			}
+		}
+	}
+	if toPhase2 {
+		if r.run != nil {
+			add(r.run.FallbackPerrow)
+		}
+		err = s.ExecTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			return r.phase2(ctx, tx, b, updatedAt)
+		})
+	}
 	if err != nil {
 		cerr, ok := r.db.Classify(err)
 		if !ok {

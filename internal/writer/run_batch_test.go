@@ -1,10 +1,13 @@
 package writer
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -331,12 +334,6 @@ func TestRunBatchSessionAndStatementErrors(t *testing.T) {
 			}
 			return oratest.Result{}
 		}, oradb.ErrDeadlock, 60},
-		{"row data in phase 1 is a batch failure here", func(c oratest.Call) oratest.Result {
-			if c.Rows > 0 {
-				return oratest.Result{Err: oratest.ORA(1)}
-			}
-			return oratest.Result{}
-		}, oradb.ErrRowData, 1},
 		{"unknown code", func(c oratest.Call) oratest.Result {
 			if c.Rows > 0 {
 				return oratest.Result{Err: oratest.ORA(24381)}
@@ -715,4 +712,423 @@ func copyArgs(a []any) []any {
 		}
 	}
 	return out
+}
+
+// --- phase 2 (P4-07b) ---
+
+// rowScript fails every array exec with arrayCode (0: none) and fails a scalar
+// exec whose key (first argument) is in fails with that ORA code. Keys in
+// standard(): destination 0 holds 5, 10, 20, 30, destination 1 holds 8, 9,
+// destination 2 holds 1. Begin, commit and rollback always succeed. The
+// oratest convention relied on: Call.Rows > 0 is an array bind, 0 a scalar
+// exec, and an operation (begin, commit, ...) carries one of the oratest.Op*
+// keys as its SQL.
+func rowScript(arrayCode int, fails map[int64]int) oratest.Script {
+	return func(c oratest.Call) oratest.Result {
+		if isOp(c.SQL) {
+			return oratest.Result{}
+		}
+		if c.Rows > 0 {
+			if arrayCode != 0 {
+				return oratest.Result{Err: oratest.ORA(arrayCode)}
+			}
+			return oratest.Result{}
+		}
+		if key, _ := c.Args[0].(int64); fails[key] != 0 {
+			return oratest.Result{Err: oratest.ORA(fails[key])}
+		}
+		return oratest.Result{}
+	}
+}
+
+// isOp reports whether sql is one of the fake's non-statement operations.
+func isOp(sql string) bool {
+	switch sql {
+	case "", oratest.OpOpen, oratest.OpPing, oratest.OpBegin, oratest.OpCommit, oratest.OpRollback:
+		return true
+	}
+	return false
+}
+
+// scalarKeys returns the key of every scalar exec in order, and how many
+// array execs there were.
+func scalarKeys(f *oratest.Fake) (keys []int64, arrays int) {
+	for _, e := range f.Execs() {
+		if e.Rows > 0 {
+			arrays++
+			continue
+		}
+		k, _ := e.Args[0].(int64)
+		keys = append(keys, k)
+	}
+	return keys, arrays
+}
+
+// destOfRow is the destination of row i of standard().
+func destOfRow(i int) int {
+	switch {
+	case i < 4:
+		return 0
+	case i < 6:
+		return 1
+	}
+	return 2
+}
+
+// TestG_STMT_2_Phase2AttributesTheRejectedRow: one bad row in a batch whose
+// array exec failed with a row-data error costs exactly that row.
+//
+// SETUP: standard() (7 rows). The array exec fails ORA-00001, which does not
+// say which row; a scalar exec fails ORA-00001 only for one key.
+// STIMULUS: one runBatch, phase 1 then phase 2.
+// ASSERTION: the failing key's row is Rejected with ErrCode 1; the other six
+// are Committed; Err nil; one array exec, then seven scalar execs in phase 1's
+// order (hand-written key list), exactly one of them failed; begin 2, rollback
+// 1, commit 1; row_rejected 1 on the right destination; rows_written the rest;
+// batch_fallback_perrow 1; oracle_error{1}=1 (first-come, not once per row).
+// Non-vacuity: key 9 rejects row 4 and nothing else, so attribution comes from
+// the failing exec and not from position, and with no scalar failure nothing
+// is rejected.
+// WOULD HAVE CAUGHT: failing the batch on a row-data error; rejecting the
+// first row or the whole run; phase 2 re-running only the failing group;
+// committing phase 1's work as well as phase 2's.
+func TestG_STMT_2_Phase2AttributesTheRejectedRow(t *testing.T) {
+	type tc struct {
+		name     string
+		fails    map[int64]int
+		rejected map[int]uint16 // row index -> ErrCode
+	}
+	for _, c := range []tc{
+		{"key 20", map[int64]int{20: 1}, map[int]uint16{1: 1}},
+		{"key 9", map[int64]int{9: 1}, map[int]uint16{4: 1}},
+		{"none", nil, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g := newRig(t)
+			g.f.SetScript(rowScript(1, c.fails))
+			b := standard()
+			res := g.r.runBatch(context.Background(), g.s, b)
+
+			if b.Err != nil || res.failure != nil {
+				t.Fatalf("Err=%v failure=%v, want a clean batch", b.Err, res.failure)
+			}
+			wantOut := all(7, model.OutcomeCommitted)
+			wantW := [3]uint64{4, 2, 1}
+			wantR := [3]uint64{}
+			for i := range c.rejected {
+				wantOut[i] = model.OutcomeRejected
+				wantW[destOfRow(i)]--
+				wantR[destOfRow(i)]++
+			}
+			if got := outcomes(b); !reflect.DeepEqual(got, wantOut) {
+				t.Fatalf("outcomes %v, want %v", got, wantOut)
+			}
+			for i, r := range b.Active() {
+				if r.ErrCode != c.rejected[i] {
+					t.Errorf("row %d ErrCode %d, want %d", i, r.ErrCode, c.rejected[i])
+				}
+			}
+			keys, arrays := scalarKeys(g.f)
+			if want := []int64{5, 20, 10, 30, 8, 9, 1}; !reflect.DeepEqual(keys, want) {
+				t.Errorf("scalar keys %v, want %v", keys, want)
+			}
+			if arrays != 1 {
+				t.Errorf("%d array execs, want 1 (phase 1 stops at its first failure)", arrays)
+			}
+			failed := 0
+			for _, e := range g.f.Execs() {
+				if e.Rows == 0 && e.Err != nil {
+					failed++
+				}
+			}
+			if failed != len(c.rejected) {
+				t.Errorf("%d scalar execs failed, want %d", failed, len(c.rejected))
+			}
+			cn := g.f.Counts()
+			if cn.Begins != 2 || cn.Rollbacks != 1 || cn.Commits != 1 {
+				t.Errorf("begins/rollbacks/commits = %d/%d/%d, want 2/1/1", cn.Begins, cn.Rollbacks, cn.Commits)
+			}
+			for d := range 3 {
+				if got := g.r.run.RowRejected[d].Load(); got != wantR[d] {
+					t.Errorf("row_rejected{%d} = %d, want %d", d, got, wantR[d])
+				}
+				if got := g.rowsWritten(d); got != wantW[d] {
+					t.Errorf("rows_written{%d} = %d, want %d", d, got, wantW[d])
+				}
+			}
+			if g.r.run.FallbackPerrow.Load() != 1 {
+				t.Errorf("batch_fallback_perrow = %d, want 1", g.r.run.FallbackPerrow.Load())
+			}
+			if g.oraErr(1) != 1 {
+				t.Errorf("oracle_error{1} = %d, want 1", g.oraErr(1))
+			}
+		})
+	}
+}
+
+// TestPhase2DirectSkipsPhase1: phase 2 is exercised on its own, not only by
+// injecting a phase 1 fault (V3 self-gate). ORA-01438 on key 9 is attributed
+// to that row, the destination 1 row index 4, and to nothing else.
+//
+// SETUP: standard(); runner.skipPhase1 set; scalar ORA-01438 for key 9.
+// ASSERTION: no array exec; one begin and one commit and no rollback;
+// row 4 Rejected with ErrCode 1438, row_rejected{1}=1 and none elsewhere;
+// the rest Committed; oracle_error not counted for a rejected row.
+// WOULD HAVE CAUGHT: a phase 2 that only works when phase 1 ran first (state
+// left by phase 1: marked empty masks, a warmed binder); a rejection counted
+// against the wrong destination.
+func TestPhase2DirectSkipsPhase1(t *testing.T) {
+	g := newRig(t)
+	g.r.skipPhase1 = true
+	g.f.SetScript(rowScript(0, map[int64]int{9: 1438}))
+	b := standard()
+	g.r.runBatch(context.Background(), g.s, b)
+
+	want := all(7, model.OutcomeCommitted)
+	want[4] = model.OutcomeRejected
+	if got := outcomes(b); !reflect.DeepEqual(got, want) || b.Err != nil {
+		t.Fatalf("outcomes %v Err=%v, want %v", got, b.Err, want)
+	}
+	if b.Rows[4].ErrCode != 1438 {
+		t.Errorf("ErrCode %d, want 1438", b.Rows[4].ErrCode)
+	}
+	keys, arrays := scalarKeys(g.f)
+	if arrays != 0 || len(keys) != 7 {
+		t.Errorf("%d array and %d scalar execs, want 0 and 7", arrays, len(keys))
+	}
+	cn := g.f.Counts()
+	if cn.Begins != 1 || cn.Commits != 1 || cn.Rollbacks != 0 {
+		t.Errorf("begins/commits/rollbacks = %d/%d/%d, want 1/1/0", cn.Begins, cn.Commits, cn.Rollbacks)
+	}
+	for d, want := range []uint64{0, 1, 0} {
+		if got := g.r.run.RowRejected[d].Load(); got != want {
+			t.Errorf("row_rejected{%d} = %d, want %d", d, got, want)
+		}
+	}
+	if g.oraErr(1438) != 0 {
+		t.Errorf("oracle_error{1438} = %d: a rejected row is not an operational error", g.oraErr(1438))
+	}
+}
+
+// TestPhase2NonRowErrorAbandons: a non-row error in phase 2 abandons the
+// batch, once, with no phase 3, and earlier rejections survive (A15).
+//
+// SETUP: array exec ORA-00001; scalar key 20 ORA-00001 (rejected), then scalar
+// key 10 ORA-00060.
+// ASSERTION: execution stops at key 10 (keys 5, 20, 10 only); row 1 stays
+// Rejected ErrCode 1; the other six are Failed with ErrCode 60; Err and
+// failure are the deadlock; nothing committed or counted written; two
+// rollbacks, no commit; oracle_error{60}=1.
+// WOULD HAVE CAUGHT: continuing after a non-row error; a phase 3; the sweep
+// overwriting Rejected with Failed; committing the rows executed before the
+// error.
+func TestPhase2NonRowErrorAbandons(t *testing.T) {
+	g := newRig(t)
+	g.f.SetScript(rowScript(1, map[int64]int{20: 1, 10: 60}))
+	b := standard()
+	res := g.r.runBatch(context.Background(), g.s, b)
+
+	want := all(7, model.OutcomeFailed)
+	want[1] = model.OutcomeRejected
+	if got := outcomes(b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("outcomes %v, want %v", got, want)
+	}
+	for i, r := range b.Active() {
+		wantCode := uint16(60)
+		if i == 1 {
+			wantCode = 1
+		}
+		if r.ErrCode != wantCode {
+			t.Errorf("row %d ErrCode %d, want %d", i, r.ErrCode, wantCode)
+		}
+	}
+	if res.failure == nil || res.failure.Class != oradb.ErrDeadlock || b.Err == nil {
+		t.Errorf("failure=%+v Err=%v, want deadlock", res.failure, b.Err)
+	}
+	if keys, _ := scalarKeys(g.f); !reflect.DeepEqual(keys, []int64{5, 20, 10}) {
+		t.Errorf("scalar keys %v, want [5 20 10]", keys)
+	}
+	cn := g.f.Counts()
+	if cn.Commits != 0 || cn.Rollbacks != 2 || cn.Begins != 2 {
+		t.Errorf("begins/commits/rollbacks = %d/%d/%d, want 2/0/2", cn.Begins, cn.Commits, cn.Rollbacks)
+	}
+	for d := range 3 {
+		if g.rowsWritten(d) != 0 {
+			t.Errorf("rows_written{%d} = %d", d, g.rowsWritten(d))
+		}
+	}
+	if g.oraErr(60) != 1 {
+		t.Errorf("oracle_error{60} = %d, want 1", g.oraErr(60))
+	}
+	// First-come (D16): the phase 1 trigger and the phase 2 abandon are each
+	// counted once; the rejected row's own code is not counted again.
+	if g.oraErr(1) != 1 {
+		t.Errorf("oracle_error{1} = %d, want 1 (the phase 1 trigger only)", g.oraErr(1))
+	}
+}
+
+// TestPhase2ShutdownAbandonsLikeAnyNonRowError: a cancelled context in phase 2
+// is not a rejection and not a skipped error.
+//
+// SETUP: standard(); skipPhase1; scalar key 20 fails ORA-00001; the scalar
+// exec for key 10 cancels the context and fails with context.Canceled.
+// ASSERTION: execution stops at key 10 (keys 5, 20, 10); key 20's row stays
+// Rejected, the other six are Failed; Err is "shutdown"; no commit; no failure
+// class and no oracle_error counted.
+// WOULD HAVE CAUGHT: execRows swallowing a cancel error; treating a
+// not-classified error (ok=false) as a row rejection and carrying on.
+func TestPhase2ShutdownAbandonsLikeAnyNonRowError(t *testing.T) {
+	g := newRig(t)
+	g.r.skipPhase1 = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g.f.SetScript(func(c oratest.Call) oratest.Result {
+		if isOp(c.SQL) || c.Rows > 0 {
+			return oratest.Result{}
+		}
+		switch key, _ := c.Args[0].(int64); key {
+		case 20:
+			return oratest.Result{Err: oratest.ORA(1)}
+		case 10:
+			cancel()
+			return oratest.Result{Err: context.Canceled}
+		}
+		return oratest.Result{}
+	})
+	b := standard()
+	res := g.r.runBatch(ctx, g.s, b)
+
+	want := all(7, model.OutcomeFailed)
+	want[1] = model.OutcomeRejected
+	if got := outcomes(b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("outcomes %v, want %v", got, want)
+	}
+	if b.Err == nil || b.Err.Error() != "shutdown" || res.failure != nil {
+		t.Errorf("Err=%v failure=%+v, want shutdown and no failure", b.Err, res.failure)
+	}
+	if keys, _ := scalarKeys(g.f); !reflect.DeepEqual(keys, []int64{5, 20, 10}) {
+		t.Errorf("scalar keys %v, want [5 20 10]", keys)
+	}
+	if cn := g.f.Counts(); cn.Commits != 0 {
+		t.Errorf("commits = %d, want 0", cn.Commits)
+	}
+	if g.oraErr(1) != 0 || g.oraErr(60) != 0 {
+		t.Errorf("oracle_error counted on shutdown")
+	}
+}
+
+// TestPhase1NonRowErrorSkipsPhase2: only a row-data class enters phase 2.
+//
+// WOULD HAVE CAUGHT: entering phase 2 for every failure (rows attempts at the
+// same failure, burning the query timeout).
+func TestPhase1NonRowErrorSkipsPhase2(t *testing.T) {
+	for _, code := range []int{60, 12541, 24381, 942, 1653} {
+		g := newRig(t)
+		g.f.SetScript(rowScript(code, nil))
+		b := standard()
+		g.r.runBatch(context.Background(), g.s, b)
+		if keys, _ := scalarKeys(g.f); len(keys) != 0 {
+			t.Errorf("ORA-%d: %d scalar execs ran", code, len(keys))
+		}
+		if g.r.run.FallbackPerrow.Load() != 0 {
+			t.Errorf("ORA-%d: batch_fallback_perrow counted", code)
+		}
+	}
+}
+
+// TestRowsAffectedMismatchChangesNoOutcome: RowsAffected is checked in both
+// phases, counted per destination and logged, and never changes a result.
+//
+// SETUP: every exec reports a wrong count, once through phase 1 and once
+// through phase 2 direct, with a count below the rows bound (0) and one above
+// it (9; the largest bound is 2). The log goes to a buffer.
+// ASSERTION: all rows Committed, Err nil, rows_written by row count (not by
+// RowsAffected); the counter is per exec: phase 1 four array execs (dest 0
+// twice, 1 and 2 once each), phase 2 seven scalar execs (4, 2, 1); one WARN
+// line per mismatching exec, naming the affected count.
+// WOULD HAVE CAUGHT: treating a mismatch as a failure or a rejection; counting
+// by RowsAffected; counting against the wrong destination; dropping the WARN;
+// comparing with < instead of !=.
+func TestRowsAffectedMismatchChangesNoOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		skip     bool
+		affected int64
+		want     [3]uint64
+	}{
+		{"phase 1 fewer", false, 0, [3]uint64{2, 1, 1}},
+		{"phase 2 fewer", true, 0, [3]uint64{4, 2, 1}},
+		{"phase 1 more", false, 9, [3]uint64{2, 1, 1}},
+		{"phase 2 more", true, 9, [3]uint64{4, 2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newRig(t)
+			var logbuf bytes.Buffer
+			g.r.log = obs.NewAppLogger(&logbuf, obs.LevelWarn, 1000, nil)
+			g.r.skipPhase1 = tc.skip
+			g.f.SetScript(func(c oratest.Call) oratest.Result {
+				if !isOp(c.SQL) {
+					return oratest.Result{Affected: oratest.Affect(tc.affected)}
+				}
+				return oratest.Result{}
+			})
+			b := standard()
+			g.r.runBatch(context.Background(), g.s, b)
+			if got := outcomes(b); !reflect.DeepEqual(got, all(7, model.OutcomeCommitted)) || b.Err != nil {
+				t.Fatalf("outcomes %v Err=%v", got, b.Err)
+			}
+			var execs uint64
+			for d, want := range tc.want {
+				execs += want
+				if got := g.r.run.RowsAffectedMismatch[d].Load(); got != want {
+					t.Errorf("rows_affected_mismatch{%d} = %d, want %d", d, got, want)
+				}
+			}
+			if n := strings.Count(logbuf.String(), "rows affected mismatch"); uint64(n) != execs {
+				t.Errorf("%d mismatch WARN lines, want %d:\n%s", n, execs, logbuf.String())
+			}
+			if want := fmt.Sprintf("affected=%d", tc.affected); !strings.Contains(logbuf.String(), want) {
+				t.Errorf("log lacks %q:\n%s", want, logbuf.String())
+			}
+			for d, want := range []uint64{4, 2, 1} {
+				if got := g.rowsWritten(d); got != want {
+					t.Errorf("rows_written{%d} = %d, want %d", d, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestPhase2EmptyMaskRowsCountedOnce: an empty-mask row is Rejected once and
+// counted once whether phase 1 reached its destination or not.
+//
+// SETUP: standard() with row 1 (destination 0) and row 4 (destination 1) at
+// mask 0; array exec ORA-00001. Phase 1 groups destination 0, counts row 1 and
+// fails before reaching destination 1.
+// ASSERTION: batch_row_empty_mask is 1 for destination 0 (not 2) and 1 for
+// destination 1; both rows Rejected with ErrCode 0; the other five Committed;
+// no scalar exec for either.
+// WOULD HAVE CAUGHT: phase 2 re-counting phase 1's empty masks; phase 2 never
+// seeing a destination phase 1 did not reach; executing a mask-0 row.
+func TestPhase2EmptyMaskRowsCountedOnce(t *testing.T) {
+	g := newRig(t)
+	g.f.SetScript(rowScript(1, nil))
+	b := standard()
+	b.Rows[1].Mask, b.Rows[4].Mask = 0, 0
+	g.r.runBatch(context.Background(), g.s, b)
+
+	want := all(7, model.OutcomeCommitted)
+	want[1], want[4] = model.OutcomeRejected, model.OutcomeRejected
+	if got := outcomes(b); !reflect.DeepEqual(got, want) || b.Err != nil {
+		t.Fatalf("outcomes %v Err=%v, want %v", got, b.Err, want)
+	}
+	if b.Rows[1].ErrCode != 0 || b.Rows[4].ErrCode != 0 {
+		t.Errorf("empty-mask ErrCode %d/%d, want 0", b.Rows[1].ErrCode, b.Rows[4].ErrCode)
+	}
+	if a, c := g.r.inst.cache.BatchRowEmptyMask[0].Load(), g.r.inst.cache.BatchRowEmptyMask[1].Load(); a != 1 || c != 1 {
+		t.Errorf("batch_row_empty_mask dest0=%d dest1=%d, want 1 and 1", a, c)
+	}
+	if keys, _ := scalarKeys(g.f); !reflect.DeepEqual(keys, []int64{5, 10, 30, 8, 1}) {
+		t.Errorf("scalar keys %v, want [5 10 30 8 1]", keys)
+	}
 }

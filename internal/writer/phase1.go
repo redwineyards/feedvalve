@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"feedvalve/internal/model"
+	"feedvalve/internal/obs"
 )
 
 // phase1 array-binds each (destination, mask) run of b and executes it inside
@@ -49,6 +50,28 @@ func (r *runner) execRun(ctx context.Context, tx *sql.Tx, b *model.Batch, k stmt
 		return err
 	}
 	defer r.cache.done(st, cached)
-	_, err = tx.StmtContext(ctx, st).ExecContext(ctx, args...)
+	res, err := tx.StmtContext(ctx, st).ExecContext(ctx, args...)
+	if err == nil {
+		r.checkAffected(res, k, len(idx))
+	}
 	return err
+}
+
+// checkAffected reports RowsAffected != want as a WARN and a counter and does
+// nothing else: the driver's array semantics are unproven, so a mismatch must
+// never change an outcome (V3 6.5).
+func (r *runner) checkAffected(res sql.Result, k stmtKey, want int) {
+	if res == nil {
+		return
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == int64(want) {
+		return
+	}
+	if r.run != nil && int(k.Dest) < len(r.run.RowsAffectedMismatch) {
+		add(r.run.RowsAffectedMismatch[k.Dest])
+	}
+	if r.log != nil {
+		r.log.Warnf(obs.ClassWriteFailed, "writer: rows affected mismatch stmt=%s affected=%d bound=%d", k.String(), n, want)
+	}
 }
