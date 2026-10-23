@@ -64,9 +64,9 @@ type scriptedDecoder struct {
 	onDecode func(model.MsgHeader, []byte, []model.UpdateUnit) (int, error)
 }
 
-func (d *scriptedDecoder) Code() model.TransCode { return d.code }
-func (d *scriptedDecoder) BodyLen() int          { return d.bodyLen }
-func (d *scriptedDecoder) MaxUnits() int         { return d.maxUnits }
+func (d *scriptedDecoder) Code() model.TransCode   { return d.code }
+func (d *scriptedDecoder) BodyLen() int            { return d.bodyLen }
+func (d *scriptedDecoder) MaxUnits() int           { return d.maxUnits }
 func (d *scriptedDecoder) SetTrace(wire.TraceSink) {}
 
 func (d *scriptedDecoder) Decode(h model.MsgHeader, p []byte, out []model.UpdateUnit) (int, error) {

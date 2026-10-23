@@ -32,9 +32,9 @@ type fakeDecoder struct {
 	entry *RegistryEntry
 }
 
-func (f fakeDecoder) Code() model.TransCode { return f.code }
-func (f fakeDecoder) BodyLen() int          { return f.bodyLen }
-func (f fakeDecoder) MaxUnits() int         { return f.maxUnits }
+func (f fakeDecoder) Code() model.TransCode   { return f.code }
+func (f fakeDecoder) BodyLen() int            { return f.bodyLen }
+func (f fakeDecoder) MaxUnits() int           { return f.maxUnits }
 func (f fakeDecoder) SetTrace(wire.TraceSink) {}
 
 func (f fakeDecoder) Decode(h model.MsgHeader, p []byte, out []model.UpdateUnit) (int, error) {
