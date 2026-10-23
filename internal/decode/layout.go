@@ -22,7 +22,7 @@ package decode
 // as "this destination's image fits imageSize" or "this decoder's fan-out fits
 // the buffer":
 //
-//	const _ = uint(fanoutBufUnits - maxDecoderUnits)
+//	const _ = uint(FanoutUnits - maxDecoderUnits)
 //
 // Choosing the one-sided form where the specification states an exact length
 // is the silent weakening: it keeps compiling while the layout shrinks, and a

@@ -12,11 +12,6 @@ import (
 	"feedvalve/internal/wire"
 )
 
-// fanoutUnits sizes the fan-out buffer: Vol 0 section 9.1's 40, which is at
-// least the MaxUnits of every catalogued code (35 for 7320/7210, 25 for 7220).
-// decode's own one-sided layout gate asserts the relationship from its side.
-const fanoutUnits = 40
-
 // receiver owns every buffer the sub-packet path touches and is the only thing
 // that may name them (Vol 0 section 9.1, Figure 1.2).
 //
@@ -40,7 +35,7 @@ type receiver struct {
 
 	// fanoutBuf is where a decoder writes its units. Routed AFTER the recover
 	// boundary returns (ADR-L10), never from inside it.
-	fanoutBuf [fanoutUnits]model.UpdateUnit
+	fanoutBuf [decode.FanoutUnits]model.UpdateUnit
 
 	// reader and hdr are reset per message rather than constructed, which is
 	// the whole of ADR-L07's allocation argument.

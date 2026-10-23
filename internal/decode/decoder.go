@@ -204,19 +204,19 @@ func (e *RegistryEntry) Contributes(d model.DestID) bool {
 // rather than from this -- so the relationship is stated where a new decoder
 // author will see it.
 //
-// fanoutBufUnits mirrors the receiver's fanoutBuf [40]UpdateUnit. It lives here
-// as a constant rather than an import because wire and model hold protocol
-// facts, and 40 is a buffer-sizing decision (Vol 0 section 9.1).
-const fanoutBufUnits = 40
+// FanoutUnits sizes the receiver's fan-out buffer, [FanoutUnits]UpdateUnit:
+// Vol 0 section 9.1's 40. Declared here, next to the gate below, and used by app
+// so the buffer and the gate cannot name two different numbers.
+const FanoutUnits = 40
 
 // The one-sided form of the layout gate: compiles only while every decoder's
 // declared fan-out fits the buffer. maxDecoderUnits is raised deliberately when
 // a decoder with a larger fan-out is added -- 35 for 7320/7210, 25 for 7220 --
-// and raising it past fanoutBufUnits must break the build rather than overflow
+// and raising it past FanoutUnits must break the build rather than overflow
 // the buffer at market open.
 const maxDecoderUnits = 35
 
-const _ = uint(fanoutBufUnits - maxDecoderUnits)
+const _ = uint(FanoutUnits - maxDecoderUnits)
 
 // wireReaderIsReady is a compile-time assertion that the cursor the decoders
 // read through exists with the shape section 8.4 specifies. It costs nothing
