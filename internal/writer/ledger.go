@@ -31,6 +31,10 @@ func newStmtLedger(need int, window time.Duration) *stmtLedger {
 	return &stmtLedger{need: need, window: window, m: map[stmtKey]stmtFailRecord{}}
 }
 
+// set replaces the rule's thresholds. Entries already recorded keep their
+// windows' start times and are judged by the new values. poolHealth serialises.
+func (l *stmtLedger) set(need int, window time.Duration) { l.need, l.window = need, window }
+
 // record notes that writerID saw k fail at now and reports whether the pool
 // must stop. Entries whose window has closed are dropped lazily here, so the
 // map is bounded by the number of identities and needs no sweeper.

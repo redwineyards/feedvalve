@@ -400,8 +400,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		want := int(wire.BroadcastDataPrefixLen) + int(r.hdr.MsgLen)
 		if m := len(payload); m != want {
 			r.in.decompressedLenMismatch[slot].Add(1)
-			if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-				r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+			if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+				r.g.deps.Log.Warnf(obs.ClassDecodeAnomaly,
 					"decompressed length %d against 8+MessageLength %d for code %d",
 					m, want, r.hdr.Code)
 			}
@@ -457,8 +457,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		// allocates nothing. Which sentinel it was goes in the log, not in a
 		// counter label: the counters that matter here already fired above.
 		// Boxing it into the variadic does allocate, hence the Allow.
-		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-			r.g.deps.Log.Errorf(obs.ClassSessionAnomaly, "decoding code %d: %v", r.hdr.Code, err)
+		if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+			r.g.deps.Log.Errorf(obs.ClassDecodeAnomaly, "decoding code %d: %v", r.hdr.Code, err)
 		}
 		return 0
 	}
@@ -466,8 +466,8 @@ func (r *receiver) decodeSubPacket(payload []byte, compressed bool, idx, count i
 		// A decoder that wrote more than it declared would have written past
 		// fanoutBuf already; this is the assertion that says so rather than
 		// letting the overflow travel downstream.
-		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-			r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
+		if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+			r.g.deps.Log.Errorf(obs.ClassDecodeAnomaly,
 				"code %d reported %d units with MaxUnits %d", r.hdr.Code, n, units)
 		}
 		return 0
@@ -499,8 +499,8 @@ func (r *receiver) countUnresolved(code model.TransCode) {
 		// onto the shared dynamic table, so it counts properly now.
 		c, ok := r.in.unconfiguredTranscode(int(code))
 		c.Add(1)
-		if r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-			r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+		if r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+			r.g.deps.Log.Warnf(obs.ClassDecodeAnomaly,
 				"transcode %d has a decoder in this build but is not configured, so nothing says "+
 					"which destination its fields belong to (ADR-011)%s", code, fullTable(ok))
 		}
@@ -508,8 +508,8 @@ func (r *receiver) countUnresolved(code model.TransCode) {
 	}
 	c, ok := r.in.unknownTranscode(int(code))
 	c.Add(1)
-	if !ok && r.g.deps.Log.Allow(obs.ClassSessionAnomaly) {
-		r.g.deps.Log.Warnf(obs.ClassSessionAnomaly,
+	if !ok && r.g.deps.Log.Allow(obs.ClassDecodeAnomaly) {
+		r.g.deps.Log.Warnf(obs.ClassDecodeAnomaly,
 			"transcode %d is not in this build's catalogue, and the unknown-code table is "+
 				"full, so it is counted under unknown_transcode_other", code)
 	}

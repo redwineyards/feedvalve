@@ -3,6 +3,7 @@ package oradb
 import (
 	"context"
 	"database/sql"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,13 +16,36 @@ import (
 type DB struct {
 	db  *sql.DB
 	red Redactor
-	s   DBSettings
+	s   DBSettings // fixed at open; the two reloadable durations live below
+
+	// lifetime and connectTimeout are the reloadable settings, in nanoseconds.
+	// They are read concurrently by Ping, Acquire and every writer, so a plain
+	// mutation of s would fail -race. Seeded from s in openDriver.
+	// Held by pointer so a DB stays copyable (the G-SEC-1 tests copy one).
+	live *liveSettings
 }
+
+type liveSettings struct {
+	lifetime       atomic.Int64
+	connectTimeout atomic.Int64
+}
+
+// SetConnMaxLifetime changes the connection lifetime: it is applied to the
+// *sql.DB (pooled connections) and is what the next Acquire copies into its
+// Session (pinned connections), so a reload reaches new sessions only. The
+// atomic in DB, not Params.ConnHold, is what a Session follows.
+func (d *DB) SetConnMaxLifetime(l time.Duration) {
+	d.live.lifetime.Store(int64(l))
+	d.db.SetConnMaxLifetime(l)
+}
+
+// SetConnectTimeout changes the timeout PingContext and Acquire run under.
+func (d *DB) SetConnectTimeout(t time.Duration) { d.live.connectTimeout.Store(int64(t)) }
 
 // PingContext pings under ConnectTimeoutSec. A failure comes back redacted:
 // it is the startup error and goes straight into a log.
 func (d *DB) PingContext(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(d.s.ConnectTimeoutSec)*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(d.live.connectTimeout.Load()))
 	defer cancel()
 	if err := d.db.PingContext(ctx); err != nil {
 		return d.red.redact(err)

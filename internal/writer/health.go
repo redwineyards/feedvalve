@@ -60,6 +60,15 @@ func newPoolHealth(cfg healthConfig, now func() time.Time) *poolHealth {
 	}
 }
 
+// reload replaces the thresholds in force, under mu, so the next failure is
+// judged by them (s5.3 failFastSeconds, statementFailWriters and window).
+func (h *poolHealth) reload(cfg healthConfig) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg = cfg
+	h.ledger.set(cfg.statementFailNeed, cfg.statementFailWindow)
+}
+
 // State returns the current state.
 func (h *poolHealth) State() HealthState {
 	h.mu.Lock()

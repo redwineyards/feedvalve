@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"reflect"
 	"slices"
 
 	"feedvalve/internal/destinations"
@@ -28,7 +30,8 @@ const (
 // schema rules that need the destination table.
 //
 // One implementation, three call sites -- startup, -selfcheck, and the SIGHUP
-// path -- so the three cannot drift. prev is nil except on reload.
+// path -- so the three cannot drift. prev and prevDests are the running
+// configuration and field map, nil except on reload.
 //
 // Two rules of Vol 4 section 2.2 are NOT here and cannot be, because they
 // need the decoder registry, which arrives in Phase 2: V-T1 (every configured
@@ -36,10 +39,13 @@ const (
 // equals the sum of its mask's declared widths). Unchecked returns their
 // identifiers so a caller can say what it has not verified rather than imply
 // a clean bill of health.
-func ValidateAll(c *Config, dests *destinations.Set, prev *Config, mode Mode) error {
+func ValidateAll(c *Config, dests, prevDests *destinations.Set, prev *Config, mode Mode) error {
 	var p problems
 	validateInto(&p, c, prev)
 	validateSchema(&p, c, dests)
+	if prev != nil {
+		validateDestsStartupOnly(&p, dests, prevDests)
+	}
 
 	// V-DB1. Neither the HLD nor Vol 0 said what a missing db means in
 	// production. poc no-ops the write, which is right for a
@@ -74,6 +80,49 @@ func ValidateAll(c *Config, dests *destinations.Set, prev *Config, mode Mode) er
 // comment.
 func Unchecked() map[string]string {
 	return map[string]string{}
+}
+
+// validateDestsStartupOnly is V-R2: the destination set is startup-only in its
+// entirety -- name, table, rowKey and the full ordered column list -- because
+// the field map fixes every ColMask bit index and image offset, and a reload
+// that moved one would renumber live masks and re-lay stored images.
+//
+// ONE problem per reload, naming the first difference found, so the rule fires
+// exactly once however much of the file was edited. With no running set
+// (prevDests nil) there is nothing to compare against and the rule is silent.
+func validateDestsStartupOnly(p *problems, dests, prevDests *destinations.Set) {
+	if dests == nil || prevDests == nil {
+		return
+	}
+	if dests.Len() != prevDests.Len() {
+		p.addKey(RuleDestStartupOnly, "runtime.destinationsFile", "", "",
+			"the destination set is startup-only and changed from %d destinations to %d; "+
+				"the whole file is rejected and the running configuration is kept",
+			prevDests.Len(), dests.Len())
+		return
+	}
+	old := prevDests.All()
+	for i, d := range dests.All() {
+		o := old[i]
+		what := ""
+		switch {
+		case d.Name != o.Name:
+			what = fmt.Sprintf("name %q became %q", o.Name, d.Name)
+		case d.Table != o.Table:
+			what = fmt.Sprintf("table %q became %q", o.Table, d.Table)
+		case d.Key != o.Key:
+			what = fmt.Sprintf("rowKey %s became %s", o.Key, d.Key)
+		case !reflect.DeepEqual(d.Columns, o.Columns):
+			what = "the ordered column list changed"
+		default:
+			continue
+		}
+		p.addKey(RuleDestStartupOnly, "runtime.destinationsFile", "", "",
+			"the destination set is startup-only in its entirety, and destination %d (%s) differs: %s; "+
+				"the whole file is rejected and the running configuration is kept",
+			i, o.Name, what)
+		return
+	}
 }
 
 func validateSchema(p *problems, c *Config, dests *destinations.Set) {

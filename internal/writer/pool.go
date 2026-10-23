@@ -91,13 +91,27 @@ func NewPool(db *oradb.DB, dests *destinations.Set, cfg Config, params func() *P
 		stopped: make(chan struct{}),
 		live:    map[int]*writer{},
 	}
-	p.health = newPoolHealth(healthConfig{
-		failFastWindow:      p0.FailFastWindow,
-		failFastWrites:      p0.FailFastWrites,
-		statementFailNeed:   p0.StatementFailWriters,
-		statementFailWindow: p0.StatementFailWindow,
-	}, func() time.Time { return p.now() })
+	p.health = newPoolHealth(healthFrom(p0), func() time.Time { return p.now() })
 	return p, nil
+}
+
+func healthFrom(p *Params) healthConfig {
+	return healthConfig{
+		failFastWindow:      p.FailFastWindow,
+		failFastWrites:      p.FailFastWrites,
+		statementFailNeed:   p.StatementFailWriters,
+		statementFailWindow: p.StatementFailWindow,
+	}
+}
+
+// ReloadHealth re-reads params() and applies the health thresholds, so a
+// reloaded writers.failFastSeconds or statementFail* takes effect on the next
+// failure. The caller orders it before Resize, so the new statementFailWriters
+// floor is in force when the new count is judged. A nil params is ignored.
+func (p *Pool) ReloadHealth() {
+	if par := p.params(); par != nil {
+		p.health.reload(healthFrom(par))
+	}
 }
 
 func realAfter(d time.Duration) (<-chan time.Time, func()) {

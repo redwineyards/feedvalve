@@ -155,6 +155,10 @@ func TestClassTableMatchesTheEnum(t *testing.T) {
 	for c, want := range map[Class]string{
 		ClassShardSendWait:    "shard_send_wait",
 		ClassEpochStalled:     "epoch_stalled",
+		ClassDecodeAnomaly:    "decode_anomaly",
+		ClassCircuitQuiet:     "circuit_quiet",
+		ClassSessionAnomaly:   "session_anomaly",
+		ClassCircuitDown:      "circuit_down",
 		ClassDecompressFailed: "decompress_failed",
 		ClassStartupFailed:    "startup_failed",
 		ClassBlobLenMismatch:  "blob_len_mismatch",

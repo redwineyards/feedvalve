@@ -136,7 +136,6 @@ func TestUnknownKeyIsRejected(t *testing.T) {
 		`{"runtime":{"maxBatchSize":100}}`, // right name, wrong section
 		`{"flush":{"windowMillis":100}}`,   // wrong unit suffix
 		`{"nosuchsection":{"x":1}}`,        // unknown top-level object
-		`{"db":{"password":"hunter2"}}`,    // the one that matters most
 	} {
 		t.Run(bad, func(t *testing.T) {
 			_, err := Parse([]byte(bad))

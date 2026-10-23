@@ -222,7 +222,7 @@ func (r *receiver) stallFatal(k model.ShardID, u *model.UpdateUnit,
 	// the operator's only account of why the process stopped. Guarding it would
 	// let a bucket drained by an unrelated class suppress exactly that. Leave
 	// it, and do not "fix" it to match the others.
-	r.g.deps.Log.Errorf(obs.ClassSessionAnomaly,
+	r.g.deps.Log.Errorf(obs.ClassShardDefect,
 		"shard queue stall budget expired; nothing is discarded, the process stops: %s", detail)
 
 	r.g.Fatal(FatalQ1Overflow, detail)

@@ -22,7 +22,7 @@ type Session struct {
 // Acquire pins one connection from the pool under ConnectTimeoutSec. The error
 // is the driver's own, for Classify.
 func (d *DB) Acquire(ctx context.Context) (*Session, error) {
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(d.s.ConnectTimeoutSec)*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(d.live.connectTimeout.Load()))
 	defer cancel()
 	c, err := d.db.Conn(ctx)
 	if err != nil {
@@ -31,7 +31,7 @@ func (d *DB) Acquire(ctx context.Context) (*Session, error) {
 	return &Session{
 		conn:       c,
 		acquiredAt: time.Now(),
-		lifetime:   time.Duration(d.s.ConnMaxLifetimeMinutes) * time.Minute,
+		lifetime:   time.Duration(d.live.lifetime.Load()),
 	}, nil
 }
 

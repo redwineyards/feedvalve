@@ -31,9 +31,11 @@ const (
 	ClassTruncation                      // F29 -- a value cut at its declared width
 	ClassClockStep                       // F23 -- the wall clock moved under us
 	ClassReloadRejected                  // F15 -- the operator's change did NOT take effect
-	ClassSessionAnomaly                  // the exchange sent something unexpected
+	ClassSessionAnomaly                  // the exchange's session state moved unexpectedly (session-only)
 	ClassShardSendWait                   // a Q1 send that had to wait AT ALL
 	ClassEpochStalled                    // Vol 2 section 2.4 -- an epoch open past epochStallWarnMs
+	ClassDecodeAnomaly                   // phase 5 ruling D16 -- bad or unexpected content while decoding (was session_anomaly)
+	ClassCircuitQuiet                    // phase 5 ruling D16 -- the feed went quiet
 
 	// ERROR classes -- Vol 4 section 6.2.
 	ClassDecompressFailed // F3  -- DecompressSafe refused the input
@@ -47,7 +49,8 @@ const (
 	ClassBlobLenMismatch  // Vol 2 section 4 step 4 -- a decoder or configuration defect
 	ClassGuardDisabled    // Vol 2 section 5.5 -- the ordering guard switched off for a transcode
 	ClassDrainDeadline    // Vol 2 section 2.6 -- the drain ran out of time with rows unwritten
-	ClassShardDefect      // phase 3 ruling D9 -- a shard construction defect (S1, S2, S3/F27)
+	ClassShardDefect      // phase 3 ruling D9 -- a shard defect (S1, S2, S3/F27); also the Q1 stall-budget fatal (phase 5 ruling D16)
+	ClassCircuitDown      // phase 5 ruling D16 -- the feed is down
 
 	numClasses
 )
@@ -78,6 +81,8 @@ var logClasses = []string{
 	ClassSessionAnomaly:     "session_anomaly",
 	ClassShardSendWait:      "shard_send_wait",
 	ClassEpochStalled:       "epoch_stalled",
+	ClassDecodeAnomaly:      "decode_anomaly",
+	ClassCircuitQuiet:       "circuit_quiet",
 	ClassDecompressFailed:   "decompress_failed",
 	ClassFramingAbandoned:   "framing_abandoned",
 	ClassErrorResponse:      "error_response",
@@ -90,6 +95,7 @@ var logClasses = []string{
 	ClassGuardDisabled:      "guard_disabled",
 	ClassDrainDeadline:      "drain_deadline",
 	ClassShardDefect:        "shard_defect",
+	ClassCircuitDown:        "circuit_down",
 }
 
 func (c Class) String() string {

@@ -170,9 +170,11 @@ var rules = []rule{
 	},
 	{
 		pkg:       "health",
-		forbidden: []string{pkg("oradb"), pkg("writer"), pkg("mirror")},
+		forbidden: []string{pkg("oradb"), pkg("writer"), pkg("mirror"), pkg("config"), databaseSQL},
 		why: "health observes state machines and reports. It must not be able to reach into " +
-			"the things it is reporting on.",
+			"the things it is reporting on. It defines its own LivenessConfig and TradingWindow " +
+			"and app projects config's into them, so config (and with it any reload logic) and " +
+			"database/sql stay out of the machines.",
 	},
 	// app has no rule. It is the one package allowed to import both halves,
 	// which is exactly why every other package's restriction is enforced here

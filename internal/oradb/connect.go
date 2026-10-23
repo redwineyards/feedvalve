@@ -81,7 +81,9 @@ func openDriver(ctx context.Context, driverName, dsn, password string, s DBSetti
 	// reconnect.
 	sdb.SetConnMaxLifetime(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute)
 
-	d := &DB{db: sdb, red: red, s: s}
+	d := &DB{db: sdb, red: red, s: s, live: &liveSettings{}}
+	d.live.lifetime.Store(int64(time.Duration(s.ConnMaxLifetimeMinutes) * time.Minute))
+	d.live.connectTimeout.Store(int64(time.Duration(s.ConnectTimeoutSec) * time.Second))
 	if err := d.PingContext(ctx); err != nil {
 		sdb.Close()
 		return nil, fmt.Errorf("connect to %s: %w", s.Describe(), err)

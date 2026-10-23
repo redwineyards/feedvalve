@@ -289,6 +289,22 @@ func storeOf(cfg *config.Config) *config.Store {
 // transcode's contributed column widths, which only the field map knows.
 // Validating each half alone would pass a pair that cannot work.
 func loadAll(path string, mode config.Mode) (*config.Config, *destinations.Set, error) {
+	return loadChecked(path, mode, nil, nil)
+}
+
+// loadForReload is loadAll for the SIGHUP path: ModeRun, validated against the
+// running configuration and field map so the reload-only rules (V-R1..V-R4)
+// apply. An empty path is a caller error on this path (D7: with no config
+// file there is nothing to reload) and is rejected rather than silently
+// loading defaults over a running configuration.
+func loadForReload(path string, prev *config.Config, prevDests *destinations.Set) (*config.Config, *destinations.Set, error) {
+	if path == "" {
+		return nil, nil, errors.New("no configuration file to reload")
+	}
+	return loadChecked(path, config.ModeRun, prev, prevDests)
+}
+
+func loadChecked(path string, mode config.Mode, prev *config.Config, prevDests *destinations.Set) (*config.Config, *destinations.Set, error) {
 	var (
 		cfg *config.Config
 		err error
@@ -314,7 +330,7 @@ func loadAll(path string, mode config.Mode) (*config.Config, *destinations.Set, 
 		return nil, nil, err
 	}
 
-	if err := config.ValidateAll(cfg, dests, nil, mode); err != nil {
+	if err := config.ValidateAll(cfg, dests, prevDests, prev, mode); err != nil {
 		return nil, nil, err
 	}
 	return cfg, dests, nil
@@ -391,6 +407,14 @@ func selfCheck(cfg *config.Config, dests *destinations.Set, out io.Writer) error
 	fmt.Fprintln(out, "selfcheck: NOT checked -- V-X7: db.connMaxLifetimeMinutes against the "+
 		"Oracle profile's IDLE_TIME. Un-checkable from here by nature; the observable "+
 		"is a recurring ORA-03113 on first reuse of a session the server already closed")
+
+	// Reload-only rules need a running configuration to compare against, so
+	// -selfcheck cannot evaluate them; it says so rather than imply they
+	// passed. V-R2 is the destination set (name, table, rowKey, ordered
+	// columns); startup-only keys are listed so the output matches the table.
+	fmt.Fprintf(out, "selfcheck: reload-only rules V-R1..V-R4 apply on SIGHUP, not here -- "+
+		"V-R2: the destination set (name, table, rowKey, ordered columns) is startup-only in its entirety; "+
+		"V-R1: %d startup-only keys\n", len(config.StartupOnlyKeys))
 
 	fmt.Fprintln(out, "selfcheck: PASSED")
 	return nil

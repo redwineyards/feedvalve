@@ -80,8 +80,8 @@ func (c *decodeCounters) BlobOverrun(code model.TransCode) {
 		// A code defect rather than bad input, so it is an ERROR and not a
 		// WARN: the decoder's declared ColSpec.Width and its actual writes
 		// have diverged, and Phase 1's worst case is 181 of 256.
-		if c.in.log.Allow(obs.ClassSessionAnomaly) {
-			c.in.log.Errorf(obs.ClassSessionAnomaly,
+		if c.in.log.Allow(obs.ClassDecodeAnomaly) {
+			c.in.log.Errorf(obs.ClassDecodeAnomaly,
 				"transcode %d wrote past its declared blob width; no units emitted for this "+
 					"message. This is a decoder defect, not bad input", code)
 		}

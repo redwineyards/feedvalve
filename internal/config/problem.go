@@ -68,6 +68,23 @@ const (
 type Problem struct {
 	Rule string // the V- identifier
 	Msg  string // what is wrong, in the operator's terms
+
+	// Optional structured detail, set by the rules that are about one key:
+	// V-R1..V-R4, V-DB3 and V-STRICT1. Running and Attempt are empty for a
+	// db.* key (a secret is never echoed) and for rules with no value to show.
+	KeyPath string
+	Running string
+	Attempt string
+}
+
+// RuleError is the first problem of a rejection, flattened for the reload
+// driver's one WARN line: which rule, which key, and both values.
+type RuleError struct {
+	Rule    string
+	KeyPath string
+	Running string
+	Attempt string
+	Detail  string
 }
 
 func (p Problem) String() string { return p.Rule + ": " + p.Msg }
@@ -87,6 +104,15 @@ func (e *ValidationError) Error() string {
 	}
 	return fmt.Sprintf("configuration rejected (%d problems):\n  - %s",
 		len(e.Problems), strings.Join(lines, "\n  - "))
+}
+
+// RuleError returns Problems[0] as a RuleError; the zero value if there is none.
+func (e *ValidationError) RuleError() RuleError {
+	if len(e.Problems) == 0 {
+		return RuleError{}
+	}
+	p := e.Problems[0]
+	return RuleError{Rule: p.Rule, KeyPath: p.KeyPath, Running: p.Running, Attempt: p.Attempt, Detail: p.Msg}
 }
 
 // Rules returns the distinct rule identifiers that fired, sorted. This is what
@@ -114,6 +140,13 @@ type problems []Problem
 
 func (p *problems) add(rule, format string, a ...any) {
 	*p = append(*p, Problem{Rule: rule, Msg: fmt.Sprintf(format, a...)})
+}
+
+// addKey is add for a rule that is about one key, recording the key path and,
+// where there are values to show, the running and attempted ones.
+func (p *problems) addKey(rule, key, running, attempt, format string, a ...any) {
+	*p = append(*p, Problem{Rule: rule, Msg: fmt.Sprintf(format, a...),
+		KeyPath: key, Running: running, Attempt: attempt})
 }
 
 func (p *problems) err() error {

@@ -128,3 +128,11 @@ carried forward into them. Each item says whether it is open, accepted or fixed.
   left partial edits, which the relaunched agents reviewed critically before finishing.
 - Plan sources: `docs/development/phase3-tasks.md`, `docs/development/phase4-tasks.md` (with the
   "as built" section 9).
+
+## Phase 5 as-built notes
+
+- P5-09: `health.SessionTracker.Apply` treats a repeat of the same code (for example 6511 while Open) as idempotent, never an anomaly. This follows the card and G-SESS-3 and deliberately differs from the LLD 4.3 table row that lists Open to Open on 6511 as an anomaly. Card wins; LLD erratum pending.
+- P5-03/P5-04: V-STRICT1 `KeyPath` is the leaf field name only (`encoding/json` does not report the full path), so a mistyped `runtime.windowMS` is reported as `windowMS`. Matches the Vol 4 table, which asks only for the unknown key.
+- P5-03/P5-04: V-DB3 (password key in the file) reports alone; any V-STRICT1 problems in the same file surface only after the credential is removed. Accepted: the credential has to be rotated first anyway.
+- P5-03/P5-04: `config.StartupOnlyKeys` has 14 entries, Vol 0 s7.2's 13 plus `runtime.destinationsFile`, an implementation addition not in the card or Vol 4 list (04-lifecycle-ops.md:677). Erratum: the LLD list should gain it.
+- P5-04: `loadForReload` has no production caller until P5-06 wires it in.

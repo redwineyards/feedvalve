@@ -55,6 +55,9 @@ func TestSelfCheckNeedsNeitherPasswordNorNetwork(t *testing.T) {
 		// profile's IDLE_TIME is un-checkable from here by nature.
 		"NOT checked -- V-X7",
 
+		// G-SC-1: the reload-only destination rule is listed, not implied.
+		"V-R2: the destination set",
+
 		// What this build can decode, and what it is configured to decode --
 		// Vol 1 section 8.2 wants both answerable from a log.
 		"decoder catalogue",
