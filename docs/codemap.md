@@ -8,7 +8,7 @@ it is listed). This describes `develop` after Phase 5 was merged in (P5-17).
 
 `cmd/feedvalve` parses flags and calls `app.Run`. `app` loads `config` and the `destinations` field
 map, builds the `obs` instrument registry, opens Oracle through `oradb`, and constructs the graph.
-The **receiver** goroutine reads UDP datagrams into the `framing` ring (QD). The **decoder**
+The **receiver** goroutine reads UDP datagrams into the `framing` queue (QD). The **decoder**
 goroutine drains QD. It splits each envelope into sub-packets, decompresses them (`lzo`), reads the
 header and feeds the gap detector (`decode`). It then runs the per-transaction-code decoder, which
 produces `model.UpdateUnit`s, and routes them by token hash to per-shard channels (Q1).
@@ -46,7 +46,7 @@ under one deadline.
   Also defines the exit codes and `ExitError`, and `loadForReload`, which validates a reloaded file
   against the running config.
 - **`graph.go`**: `Graph`, the constructed process. `Build` creates the decoder registry, the guard
-  table, the runtime snapshot, the QD ring and the Q1 channels. It also builds the shards
+  table, the runtime snapshot, the QD channel and the Q1 channels. It also builds the shards
   (`buildShards`) and the writer pool (`buildPool`), all before any socket exists. `Fatal` is a
   one-shot channel for terminal conditions (Q1 overflow, DB fail-fast, writer-pool stop, batchQ
   send failure, shard panic or invariant breach, unreported batch row, UDP read failure). It records
@@ -137,7 +137,7 @@ under one deadline.
   `password` key anywhere in the file without echoing its value (V-DB3), and reports unknown keys as
   V-STRICT1. Derives the DB pool size from `writers.count + 1`.
 - **`validate.go`**: `Validate`, the config-only rule set. It checks per-key ranges and cross-field
-  rules: ring capacity is a power of two, general shard is in range, batch size is within the
+  rules: general shard is in range, batch size is within the
   ceiling, retry order, heartbeat order, trading window, timezone, DB fields, and trace codes.
   `StartupOnlyKeys` (14 keys) are refused on reload, as is any change to transcode membership. A
   `db.*` value is never echoed in the error.
@@ -180,17 +180,15 @@ under one deadline.
 - **`layout.go`**: build-time gate G-LAY-3, which fails compilation if a shipped destination image
   exceeds `model.ImageSize`.
 
-## `internal/framing`: datagram ring and envelope split
+## `internal/framing`: datagram queue and envelope split
 
-- **`doc.go`**: package contract. QD (the SPSC ring) and the envelope rules: 8-byte prefix,
-  `messageLength` checks, and netId as an alignment oracle.
-- **`ring.go`**: QD, a lock-free single-producer/single-consumer ring of `model.Datagram`.
-  Power-of-two capacity, head and tail on separate 128-byte cache lines, and separate
-  `Producer`/`Consumer` handles. A publish stores tail before signalling a capacity-1 wake channel.
-- **`consume.go`**: `Consumer.Drain` copies each slot out before advancing head, spins briefly,
-  then parks. Returns only when the ring is closed and empty. Refuses a second consumer.
-- **`budget.go`**: `Producer.PublishWithin`. Fast path first; when the ring is full, it yields until
-  the caller's budget expires, then returns `model.ErrStallBudgetExpired`.
+- **`doc.go`**: package contract. QD (the receiver-to-decoder queue, exactly one consumer) and the
+  envelope rules: 8-byte prefix, `messageLength` checks, and netId as an alignment oracle.
+- **`qd.go`**: QD, a buffered `chan model.Datagram` behind `Producer`/`Consumer` handles.
+  `TryPublish` is a non-blocking send. `PublishWithin` waits on one timer against the caller's
+  per-datagram budget and returns `model.ErrStallBudgetExpired` on expiry. `Close` closes the
+  channel, and `Drain` delivers everything still queued before returning. A second concurrent
+  `Drain` is refused.
 - **`split.go`**: `Split` walks the envelope (`cNetId`, `iNoPackets`, length-prefixed sub-packets
   in FIFO order) and hands each one to a `SubPacketHandler`. Rules R1–R9 stop framing on bad
   lengths, recording the rule, index and offset. Oversize input is trimmed to 512 bytes.
@@ -229,7 +227,7 @@ under one deadline.
   is a BCAST_HEADER.
 - **`decoder.go`**: the `Decoder` interface (`Code`, `BodyLen`, `MaxUnits`, `Decode`) and its
   sentinel errors. `ColSpec` holds the mask, width and per-bit blob offsets. Also defines
-  `RegistryEntry`, the `Counters` sink, and `Traceable`.
+  `RegistryEntry` and the `Counters` sink. `Decoder.SetTrace` attaches the optional field trace.
 - **`catalogue.go`**: the compile-time catalogue of decoder constructors, filled by each code file's
   `init()`. `Catalogue` and `CanDecode` separate "unknown" from "unconfigured".
 - **`registry.go`**: `Registry` and its implementation, parallel arrays of up to 32 entries sorted
@@ -429,12 +427,12 @@ under one deadline.
 - **`header.go`**: `MsgHeader`, the decoded union of both header layouts.
 - **`datagram.go`**: `Datagram`, one received UDP datagram (1024-byte buffer plus receipt time) as
   stored in QD.
-- **`key.go`**: `RowKey` (`SingleKey`/`CompositeKey`, which zero-extend) and `ColMask` bitset
+- **`key.go`**: `RowKey` (`SingleKey`, which zero-extends) and `ColMask` bitset
   operations.
 - **`scalar.go`**: small enums and IDs: `TransCode`, `DestID`, `ShardID`, `Class`, `HeaderKind`,
   `UnitFlags`, `RowOutcome`.
-- **`reject.go`**: the `Reject` enum for receive-path rejections, each mapped to its obs counter
-  name, plus `ErrStallBudgetExpired`.
+- **`reject.go`**: the `Reject` enum for the rejections framing and header parsing return, each
+  mapped to its obs counter name, plus `ErrStallBudgetExpired`.
 - **`session.go`**: `SessionEvent`, a market-session transition passed from decode to health by
   value.
 - **`layout.go`**: gate G-LAY-2, which pins the size and field offsets of every fixed-size model
